@@ -1,0 +1,52 @@
+{
+  "levels": [
+    {
+      "name": "Pro (Bronze)",
+      "deposit_usdc": "500",
+      "funding_usdc": "2500",
+      "points_target": "100",
+      "profit_target_usdc": "375",
+      "drawdown_limit_pct": "0.20",
+      "fixed_price_usdc": "10",
+      "expiry_days": "7",
+      "renew_window_minutes": "1440",
+      "buffer_alert_pct": "2"
+    },
+    {
+      "name": "Pro (Silver)",
+      "deposit_usdc": "0",
+      "funding_usdc": "5000",
+      "points_target": "100",
+      "profit_target_usdc": "750",
+      "drawdown_limit_pct": "0.15",
+      "fixed_price_usdc": "15",
+      "expiry_days": "7",
+      "renew_window_minutes": "1440",
+      "buffer_alert_pct": "2"
+    },
+    {
+      "name": "Pro (Gold)",
+      "deposit_usdc": "0",
+      "funding_usdc": "7500",
+      "points_target": "100",
+      "profit_target_usdc": "1125",
+      "drawdown_limit_pct": "0.12",
+      "fixed_price_usdc": "25",
+      "expiry_days": "7",
+      "renew_window_minutes": "1440",
+      "buffer_alert_pct": "2"
+    },
+    {
+      "name": "Pro (Platinum)",
+      "deposit_usdc": "0",
+      "funding_usdc": "10000",
+      "points_target": "100",
+      "profit_target_usdc": "1500",
+      "drawdown_limit_pct": "0.12",
+      "fixed_price_usdc": "35",
+      "expiry_days": "7",
+      "renew_window_minutes": "1440",
+      "buffer_alert_pct": "2"
+    }
+  ]
+}

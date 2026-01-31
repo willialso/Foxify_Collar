@@ -1,0 +1,122 @@
+{
+  "risk_budget_pct_min": 0.25,
+  "risk_budget_pct_max": 0.4,
+  "volatility_throttle_iv": 0.8,
+  "hedge_reduction_factor": 0.7,
+  "max_leverage": 10,
+  "net_exposure_cap_usdc": {
+    "Pro (Bronze)": 500000,
+    "Pro (Silver)": 1000000,
+    "Pro (Gold)": 1500000,
+    "Pro (Platinum)": 2000000
+  },
+  "max_spread_pct": 0.03,
+  "max_slippage_pct": 0.005,
+  "max_spread_pct_by_days": {
+    "1": 0.12,
+    "2": 0.12,
+    "3": 0.12,
+    "4": 0.08,
+    "5": 0.08,
+    "6": 0.08,
+    "7": 0.08
+  },
+  "max_slippage_pct_by_days": {
+    "1": 0.02,
+    "2": 0.02,
+    "3": 0.02,
+    "4": 0.015,
+    "5": 0.015,
+    "6": 0.015,
+    "7": 0.015
+  },
+  "liquidity_override_enabled": true,
+  "liquidity_override_spread_pct": 0.2,
+  "liquidity_override_slippage_pct": 0.03,
+  "liquidity_override_spread_pct_by_days": {
+    "1": 0.2,
+    "2": 0.2,
+    "3": 0.2,
+    "4": 0.12,
+    "5": 0.12,
+    "6": 0.12,
+    "7": 0.12
+  },
+  "liquidity_override_slippage_pct_by_days": {
+    "1": 0.03,
+    "2": 0.03,
+    "3": 0.03,
+    "4": 0.02,
+    "5": 0.02,
+    "6": 0.02,
+    "7": 0.02
+  },
+  "option_score_weights": {
+    "protection": 0.35,
+    "premium": 0.35,
+    "liquidity": 0.2,
+    "volatility": 0.1
+  },
+  "min_fee_usdc_by_tier": {
+    "Pro (Bronze)": 20,
+    "Pro (Silver)": 30,
+    "Pro (Gold)": 50,
+    "Pro (Platinum)": 70
+  },
+  "premium_floor_ratio": 1.25,
+  "fee_iv_uplift_threshold": 0.8,
+  "fee_iv_uplift_pct_by_tier": {
+    "Pro (Bronze)": 0.35,
+    "Pro (Silver)": 0.3,
+    "Pro (Gold)": 0.25,
+    "Pro (Platinum)": 0.2
+  },
+  "fee_iv_regime_thresholds": {
+    "low": 0.5,
+    "high": 0.8
+  },
+  "fee_iv_regime_multipliers_by_tier": {
+    "Pro (Bronze)": { "low": 0.95, "normal": 1.0, "high": 1.6 },
+    "Pro (Silver)": { "low": 0.95, "normal": 1.0, "high": 1.5 },
+    "Pro (Gold)": { "low": 0.95, "normal": 1.0, "high": 1.35 },
+    "Pro (Platinum)": { "low": 0.95, "normal": 1.0, "high": 1.25 }
+  },
+  "fee_leverage_multipliers_by_x": {
+    "1": 1,
+    "2": 1.1,
+    "3": 1.2,
+    "5": 1.35,
+    "10": 1.6
+  },
+  "pass_through_cap_by_leverage": {
+    "1": 1.0,
+    "2": 1.5,
+    "5": 2.0,
+    "10": 3.0
+  },
+  "coverage_override_tiers": ["Pro (Gold)", "Pro (Platinum)"],
+  "duration_fee_per_day_pct": 0.04,
+  "duration_fee_max_pct": 0.6,
+  "partial_coverage_discount_pct": 0.15,
+  "ctc_enabled": true,
+  "ctc_buffer_pct": 0.15,
+  "ctc_margin_by_tier": {
+    "Pro (Bronze)": 0.6,
+    "Pro (Silver)": 0.5,
+    "Pro (Gold)": 0.4,
+    "Pro (Platinum)": 0.3
+  },
+  "ctc_ops_buffer_usdc_by_tier": {
+    "Pro (Bronze)": 1,
+    "Pro (Silver)": 2,
+    "Pro (Gold)": 3,
+    "Pro (Platinum)": 4
+  },
+  "ctc_floor_buckets": [0.12, 0.16, 0.2],
+  "ctc_price_buffer_pct": 0.02,
+  "ctc_max_snapshot_age_ms": 10000,
+  "default_target_days": 7,
+  "max_target_days": 7,
+  "fallback_target_days": 14,
+  "survival_tolerance_pct": 0.98
+}

@@ -1,0 +1,23 @@
+{
+  "accounts": [
+    {
+      "accountId": "demo",
+      "drawdownLimitUsdc": "9000",
+      "initialBalanceUsdc": "10000",
+      "hedgeInstrument": "BTC-PERPETUAL",
+      "hedgeSize": 0.1,
+      "bufferTargetPct": 0.05,
+      "hysteresisPct": 0.01,
+      "expiryIso": "2026-02-25T08:00:00Z",
+      "renewWindowMinutes": 240,
+      "renewPayload": {
+        "spotPrice": 50000,
+        "drawdownFloorPct": 0.2,
+        "fixedPriceUsdc": 25,
+        "expiryTag": "30DEC25",
+        "amount": 1
+      },
+      "alertWebhookUrl": ""
+    }
+  ]
+}

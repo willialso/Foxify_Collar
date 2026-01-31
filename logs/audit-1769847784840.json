@@ -1,0 +1,60 @@
+{
+  "ts": "2026-01-31T08:22:37.805Z",
+  "tier": "Pro (Bronze)",
+  "autoRenew": true,
+  "feeUsd": 20,
+  "totalFeeUsd": 20,
+  "subsidyUsd": 0,
+  "reason": "flat_fee",
+  "selectedIds": [
+    "7mxx4pl4"
+  ],
+  "coverageId": "Pro (Bronze):2026-02-07:7mxx4pl4",
+  "portfolio": {
+    "tierName": "Pro (Bronze)",
+    "positions": [
+      {
+        "id": "7mxx4pl4",
+        "asset": "BTC",
+        "side": "long",
+        "marginUsd": 500,
+        "leverage": 1,
+        "entryPrice": 83093.72
+      }
+    ]
+  },
+  "floorUsd": 2000,
+  "equityUsd": 2500,
+  "expiryIso": "2026-02-07T08:22:37.805Z",
+  "notionalUsdc": 500,
+  "hedge": {
+    "hedgeType": "option",
+    "instrument": "BTC-3FEB26-70000-P",
+    "premiumUsdc": "1.99",
+    "subsidyUsdc": null,
+    "reason": "flat_fee",
+    "hedgeSize": 0.006,
+    "optionType": "put",
+    "strike": "70000",
+    "floorPrice": "66474.98",
+    "expiryTag": "3FEB26",
+    "targetDays": 3,
+    "order": {
+      "status": "paper_filled",
+      "id": "paper-order-1769847784830",
+      "request": {
+        "instrument": "BTC-13FEB26-70000-P",
+        "amount": 0.006,
+        "side": "buy",
+        "type": "market"
+      },
+      "fillPrice": 0.0024,
+      "fillCurrency": "btc",
+      "bestBid": 0.0022,
+      "bestAsk": 0.0024,
+      "availableSize": 25,
+      "bookTimestamp": 1769847783729,
+      "filledAmount": 0.006
+    }
+  }
+}

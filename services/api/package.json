@@ -1,0 +1,23 @@
+{
+  "name": "@foxify/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/server.ts",
+  "dependencies": {
+    "@fastify/cors": "^8.5.0",
+    "@foxify/connectors": "0.1.0",
+    "@foxify/hedging": "0.1.0",
+    "decimal.js": "^10.4.3",
+    "fastify": "^4.28.1",
+    "ws": "^8.19.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts"
+  }
+}

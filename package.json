@@ -1,0 +1,16 @@
+{
+  "name": "foxify_collar",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace apps/web run dev",
+    "build:web": "npm --workspace apps/web run build",
+    "dev:api": "npm --workspace services/api run dev",
+    "test": "npm --workspace services/hedging run test"
+  }
+}
