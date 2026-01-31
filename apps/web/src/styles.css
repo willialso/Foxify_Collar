@@ -539,6 +539,10 @@ select.input {
   padding: 16px;
 }
 
+.modal-card.modal-wide {
+  width: min(1100px, 100%);
+}
+
 .modal-header {
   display: flex;
   justify-content: space-between;

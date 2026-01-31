@@ -1988,7 +1988,14 @@ app.post("/put/quote", async (req) => {
     }
     const premiumTotal = bestCandidate.premiumTotal;
     const allInPremium = bestCandidate.allInPremium;
-    const premiumFloor = premiumFloorBreached(allInPremium, feeUsdc);
+    const isBronzeFixed = tierName === "Pro (Bronze)" && leverage <= 2;
+    const premiumFloor = isBronzeFixed
+      ? {
+          breached: false,
+          ratio: new Decimal(0),
+          threshold: new Decimal(riskControls.premium_floor_ratio ?? 1.25)
+        }
+      : premiumFloorBreached(allInPremium, feeUsdc);
     let subsidyNeeded = allInPremium.minus(feeUsdc);
     let subsidyCheck = canApplySubsidy(
       tierName,
@@ -2341,7 +2348,14 @@ app.post("/put/quote", async (req) => {
     feeReason = "ctc_safety";
   }
   const allInPremium = quote.allInPremium;
-  const premiumFloor = premiumFloorBreached(allInPremium, feeUsdc);
+  const isBronzeFixed = tierName === "Pro (Bronze)" && leverage <= 2;
+  const premiumFloor = isBronzeFixed
+    ? {
+        breached: false,
+        ratio: new Decimal(0),
+        threshold: new Decimal(riskControls.premium_floor_ratio ?? 1.25)
+      }
+    : premiumFloorBreached(allInPremium, feeUsdc);
   const canPassThrough = FOXIFY_APPROVED && body.allowPremiumPassThrough;
   const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage);
   const canFullyCoverQuote = quote.availableSize.greaterThanOrEqualTo(requiredSize);
@@ -2987,7 +3001,14 @@ app.post("/put/auto-renew", async (req) => {
     effectiveFeeUsdc = renewSafety.feeUsdc;
     renewReason = "ctc_safety";
   }
-  const renewPremiumFloor = premiumFloorBreached(effectiveAllInPremium, effectiveFeeUsdc);
+  const isBronzeFixed = tierName === "Pro (Bronze)" && renewLeverage <= 2;
+  const renewPremiumFloor = isBronzeFixed
+    ? {
+        breached: false,
+        ratio: new Decimal(0),
+        threshold: new Decimal(riskControls.premium_floor_ratio ?? 1.25)
+      }
+    : premiumFloorBreached(effectiveAllInPremium, effectiveFeeUsdc);
   const renewCanPassThrough = FOXIFY_APPROVED && body.allowPremiumPassThrough;
   let subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
   let subsidyCheck = canApplySubsidy(

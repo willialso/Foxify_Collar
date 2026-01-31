@@ -47,9 +47,19 @@ type AuditEntry = {
   payload?: Record<string, unknown>;
 };
 
-export function AuditDashboard() {
-  const [summary, setSummary] = useState<AuditSummary | null>(null);
-  const [entries, setEntries] = useState<AuditEntry[]>([]);
+export function AuditDashboard({
+  initialSummary,
+  initialEntries
+}: {
+  initialSummary?: Record<string, unknown> | null;
+  initialEntries?: Array<Record<string, unknown>>;
+}) {
+  const [summary, setSummary] = useState<AuditSummary | null>(
+    (initialSummary as AuditSummary) ?? null
+  );
+  const [entries, setEntries] = useState<AuditEntry[]>(
+    (initialEntries as AuditEntry[]) ?? []
+  );
   const [coverageFilter, setCoverageFilter] = useState<string | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);

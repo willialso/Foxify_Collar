@@ -143,6 +143,11 @@ export function App() {
   const [portfolioError, setPortfolioError] = useState<string | null>(null);
   const [isActivating, setIsActivating] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditPrefetchSummary, setAuditPrefetchSummary] = useState<Record<string, unknown> | null>(
+    null
+  );
+  const [auditPrefetchEntries, setAuditPrefetchEntries] = useState<Array<Record<string, unknown>>>([]);
   const [riskSummary, setRiskSummary] = useState<RiskSummary | null>(null);
   const [feeRegimeLabel, setFeeRegimeLabel] = useState<string | null>(null);
   const [protectionTierName, setProtectionTierName] = useState<string | null>(null);
@@ -1125,6 +1130,8 @@ export function App() {
   const remainingMargin = level
     ? Number(level.funding_usdc) - portfolioStats.totalMargin
     : 0;
+  const hasProtectedPosition =
+    portfolio?.positions?.some((pos) => protectedIds.includes(pos.id)) ?? false;
   const bronzeFixed =
     level?.name === "Pro (Bronze)" && (selectedPositions[0]?.leverage ?? 0) <= 2;
   const volAdjusted =
@@ -1175,10 +1182,38 @@ export function App() {
             {DATA_MODE === "demo" ? (
               <>
                 <button className="btn" onClick={() => setPortfolioOpen(true)}>
-                  {portfolio ? "Edit" : "Add"} Position
+                  {protectionActive ? "Add" : portfolio ? "Edit" : "Add"} Position
                 </button>
-                <button className="btn" onClick={() => setShowAudit((prev) => !prev)}>
-                  {showAudit ? "Hide Audit" : "Audit"}
+                <button
+                  className="btn"
+                  onClick={async () => {
+                    if (showAudit) {
+                      setShowAudit(false);
+                      return;
+                    }
+                    if (auditLoading) return;
+                    setAuditLoading(true);
+                    try {
+                      const [summaryRes, entriesRes] = await Promise.all([
+                        fetch(`${API_BASE}/audit/summary?mode=internal`),
+                        fetch(`${API_BASE}/audit/entries?limit=200`)
+                      ]);
+                      if (!summaryRes.ok || !entriesRes.ok) throw new Error("audit_fetch_failed");
+                      const summaryData = await summaryRes.json();
+                      const entriesData = await entriesRes.json();
+                      setAuditPrefetchSummary(summaryData);
+                      setAuditPrefetchEntries(Array.isArray(entriesData) ? entriesData : []);
+                      setShowAudit(true);
+                    } catch {
+                      setToast("Audit data unavailable.");
+                      setTimeout(() => setToast(null), 2000);
+                    } finally {
+                      setAuditLoading(false);
+                    }
+                  }}
+                  disabled={auditLoading}
+                >
+                  {showAudit ? "Hide Audit" : auditLoading ? "Loading..." : "Audit"}
                 </button>
               </>
             ) : (
@@ -1320,7 +1355,12 @@ export function App() {
           </>
         )}
 
-        {showAudit && <AuditDashboard />}
+        {showAudit && (
+          <AuditDashboard
+            initialSummary={auditPrefetchSummary}
+            initialEntries={auditPrefetchEntries}
+          />
+        )}
 
         {protectionActive && !showAudit && (
           <>
@@ -1466,12 +1506,20 @@ export function App() {
                 <strong>${formatUsd(Math.max(0, remainingMargin))}</strong>
               </div>
               <div className="divider" />
+              {protectionActive && hasProtectedPosition && (
+                <div className="disclaimer">
+                  Protected position is locked. Add a new position after protection ends.
+                </div>
+              )}
               <PortfolioForm
                 levels={levels}
                 level={level}
                 remainingMargin={remainingMargin}
                 spotPrices={spotPrices}
-                existingPosition={portfolio?.positions?.[0] ?? null}
+                existingPosition={
+                  protectionActive && hasProtectedPosition ? null : portfolio?.positions?.[0] ?? null
+                }
+                disabled={protectionActive && hasProtectedPosition}
                 onSave={(position) => {
                   setPortfolio((prev) => ({
                     tierName: prev?.tierName || level?.name || "",
@@ -1504,6 +1552,7 @@ export function App() {
                           }));
                           setSelectedIds((prev) => (prev.includes(p.id) ? [] : prev));
                         }}
+                        disabled={isProtected}
                       >
                         Remove
                       </button>
@@ -1519,6 +1568,18 @@ export function App() {
                 <button
                   className="btn btn-secondary"
                   onClick={() => {
+                    if (protectionActive || hasProtectedPosition) {
+                      setPortfolio((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              positions: prev.positions.filter((item) => protectedIds.includes(item.id))
+                            }
+                          : prev
+                      );
+                      setSelectedIds((prev) => prev.filter((id) => protectedIds.includes(id)));
+                      return;
+                    }
                     setPortfolio(null);
                     setSelectedIds([]);
                     setProtectionActive(false);
@@ -1557,6 +1618,7 @@ function PortfolioForm({
   remainingMargin,
   spotPrices,
   existingPosition,
+  disabled,
   onSave
 }: {
   levels: FundedLevel[];
@@ -1564,6 +1626,7 @@ function PortfolioForm({
   remainingMargin: number;
   spotPrices: Record<Asset, number | null>;
   existingPosition: PortfolioPosition | null;
+  disabled?: boolean;
   onSave: (position: PortfolioPosition) => void;
 }) {
   const [asset, setAsset] = useState<Asset>(existingPosition?.asset || "BTC");
@@ -1585,6 +1648,7 @@ function PortfolioForm({
 
   const availableMargin = remainingMargin + (existingPosition?.marginUsd || 0);
   const canSave =
+    !disabled &&
     level &&
     marginUsd > 0 &&
     marginUsd <= availableMargin &&
@@ -1594,6 +1658,7 @@ function PortfolioForm({
 
   useEffect(() => {
     if (!existingPosition) return;
+    if (disabled) return;
     if (!canSave) return;
     if (!autoSaveInitRef.current) {
       autoSaveInitRef.current = true;
@@ -1624,7 +1689,12 @@ function PortfolioForm({
     <div className="recommendation">
       <div className="row">
         <span>Asset</span>
-        <select className="input" value={asset} onChange={(e) => setAsset(e.target.value as Asset)}>
+        <select
+          className="input"
+          value={asset}
+          onChange={(e) => setAsset(e.target.value as Asset)}
+          disabled={disabled}
+        >
           {ASSETS.map((item) => (
             <option key={item} value={item}>
               {item}
@@ -1634,7 +1704,12 @@ function PortfolioForm({
       </div>
       <div className="row">
         <span>Side</span>
-        <select className="input" value={side} onChange={(e) => setSide(e.target.value as "long" | "short")}>
+        <select
+          className="input"
+          value={side}
+          onChange={(e) => setSide(e.target.value as "long" | "short")}
+          disabled={disabled}
+        >
           <option value="long">Long</option>
           <option value="short">Short</option>
         </select>
@@ -1648,6 +1723,7 @@ function PortfolioForm({
           step="50"
           value={marginUsd}
           onChange={(e) => setMarginUsd(Number(e.target.value || 0))}
+          disabled={disabled}
         />
       </div>
       <div className="row">
@@ -1660,6 +1736,7 @@ function PortfolioForm({
           step="1"
           value={leverage}
           onChange={(e) => setLeverage(Number(e.target.value || 1))}
+          disabled={disabled}
         />
       </div>
       <div className="row">
@@ -1667,17 +1744,21 @@ function PortfolioForm({
         <strong>{spot ? `$${spot.toFixed(2)}` : "—"}</strong>
       </div>
       {!existingPosition && (
-        <button className="btn btn-primary add-position" onClick={() => {
-          if (!canSave) return;
-          onSave({
-            id: Math.random().toString(36).slice(2, 10),
-            asset,
-            side,
-            marginUsd,
-            leverage,
-            entryPrice: spot
-          });
-        }} disabled={!canSave}>
+        <button
+          className="btn btn-primary add-position"
+          onClick={() => {
+            if (!canSave) return;
+            onSave({
+              id: Math.random().toString(36).slice(2, 10),
+              asset,
+              side,
+              marginUsd,
+              leverage,
+              entryPrice: spot
+            });
+          }}
+          disabled={!canSave}
+        >
           Add Position
         </button>
       )}
