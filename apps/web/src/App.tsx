@@ -138,6 +138,7 @@ export function App() {
   const [protectionExpiry, setProtectionExpiry] = useState<string | null>(null);
   const [protectedIds, setProtectedIds] = useState<string[]>([]);
   const [showAudit, setShowAudit] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
   const [lastExecution, setLastExecution] = useState<string | null>(null);
   const [lastCoverageId, setLastCoverageId] = useState<string | null>(null);
   const [portfolioError, setPortfolioError] = useState<string | null>(null);
@@ -200,6 +201,93 @@ export function App() {
   } | null>(null);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const media = window.matchMedia("(max-width: 767px)");
+    const handle = () => setIsMobile(media.matches);
+    handle();
+    if (media.addEventListener) {
+      media.addEventListener("change", handle);
+      return () => media.removeEventListener("change", handle);
+    }
+    media.addListener(handle);
+    return () => media.removeListener(handle);
+  }, []);
+
+  useEffect(() => {
+    if (isMobile && showAudit) {
+      setShowAudit(false);
+    }
+  }, [isMobile, showAudit]);
+
+  const fetchPositions = async (accountId = "demo") => {
+    try {
+      const response = await fetch(
+        `${API_BASE}/portfolio/positions?accountId=${encodeURIComponent(accountId)}`
+      );
+      const data = await response.json();
+      if (data?.status !== "ok" || !Array.isArray(data.positions)) return;
+      const nextPositions = data.positions
+        .map((pos: any, idx: number) => {
+          const entryPrice = Number(pos?.entryPrice ?? 0);
+          const size = Number(pos?.size ?? 0);
+          const leverage = Number(pos?.leverage ?? 1);
+          if (!Number.isFinite(entryPrice) || entryPrice <= 0) return null;
+          if (!Number.isFinite(size) || size <= 0) return null;
+          if (!Number.isFinite(leverage) || leverage <= 0) return null;
+          const marginUsd = (size * entryPrice) / leverage;
+          return {
+            id:
+              typeof pos?.id === "string"
+                ? pos.id
+                : `${pos?.asset || "BTC"}-${pos?.side || "long"}-${leverage}-${entryPrice}-${idx}`,
+            asset: (pos?.asset || "BTC") as Asset,
+            side: pos?.side === "short" ? "short" : "long",
+            marginUsd,
+            leverage,
+            entryPrice
+          } as PortfolioPosition;
+        })
+        .filter((pos: PortfolioPosition | null): pos is PortfolioPosition => Boolean(pos));
+      setPortfolio((prev) => ({
+        tierName: prev?.tierName || level?.name || "Pro (Bronze)",
+        positions: nextPositions
+      }));
+      if (nextPositions.length > 0) {
+        console.log(`✓ Loaded ${nextPositions.length} position(s) from server`);
+      }
+      return nextPositions;
+    } catch (error) {
+      console.warn("Failed to load positions on mount:", error);
+    }
+    return null;
+  };
+
+  const syncPositions = async (nextPortfolio: Portfolio) => {
+    const accountId = "demo";
+    const exposures = nextPortfolio.positions.map((pos) => ({
+      asset: pos.asset,
+      side: pos.side,
+      entryPrice: pos.entryPrice,
+      size: pos.entryPrice > 0 ? (pos.marginUsd * pos.leverage) / pos.entryPrice : 0,
+      leverage: pos.leverage
+    }));
+    try {
+      await fetch(`${API_BASE}/portfolio/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountId,
+          positions: exposures,
+          source: "manual"
+        })
+      });
+      await fetchPositions(accountId);
+    } catch (error) {
+      console.warn("Failed to sync positions:", error);
+    }
+  };
+
+  useEffect(() => {
     const loadLevels = async () => {
       const res = await fetch("/funded_levels.json");
       const data = await res.json();
@@ -210,6 +298,58 @@ export function App() {
     };
     loadLevels();
   }, [DATA_MODE, FOXIFY_ENABLED, FOXIFY_POSITION_ENDPOINT]);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      const accountId = "demo";
+      try {
+        const [positions, coverageResponse] = await Promise.all([
+          fetchPositions(accountId),
+          fetch(`${API_BASE}/coverage/active?accountId=${encodeURIComponent(accountId)}`).then(
+            (res) => res.json()
+          )
+        ]);
+
+        const coverages = Array.isArray(coverageResponse?.coverages)
+          ? (coverageResponse.coverages as any[])
+          : [];
+
+        if (positions && coverages.length > 0) {
+          const coverageMap = new Map<string, any>();
+          for (const coverage of coverages) {
+            const pos = coverage?.positions?.[0];
+            if (!pos) continue;
+            const key = `${pos.asset}-${pos.side}-${pos.entryPrice}`;
+            coverageMap.set(key, coverage);
+          }
+
+          const protectedIds = positions
+            .map((pos) => {
+              const key = `${pos.asset}-${pos.side}-${pos.entryPrice}`;
+              return coverageMap.has(key) ? pos.id : null;
+            })
+            .filter((id): id is string => Boolean(id));
+
+          setProtectedIds(protectedIds);
+          setProtectionActive(protectedIds.length > 0);
+
+          const firstCoverage = coverages[0];
+          if (firstCoverage?.expiryIso) {
+            setProtectionExpiry(firstCoverage.expiryIso);
+          }
+          if (firstCoverage?.coverageId) {
+            setLastCoverageId(firstCoverage.coverageId);
+          }
+
+          console.log(`✓ Loaded ${coverages.length} active coverage(s)`);
+        }
+      } catch (error) {
+        console.error("Failed to fetch data:", error);
+      }
+    };
+
+    fetchData();
+  }, []);
 
   useEffect(() => {
     const loadSpot = async () => {
@@ -799,16 +939,35 @@ export function App() {
               side: netSide,
               coverageId,
               targetDays: expiryDays,
-              allowPremiumPassThrough: FOXIFY_APPROVED
+              allowPremiumPassThrough: true
             })
           });
           quote = await quoteRes.json();
 
+          if (quote?.status === "pass_through" || quote?.status === "pass_through_capped") {
+            const pricing = quote?.pricing;
+            const message =
+              quote.status === "pass_through"
+                ? `High volatility: Premium is ${pricing?.ratio || "N/A"}× base fee. You'll be charged $${quote.feeUsdc} for full protection.`
+                : `Premium exceeds tier cap. Fee capped at $${quote.feeUsdc}. Platform subsidizing $${quote.subsidyUsdc || "0"} for full protection.`;
+            setLastExecution(message);
+          }
+
+          if (quote?.status === "partial") {
+            setLastExecution(
+              `Partial coverage is not supported for ${level.name}. ` +
+                "Upgrade tier or adjust leverage/duration for full protection."
+            );
+            setIsActivating(false);
+            return;
+          }
+
           if (quote?.status === "premium_floor") {
             const ratio = quote?.warning?.ratio ?? "";
-            setLastExecution(
-              `Premium exceeds fee floor${ratio ? ` (ratio ${ratio}).` : "."} Pass-through required.`
-            );
+            const explanation =
+              quote?.pricing?.explanation ||
+              `Premium exceeds fee floor${ratio ? ` (ratio ${ratio}).` : "."} Pass-through required.`;
+            setLastExecution(explanation);
             setIsActivating(false);
             return;
           }
@@ -1185,7 +1344,7 @@ export function App() {
                   {protectionActive ? "Add" : portfolio ? "Edit" : "Add"} Position
                 </button>
                 <button
-                  className="btn"
+                  className="btn audit-toggle"
                   onClick={async () => {
                     if (showAudit) {
                       setShowAudit(false);
@@ -1194,17 +1353,26 @@ export function App() {
                     if (auditLoading) return;
                     setAuditLoading(true);
                     try {
-                      const [summaryRes, entriesRes] = await Promise.all([
-                        fetch(`${API_BASE}/audit/summary?mode=internal`),
-                        fetch(`${API_BASE}/audit/entries?limit=200`)
-                      ]);
-                      if (!summaryRes.ok || !entriesRes.ok) throw new Error("audit_fetch_failed");
+                      const summaryRes = await fetch(`${API_BASE}/audit/summary?mode=internal`);
+                      if (!summaryRes.ok) throw new Error("audit_summary_failed");
                       const summaryData = await summaryRes.json();
+
+                      const entriesRes = await fetch(`${API_BASE}/audit/logs?limit=200`);
+                      if (!entriesRes.ok) throw new Error("audit_entries_failed");
+
                       const entriesData = await entriesRes.json();
                       setAuditPrefetchSummary(summaryData);
-                      setAuditPrefetchEntries(Array.isArray(entriesData) ? entriesData : []);
+                      setAuditPrefetchEntries(
+                        Array.isArray(entriesData?.entries) ? entriesData.entries : []
+                      );
+                      if (entriesData?.count !== undefined) {
+                        console.log(
+                          `✓ Loaded ${entriesData.count} audit events (${entriesData.totalEvents || 0} total)`
+                        );
+                      }
                       setShowAudit(true);
-                    } catch {
+                    } catch (error) {
+                      console.error("Failed to fetch audit logs:", error);
                       setToast("Audit data unavailable.");
                       setTimeout(() => setToast(null), 2000);
                     } finally {
@@ -1355,7 +1523,7 @@ export function App() {
           </>
         )}
 
-        {showAudit && (
+        {showAudit && !isMobile && (
           <AuditDashboard
             initialSummary={auditPrefetchSummary}
             initialEntries={auditPrefetchEntries}
@@ -1520,11 +1688,13 @@ export function App() {
                   protectionActive && hasProtectedPosition ? null : portfolio?.positions?.[0] ?? null
                 }
                 disabled={protectionActive && hasProtectedPosition}
-                onSave={(position) => {
-                  setPortfolio((prev) => ({
-                    tierName: prev?.tierName || level?.name || "",
+                onSave={async (position) => {
+                  const nextPortfolio = {
+                    tierName: portfolio?.tierName || level?.name || "Pro (Bronze)",
                     positions: [position]
-                  }));
+                  };
+                  setPortfolio(nextPortfolio);
+                  await syncPositions(nextPortfolio);
                 }}
               />
               <div className="positions">

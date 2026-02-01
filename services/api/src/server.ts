@@ -43,20 +43,63 @@ import {
 } from "./riskControls";
 import { sendWebhookAlert } from "@foxify/hedging";
 
+// ═══════════════════════════════════════════════════════════
+// CEO-FOCUSED AUDIT EVENTS (Filter for Modal Display)
+// ═══════════════════════════════════════════════════════════
+
+const CEO_AUDIT_EVENTS = [
+  "coverage_activated",
+  "coverage_renewed",
+  "coverage_expired",
+  "coverage_duplicate",
+  "liquidity_update",
+  "hedge_order",
+  "hedge_action",
+  "put_quote_failed",
+  "put_renew_failed",
+  "option_exec_failed",
+  "close_blocked",
+  "put_renew"
+];
+
+const EXCLUDED_AUDIT_EVENTS = [
+  "portfolio_ingest",
+  "mtm_credit",
+  "audit_seed",
+  "system_startup",
+  "iv_ladder_ready",
+  "audit_parse_error",
+  "put_quote",
+  "quote_expired",
+  "loop_tick"
+];
+
+function isCeoRelevantEvent(eventName: string): boolean {
+  return CEO_AUDIT_EVENTS.includes(eventName);
+}
+
 const app = Fastify();
 await app.register(cors, { origin: true });
-const LOOP_INTERVAL_MS = Number(process.env.LOOP_INTERVAL_MS || "15000");
-const MTM_INTERVAL_MS = Number(process.env.MTM_INTERVAL_MS || "60000");
+const LOOP_INTERVAL_MS = Number(process.env.LOOP_INTERVAL_MS || "600000");
+const MTM_INTERVAL_MS = Number(process.env.MTM_INTERVAL_MS || "300000");
 const APP_MODE = process.env.APP_MODE || "demo";
-const FOXIFY_APPROVED = process.env.FOXIFY_APPROVED === "true";
 const AUDIT_SEED = process.env.AUDIT_SEED !== "false";
 const CONFIG_PATH = process.env.ACCOUNTS_CONFIG_PATH || "../../../configs/live_accounts.json";
 const AUDIT_LOG_PATH = new URL("../../../logs/audit.log", import.meta.url);
 const LOGS_DIR = new URL("../../../logs/", import.meta.url);
 const RISK_CONTROLS_PATH = new URL("../../../configs/risk_controls.json", import.meta.url);
-const QUOTE_CACHE_TTL_MS = Number(process.env.QUOTE_CACHE_TTL_MS || "4000");
+const COVERAGE_FILE_PATH = new URL("../../../logs/coverages.json", import.meta.url);
+const HEDGE_LEDGER_PATH = new URL("../../../logs/hedge-ledger.json", import.meta.url);
+const QUOTE_CACHE_TTL_MS = Number(process.env.QUOTE_CACHE_TTL_MS || "300000");
 const QUOTE_CACHE_STALE_MS = Number(process.env.QUOTE_CACHE_STALE_MS || "20000");
 const QUOTE_CACHE_HARD_MS = Number(process.env.QUOTE_CACHE_HARD_MS || "120000");
+
+console.log(
+  `✓ Hedging loop interval: ${LOOP_INTERVAL_MS}ms (${(LOOP_INTERVAL_MS / 60000).toFixed(1)} minutes)`
+);
+console.log(
+  `✓ MTM update interval: ${MTM_INTERVAL_MS}ms (${(MTM_INTERVAL_MS / 60000).toFixed(1)} minutes)`
+);
 
 // Load config at startup (fail fast if invalid)
 const configUrl = new URL(CONFIG_PATH, import.meta.url);
@@ -151,6 +194,116 @@ async function readAuditEntries(limit = 200): Promise<Array<Record<string, unkno
       });
   } catch {
     return [];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// COVERAGE PERSISTENCE
+// ═══════════════════════════════════════════════════════════
+
+async function saveCoverages(): Promise<void> {
+  try {
+    const data = Array.from(activeCoverages.entries());
+    await writeFile(COVERAGE_FILE_PATH, JSON.stringify(data, null, 2), "utf-8");
+    console.log(`✓ Saved ${data.length} coverage(s) to file`);
+  } catch (error) {
+    console.error("Failed to save coverages:", error);
+  }
+}
+
+async function loadCoverages(): Promise<void> {
+  try {
+    const { existsSync } = await import("node:fs");
+    if (!existsSync(COVERAGE_FILE_PATH)) {
+      console.log("No coverage file found (fresh start)");
+      return;
+    }
+    const raw = await (await import("node:fs/promises")).readFile(
+      COVERAGE_FILE_PATH,
+      "utf-8"
+    );
+    const data = JSON.parse(raw) as Array<[string, CoverageRecord]>;
+    const now = Date.now();
+    let loadedCount = 0;
+    let expiredCount = 0;
+    for (const [key, value] of data) {
+      const expiryMs = Date.parse(value.expiryIso);
+      if (Number.isFinite(expiryMs) && expiryMs > now) {
+        activeCoverages.set(key, value);
+        loadedCount++;
+      } else {
+        expiredCount++;
+      }
+    }
+    console.log(`✓ Loaded ${loadedCount} active coverage(s), skipped ${expiredCount} expired`);
+  } catch (error) {
+    console.error("Failed to load coverages:", error);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// HEDGE LEDGER PERSISTENCE
+// ═══════════════════════════════════════════════════════════
+
+function serializeHedgeLedger(): Array<[string, { size: string; avgCostUsdc: string }]> {
+  const entries: Array<[string, { size: string; avgCostUsdc: string }]> = [];
+  for (const [instrument, entry] of hedgeLedger.entries()) {
+    entries.push([
+      instrument,
+      {
+        size: entry.size.toString(),
+        avgCostUsdc: entry.avgCostUsdc.toString()
+      }
+    ]);
+  }
+  return entries;
+}
+
+async function saveHedgeLedger(): Promise<void> {
+  try {
+    const data = {
+      ledger: serializeHedgeLedger(),
+      realizedPnl: realizedHedgePnlUsdc.toString(),
+      timestamp: new Date().toISOString()
+    };
+    await writeFile(HEDGE_LEDGER_PATH, JSON.stringify(data, null, 2), "utf-8");
+    console.log(
+      `✓ Saved hedge ledger (${data.ledger.length} positions, realizedPnl=$${realizedHedgePnlUsdc.toFixed(
+        2
+      )})`
+    );
+  } catch (error) {
+    console.error("Failed to save hedge ledger:", error);
+  }
+}
+
+async function loadHedgeLedger(): Promise<void> {
+  try {
+    const { existsSync } = await import("node:fs");
+    if (!existsSync(HEDGE_LEDGER_PATH)) {
+      console.log("No hedge ledger found (fresh start)");
+      return;
+    }
+    const raw = await (await import("node:fs/promises")).readFile(HEDGE_LEDGER_PATH, "utf-8");
+    const data = JSON.parse(raw) as {
+      ledger: Array<[string, { size: string; avgCostUsdc: string }]>;
+      realizedPnl: string;
+      timestamp: string;
+    };
+    for (const [instrument, entry] of data.ledger) {
+      hedgeLedger.set(instrument, {
+        size: new Decimal(entry.size),
+        avgCostUsdc: new Decimal(entry.avgCostUsdc)
+      });
+    }
+    realizedHedgePnlUsdc = new Decimal(data.realizedPnl);
+    console.log(
+      `✓ Loaded hedge ledger: ${data.ledger.length} positions, realizedPnl=$${realizedHedgePnlUsdc.toFixed(
+        2
+      )})`
+    );
+  } catch (error) {
+    console.error("Failed to load hedge ledger:", error);
   }
 }
 
@@ -449,7 +602,16 @@ function normalizeLeverage(rawLeverage?: number): { ok: boolean; value: number; 
   return { ok: true, value, max };
 }
 
-function resolvePassThroughCapMultiplier(leverage?: number): Decimal | null {
+function resolvePassThroughCapMultiplier(leverage?: number, tierName?: string): Decimal | null {
+  if (tierName && riskControls.pass_through_cap_by_tier) {
+    const tierCaps = riskControls.pass_through_cap_by_tier[tierName];
+    if (tierCaps) {
+      const selected = findLeverageMultiplier(leverage, tierCaps);
+      if (Number.isFinite(selected) && selected && selected > 0) {
+        return new Decimal(selected);
+      }
+    }
+  }
   const selected = findLeverageMultiplier(leverage, riskControls.pass_through_cap_by_leverage);
   if (!Number.isFinite(selected) || !selected || selected <= 0) return null;
   return new Decimal(selected);
@@ -458,24 +620,25 @@ function resolvePassThroughCapMultiplier(leverage?: number): Decimal | null {
 function applyPassThroughCap(
   baseFee: Decimal,
   allInPremium: Decimal,
-  leverage?: number
-): { maxFee: Decimal | null; capped: boolean; capMultiplier: Decimal | null } {
-  const capMultiplier = resolvePassThroughCapMultiplier(leverage);
-  if (!capMultiplier) return { maxFee: null, capped: false, capMultiplier: null };
+  leverage?: number,
+  tierName?: string
+): { maxFee: Decimal | null; capped: boolean; capMultiplier: Decimal | null; tierName?: string } {
+  const capMultiplier = resolvePassThroughCapMultiplier(leverage, tierName);
+  if (!capMultiplier) {
+    return { maxFee: null, capped: false, capMultiplier: null, tierName };
+  }
   const maxFee = baseFee.mul(capMultiplier);
   const capped = allInPremium.gt(maxFee);
-  return { maxFee, capped, capMultiplier };
+  return { maxFee, capped, capMultiplier, tierName };
 }
 
 function applyBronzeFixedFee(
   tierName: string,
   leverage: number,
-  feeUsdc: Decimal
+  feeUsdc: Decimal,
+  optionType?: "put" | "call"
 ): { fee: Decimal; applied: boolean } {
-  if (tierName !== "Pro (Bronze)" || leverage > 2) {
-    return { fee: feeUsdc, applied: false };
-  }
-  return { fee: new Decimal(20), applied: true };
+  return { fee: feeUsdc, applied: false };
 }
 
 function applyIvFeeUplift(tierName: string, feeUsdc: Decimal, iv?: number): Decimal {
@@ -501,7 +664,7 @@ async function resolveFeeIv(asset: string, iv?: number): Promise<NormalizedIv> {
     return normalizeIvValue(iv as number);
   }
   if (asset.toUpperCase() === "BTC") {
-    const ladder = ivLadder.getSnapshot();
+    const ladder = ivLadderPut.getSnapshot();
     if (ladder) {
       return normalizeIvValue(ladder.hedgeIv);
     }
@@ -517,6 +680,7 @@ async function calculateFeeBase(params: {
   leverage: number;
   asset: string;
   ivCandidate?: number;
+  optionType?: "put" | "call";
 }): Promise<{
   feeUsdc: Decimal;
   feeRegime: { regime: "low" | "normal" | "high" | null; multiplier: Decimal | null };
@@ -538,7 +702,12 @@ async function calculateFeeBase(params: {
     ? { fee: feeUsdc, multiplier: new Decimal(1) }
     : applyLeverageFee(feeUsdc, params.leverage);
   feeUsdc = feeLeverage.fee;
-  const bronzeFixed = applyBronzeFixedFee(params.tierName, params.leverage, feeUsdc);
+  const bronzeFixed = applyBronzeFixedFee(
+    params.tierName,
+    params.leverage,
+    feeUsdc,
+    params.optionType
+  );
   feeUsdc = bronzeFixed.fee;
   return { feeUsdc, feeRegime, feeLeverage, feeIv };
 }
@@ -563,12 +732,11 @@ function calculateCtcSafetyFee(params: {
   spotPrice: Decimal;
   positionSize: Decimal;
   leverage: number;
+  optionType: "put" | "call";
 }): { feeUsdc: Decimal | null; baseIv: number | null; hedgeIv: number | null } {
   if (!(riskControls.ctc_enabled ?? false)) return { feeUsdc: null, baseIv: null, hedgeIv: null };
-  if (params.tierName === "Pro (Bronze)" && params.leverage <= 2) {
-    return { feeUsdc: null, baseIv: null, hedgeIv: null };
-  }
-  const ladder = ivLadder.getSnapshot();
+  const ladder =
+    params.optionType === "put" ? ivLadderPut.getSnapshot() : ivLadderCall.getSnapshot();
   if (!ladder || !ladder.legs.length) {
     return { feeUsdc: null, baseIv: null, hedgeIv: null };
   }
@@ -582,7 +750,10 @@ function calculateCtcSafetyFee(params: {
     [3, 0.3],
     [7, 0.5]
   ]);
-  const floorPrice = params.spotPrice.mul(new Decimal(1).minus(params.drawdownPct));
+  const floorPrice =
+    params.optionType === "put"
+      ? params.spotPrice.mul(new Decimal(1).minus(params.drawdownPct))
+      : params.spotPrice.mul(new Decimal(1).plus(params.drawdownPct));
   if (floorPrice.lte(0)) return { feeUsdc: null, baseIv: ladder.baseIv, hedgeIv: ladder.hedgeIv };
   const notionalUsdc = params.spotPrice.mul(params.positionSize).mul(new Decimal(params.leverage));
   const bufferPct = riskControls.ctc_buffer_pct ?? 0.15;
@@ -618,7 +789,8 @@ function calculateCtcSafetyFee(params: {
       return { feeUsdc: null, baseIv: ladder.baseIv, hedgeIv: ladder.hedgeIv };
     }
     const strike = new Decimal(leg.strike);
-    const intrinsic = strike.minus(floorPrice);
+    const intrinsic =
+      params.optionType === "put" ? strike.minus(floorPrice) : floorPrice.minus(strike);
     if (intrinsic.lte(0)) {
       return { feeUsdc: null, baseIv: ladder.baseIv, hedgeIv: ladder.hedgeIv };
     }
@@ -765,6 +937,60 @@ app.post("/portfolio/ingest", async (req) => {
   return { status: "ok", accountId: body.accountId, count: body.positions.length, updatedAt };
 });
 
+// GET endpoint to retrieve stored positions
+app.get("/portfolio/positions", async (req, reply) => {
+  const query = req.query as { accountId?: string };
+  const accountId = query.accountId || "demo";
+
+  const snapshot = portfolioSnapshots.get(accountId);
+
+  if (!snapshot) {
+    return reply.send({
+      status: "ok",
+      accountId,
+      positions: [],
+      message: "No positions found",
+      updatedAt: new Date().toISOString()
+    });
+  }
+
+  return reply.send({
+    status: "ok",
+    accountId,
+    positions: snapshot.positions,
+    updatedAt: snapshot.updatedAt,
+    count: snapshot.positions.length
+  });
+});
+
+app.get("/coverage/active", async (req) => {
+  const query = req.query as { accountId?: string };
+  const accountId = query.accountId || "demo";
+
+  const now = Date.now();
+  const active: CoverageRecord[] = [];
+
+  for (const [key, coverage] of activeCoverages.entries()) {
+    const expiryMs = Date.parse(coverage.expiryIso);
+    if (Number.isFinite(expiryMs) && expiryMs > now) {
+      active.push(coverage);
+    } else {
+      activeCoverages.delete(key);
+    }
+  }
+
+  if (active.length !== activeCoverages.size) {
+    await saveCoverages();
+  }
+
+  return {
+    status: "ok",
+    accountId,
+    coverages: active,
+    count: active.length
+  };
+});
+
 app.get("/coverage/report", async (req) => {
   const query = req.query as { accountId?: string };
   const accountId = query.accountId || "demo";
@@ -861,7 +1087,7 @@ app.get("/integration/handshake", async () => {
   return {
     status: "ok",
     mode: APP_MODE,
-    approved: FOXIFY_APPROVED,
+    approved: riskControls.enable_premium_pass_through !== false,
     timestamp: new Date().toISOString()
   };
 });
@@ -997,8 +1223,9 @@ const pricingEngine = new MultiVenuePricingEngine([
   }
 ]);
 const ivCache = createDeribitIvCache(deribit, { ttlMs: 15000, fallbackIv: 0.5 });
-const ivLadder = createDeribitIvLadderCache(deribit, {
+const ivLadderPut = createDeribitIvLadderCache(deribit, {
   asset: "BTC",
+  optionType: "put",
   expiriesDays: [1, 2, 3, 5, 7],
   floorPcts: [0.12, 0.16, 0.2],
   refreshMs: 300000,
@@ -1006,11 +1233,32 @@ const ivLadder = createDeribitIvLadderCache(deribit, {
   maxSnapshotAgeMs: riskControls.ctc_max_snapshot_age_ms ?? 10000,
   priceBufferPct: riskControls.ctc_price_buffer_pct ?? 0.02
 });
-ivLadder.start();
+const ivLadderCall = createDeribitIvLadderCache(deribit, {
+  asset: "BTC",
+  optionType: "call",
+  expiriesDays: [1, 2, 3, 5, 7],
+  floorPcts: [0.12, 0.16, 0.2],
+  refreshMs: 300000,
+  maxAgeMs: 5000,
+  maxSnapshotAgeMs: riskControls.ctc_max_snapshot_age_ms ?? 10000,
+  priceBufferPct: riskControls.ctc_price_buffer_pct ?? 0.02
+});
+ivLadderPut.start();
+ivLadderCall.start();
 const ladderWarmup = setInterval(() => {
-  const snapshot = ivLadder.getSnapshot();
-  if (snapshot) {
-    console.log(`[iv] ladder_ready base=${snapshot.baseIv.toFixed(4)} hedge=${snapshot.hedgeIv.toFixed(4)}`);
+  const putSnapshot = ivLadderPut.getSnapshot();
+  const callSnapshot = ivLadderCall.getSnapshot();
+  if (putSnapshot) {
+    console.log(
+      `[iv] ladder_put_ready base=${putSnapshot.baseIv.toFixed(4)} hedge=${putSnapshot.hedgeIv.toFixed(4)}`
+    );
+  }
+  if (callSnapshot) {
+    console.log(
+      `[iv] ladder_call_ready base=${callSnapshot.baseIv.toFixed(4)} hedge=${callSnapshot.hedgeIv.toFixed(4)}`
+    );
+  }
+  if (putSnapshot && callSnapshot) {
     clearInterval(ladderWarmup);
   }
 }, 1000);
@@ -1509,6 +1757,7 @@ app.post("/deribit/order", async (req) => {
       sizeDelta,
       fillPriceUsdc
     });
+    await saveHedgeLedger();
   }
   await audit("hedge_order", {
     instrument: body.instrument,
@@ -1579,7 +1828,7 @@ app.get("/pricing/iv/:asset", async (req) => {
   if (asset !== "BTC") {
     return { asset, iv: null };
   }
-  const ladder = ivLadder.getSnapshot();
+  const ladder = ivLadderPut.getSnapshot();
   if (ladder) {
     return { asset, iv: Number(ladder.baseIv.toFixed(6)), ivHedge: Number(ladder.hedgeIv.toFixed(6)) };
   }
@@ -1595,6 +1844,8 @@ app.post("/pricing/ctc", async (req) => {
     drawdownFloorPct: number;
     positionSize: number;
     leverage?: number;
+    side?: "long" | "short";
+    targetDays?: number;
   };
   const asset = (body.asset || "BTC").toUpperCase();
   if (asset !== "BTC") {
@@ -1608,29 +1859,128 @@ app.post("/pricing/ctc", async (req) => {
   const spotPrice = new Decimal(body.spotPrice || 0);
   const drawdownFloorPct = new Decimal(body.drawdownFloorPct || 0);
   const positionSize = new Decimal(body.positionSize || 0);
+  const optionType = body.side === "short" ? "call" : "put";
   if (spotPrice.lte(0) || positionSize.lte(0)) {
     return { status: "no_quote", reason: "invalid_position" };
-  }
-  if (tierName === "Pro (Bronze)" && leverageCheck.value <= 2) {
-    return { status: "ok", feeUsdc: "20.00", reason: "bronze_fixed" };
   }
   const ctcSafety = calculateCtcSafetyFee({
     tierName,
     drawdownPct: drawdownFloorPct,
     spotPrice,
     positionSize,
-    leverage: leverageCheck.value
+    leverage: leverageCheck.value,
+    optionType
   });
-  if (ctcSafety.feeUsdc) {
-    return {
-      status: "ok",
-      feeUsdc: ctcSafety.feeUsdc.toFixed(2),
-      reason: "ctc_safety",
-      ivBase: ctcSafety.baseIv,
-      ivHedge: ctcSafety.hedgeIv
-    };
+  const targetDays = Math.max(1, Math.round(body.targetDays ?? 7));
+  const targetStrike = optionType === "put"
+    ? spotPrice.mul(new Decimal(1).minus(drawdownFloorPct))
+    : spotPrice.mul(new Decimal(1).plus(drawdownFloorPct));
+  const ladder = optionType === "put" ? ivLadderPut.getSnapshot() : ivLadderCall.getSnapshot();
+  let bestInstrument: { instrument: string; strike: number; tenorDays: number; markPrice: number | null } | null =
+    null;
+  const spotNumber = spotPrice.toNumber();
+  const targetStrikeNumber = targetStrike.toNumber();
+  if (ladder && ladder.legs.length > 0) {
+    const candidates = ladder.legs.filter((leg) => {
+      const tenorMatch = Math.abs(leg.tenorDays - targetDays) <= 2;
+      if (!tenorMatch) return false;
+      if (optionType === "put") {
+        return leg.strike <= spotNumber;
+      }
+      return leg.strike >= spotNumber;
+    });
+    if (candidates.length > 0) {
+      bestInstrument = candidates.reduce((best, leg) => {
+        const bestDiff = Math.abs(best.strike - targetStrikeNumber);
+        const legDiff = Math.abs(leg.strike - targetStrikeNumber);
+        return legDiff < bestDiff ? leg : best;
+      });
+    }
   }
-  return { status: "no_quote", reason: "ctc_unavailable" };
+
+  if (bestInstrument) {
+    const strikeValid =
+      optionType === "put" ? bestInstrument.strike <= spotNumber : bestInstrument.strike >= spotNumber;
+    if (!strikeValid) {
+      console.warn(
+        `Strike validation failed: ${optionType} strike ${bestInstrument.strike} vs spot ${spotNumber}`
+      );
+      bestInstrument = null;
+    }
+  }
+
+  let feeUsdc = ctcSafety.feeUsdc;
+  let feeReason = "ctc_safety";
+  if (!feeUsdc || feeUsdc.lte(0)) {
+    const fallbackFee = await calculateFeeBase({
+      tierName,
+      baseFeeUsdc: new Decimal(50),
+      targetDays,
+      leverage: leverageCheck.value,
+      asset,
+      ivCandidate: ctcSafety.hedgeIv ?? 0.6,
+      optionType
+    });
+    feeUsdc = fallbackFee.feeUsdc;
+    feeReason = "regime_fallback";
+  }
+
+  console.log("CTC Quote Debug:", {
+    optionType,
+    spotPrice: spotNumber,
+    targetStrike: targetStrikeNumber,
+    ladderReady: ladder ? "yes" : "no",
+    ladderLegs: ladder?.legs?.length || 0,
+    ctcFee: ctcSafety.feeUsdc?.toFixed(2) || null,
+    bestInstrument: bestInstrument?.instrument || null
+  });
+
+  const size = Number(body.positionSize || 1);
+  const premiumUsdc =
+    bestInstrument && Number.isFinite(bestInstrument.markPrice || 0)
+      ? new Decimal(bestInstrument.markPrice || 0)
+          .mul(spotPrice)
+          .mul(new Decimal(size))
+          .toFixed(2)
+      : null;
+  const expiryTag = bestInstrument?.instrument?.split("-")?.[1] || null;
+
+  return {
+    status: "ok",
+    feeUsdc: feeUsdc ? feeUsdc.toFixed(2) : "0.00",
+    reason: feeReason,
+    ivBase: ctcSafety.baseIv,
+    ivHedge: ctcSafety.hedgeIv,
+    optionType,
+    strike: bestInstrument ? bestInstrument.strike : targetStrikeNumber,
+    spotPrice: spotNumber,
+    drawdownFloorPct: drawdownFloorPct.toNumber(),
+    targetStrike: targetStrikeNumber,
+    hedge: bestInstrument
+      ? {
+          instrument: bestInstrument.instrument,
+          size,
+          premiumUsdc,
+          expiryTag,
+          daysToExpiry: bestInstrument.tenorDays,
+          strike: bestInstrument.strike
+        }
+      : {
+          instrument: null,
+          reason: "no_liquid_options",
+          fallback: "perp"
+        },
+    debug:
+      feeReason === "regime_fallback"
+        ? {
+            optionType,
+            ladderReady: !!ladder,
+            ladderLegs: ladder?.legs?.length || 0,
+            spotPrice: spotNumber,
+            targetStrike: targetStrikeNumber
+          }
+        : undefined
+  };
 });
 
 app.get("/risk/mtm", async () => {
@@ -1675,6 +2025,7 @@ type PutQuoteRequest = {
   coverageId?: string;
   accountId?: string;
   allowPremiumPassThrough?: boolean;
+  allowPartialCoverage?: boolean;
 };
 
 function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Record<string, unknown>> {
@@ -1717,31 +2068,51 @@ app.post("/put/quote", async (req) => {
   const cacheKey = buildQuoteCacheKey(body);
   const cached = getQuoteCache(cacheKey);
   if (cached && isQuoteCacheFresh(cached)) {
-    return cached.response;
+    // Temporarily bypass cache for Bronze call testing or explicit cache busting
+    if (body._cacheBust || (body.tierName === "Pro (Bronze)" && body.side === "short")) {
+      await audit("debug_cache_bypass", {
+        tierName: body.tierName,
+        side: body.side,
+        cacheBust: body._cacheBust ?? null
+      });
+    } else {
+      return cached.response;
+    }
   }
+  await audit("debug_quote_request", {
+    tier: body.tierName,
+    side: body.side,
+    leverage: body.leverage,
+    cached: cached ? "yes" : "no",
+    cacheBust: body._cacheBust ?? null
+  });
+  const cacheAndReturn = (response: Record<string, unknown>) => {
+    setQuoteCache(cacheKey, response);
+    return response;
+  };
 
   const asset = (body.asset || "BTC").toUpperCase();
   if (asset !== "BTC") {
-    return {
+    return cacheAndReturn({
       status: "no_quote",
       reason: "unsupported_asset"
-    };
+    });
   }
   const instruments = await deribit.listInstruments(asset);
   const results = (instruments as any)?.result || [];
   if (!results.length) {
-    return {
+    return cacheAndReturn({
       status: "no_quote",
       reason: "unsupported_asset"
-    };
+    });
   }
   if (!results.length) {
-    return {
+    return cacheAndReturn({
       status: "no_quote",
       expiryTag: "",
       targetDays: 0,
       reason: "unsupported_asset"
-    };
+    });
   }
   const useBodySpread = body.maxSpreadPct !== undefined;
   const useBodySlippage = body.maxSlippagePct !== undefined;
@@ -1756,11 +2127,11 @@ app.post("/put/quote", async (req) => {
   const contractSize = new Decimal(body.contractSize ?? 1);
   const leverageCheck = normalizeLeverage(body.leverage);
   if (!leverageCheck.ok) {
-    return {
+    return cacheAndReturn({
       status: "no_quote",
       reason: "invalid_leverage",
       maxLeverage: leverageCheck.max
-    };
+    });
   }
   const leverage = leverageCheck.value;
   const hedgeSize = body.optionDelta
@@ -1771,7 +2142,66 @@ app.post("/put/quote", async (req) => {
   const optionType = body.side === "short" ? "call" : "put";
   const spotPrice = new Decimal(body.spotPrice);
   const drawdownFloorPct = new Decimal(body.drawdownFloorPct);
+  const targetStrike =
+    optionType === "put"
+      ? spotPrice.mul(new Decimal(1).minus(drawdownFloorPct))
+      : spotPrice.mul(new Decimal(1).plus(drawdownFloorPct));
   const tierName = body.tierName || "Unknown";
+  if (tierName === "Pro (Bronze)" && optionType === "call") {
+    await audit("bronze_call_not_supported", {
+      tierName,
+      side: body.side,
+      optionType,
+      requestedLeverage: leverage
+    });
+    return cacheAndReturn({
+      status: "error",
+      error: "option_type_not_supported",
+      message:
+        "Bronze tier supports put protection (long positions) only. Call protection (short positions) not available.",
+      details: {
+        tierName,
+        requestedOptionType: optionType,
+        supportedTypes: ["put"],
+        reason: "Bronze tier optimized for long position protection due to cost dynamics"
+      },
+      suggestions: [
+        "Bronze tier: Use put protection for long positions (up to 10× leverage)",
+        "Short position protection not available at Bronze tier",
+        "Reduce position size or use unprotected shorts if comfortable with risk"
+      ]
+    });
+  }
+  const tierLeverageLimits = riskControls.max_leverage_by_tier?.[tierName];
+  if (tierLeverageLimits && optionType === "put") {
+    const maxLeverageForOption = tierLeverageLimits[optionType];
+    if (Number.isFinite(maxLeverageForOption) && leverage > maxLeverageForOption) {
+      await audit("leverage_validation_failed", {
+        tierName,
+        side: body.side,
+        optionType,
+        requestedLeverage: leverage,
+        maxAllowed: maxLeverageForOption
+      });
+      const currentDays = body.targetDays ?? riskControls.default_target_days ?? 7;
+      return cacheAndReturn({
+        status: "error",
+        error: "leverage_exceeded",
+        message: `${tierName} supports ${optionType} protection up to ${maxLeverageForOption}× leverage.`,
+        details: {
+          tierName,
+          optionType,
+          requestedLeverage: leverage,
+          maxAllowed: maxLeverageForOption
+        },
+        suggestions: [
+          `Reduce leverage to ${maxLeverageForOption}× or below`,
+          `Shorten duration (try 3-7 days)`,
+          "Increase drawdown floor percentage"
+        ]
+      });
+    }
+  }
   const expiryTargetDays = body.expiryTag
     ? targetDaysForExpiryTag(results, body.expiryTag)
     : null;
@@ -1949,13 +2379,13 @@ app.post("/put/quote", async (req) => {
         rejected,
         liquidityOverride: liquidityOverrideUsed
       });
-      return {
+      return cacheAndReturn({
         status: "no_quote",
         expiryTag: body.expiryTag || "",
         targetDays: 0,
         rejected,
         liquidityOverride: liquidityOverrideUsed
-      };
+      });
     }
 
     const candidateIv =
@@ -1968,9 +2398,11 @@ app.post("/put/quote", async (req) => {
       targetDays: bestCandidate.targetDays,
       leverage,
       asset,
-      ivCandidate: candidateIv
+      ivCandidate: candidateIv,
+      optionType
     });
     let feeUsdc = feeBase.feeUsdc;
+    const baseFeeUsdc = feeUsdc;
     const feeRegime = feeBase.feeRegime;
     const feeLeverage = feeBase.feeLeverage;
     const feeIv = feeBase.feeIv;
@@ -1979,7 +2411,8 @@ app.post("/put/quote", async (req) => {
       drawdownPct: drawdownFloorPct,
       spotPrice,
       positionSize,
-      leverage
+      leverage,
+      optionType
     });
     let feeReason = "flat_fee";
     if (ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
@@ -1988,14 +2421,12 @@ app.post("/put/quote", async (req) => {
     }
     const premiumTotal = bestCandidate.premiumTotal;
     const allInPremium = bestCandidate.allInPremium;
-    const isBronzeFixed = tierName === "Pro (Bronze)" && leverage <= 2;
-    const premiumFloor = isBronzeFixed
-      ? {
-          breached: false,
-          ratio: new Decimal(0),
-          threshold: new Decimal(riskControls.premium_floor_ratio ?? 1.25)
-        }
-      : premiumFloorBreached(allInPremium, feeUsdc);
+    const premiumFloor = premiumFloorBreached(allInPremium, baseFeeUsdc);
+    const isPremiumTier =
+      tierName === "Pro (Silver)" ||
+      tierName === "Pro (Gold)" ||
+      tierName === "Pro (Platinum)";
+    const allowPartialCoverage = tierName === "Pro (Bronze)" && body.allowPartialCoverage === true;
     let subsidyNeeded = allInPremium.minus(feeUsdc);
     let subsidyCheck = canApplySubsidy(
       tierName,
@@ -2003,8 +2434,20 @@ app.post("/put/quote", async (req) => {
       subsidyNeeded.toNumber(),
       feeIv.scaled
     );
-    const canPassThrough = FOXIFY_APPROVED && body.allowPremiumPassThrough;
-    const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage);
+    const passThroughEnabled = riskControls.enable_premium_pass_through !== false;
+    const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
+    const userOptedIn = body.allowPremiumPassThrough !== false;
+    const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
+    const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
+    await audit("pass_through_gate", {
+      passThroughEnabled,
+      requiresUserOptIn,
+      userOptedIn,
+      canPassThrough,
+      tierName,
+      leverage,
+      premiumRatio: premiumFloor.ratio.toFixed(4)
+    });
     const fallbackReplication = buildReplicationMeta({
       targetDays: bestCandidate.targetDays,
       maxPreferredDays,
@@ -2030,21 +2473,42 @@ app.post("/put/quote", async (req) => {
     const canFullyCover = bestCandidate.availableSize.greaterThanOrEqualTo(requiredSize);
 
     if (premiumFloor.breached) {
+      const minNotificationRatio = new Decimal(
+        riskControls.pass_through_min_notification_ratio ?? 1.5
+      );
+      const shouldNotify = premiumFloor.ratio.gte(minNotificationRatio);
+      const optionSymbol = optionType === "put" ? "P" : "C";
+      const optionInstrument = buildInstrumentName(
+        asset,
+        bestCandidate.expiryTag,
+        bestCandidate.strike.toFixed(0),
+        optionSymbol
+      );
+      const ratio = premiumFloor.ratio.toFixed(4);
+      const threshold = premiumFloor.threshold.toFixed(4);
+
       if (canPassThrough && !passThroughCapInfo.capped) {
-        const optionSymbol = optionType === "put" ? "P" : "C";
-        const optionInstrument = buildInstrumentName(
-          asset,
-          bestCandidate.expiryTag,
-          bestCandidate.strike.toFixed(0),
-          optionSymbol
-        );
-        return {
+        await audit("premium_pass_through", {
+          type: "uncapped",
+          baseFee: baseFeeUsdc.toFixed(2),
+          allInPremium: allInPremium.toFixed(2),
+          ratio,
+          threshold,
+          tierName,
+          leverage,
+          optionType,
+          instrument: optionInstrument
+        });
+        return cacheAndReturn({
           status: "pass_through",
           expiryTag: bestCandidate.expiryTag,
           targetDays: bestCandidate.targetDays,
           optionType,
           strike: bestCandidate.strike.toFixed(0),
           instrument: optionInstrument,
+          spotPrice: spotPrice.toNumber(),
+          drawdownFloorPct: drawdownFloorPct.toNumber(),
+          targetStrike: targetStrike.toNumber(),
           premiumUsdc: premiumTotal.toFixed(2),
           premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
           hedgeSize: requiredSize.toFixed(4),
@@ -2052,12 +2516,11 @@ app.post("/put/quote", async (req) => {
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
           subsidyUsdc: "0.00",
+          baseFeeUsdc: baseFeeUsdc.toFixed(2),
           feeUsdc: allInPremium.toFixed(2),
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier
-            ? feeLeverage.multiplier.toFixed(4)
-            : null,
+          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
           passThroughCapMultiplier: passThroughCapInfo.capMultiplier
             ? passThroughCapInfo.capMultiplier.toFixed(4)
             : null,
@@ -2069,59 +2532,460 @@ app.post("/put/quote", async (req) => {
           selectionSnapshot: fallbackSnapshot,
           rollMultiplier: bestCandidate.rollMultiplier,
           rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-          warning: {
-            type: "premium_floor",
-            ratio: premiumFloor.ratio.toFixed(4),
-            threshold: premiumFloor.threshold.toFixed(4)
-          }
-        };
+          hedge: {
+            instrument: optionInstrument,
+            size: requiredSize.toFixed(4),
+            premiumUsdc: allInPremium.toFixed(2),
+            expiryTag: bestCandidate.expiryTag,
+            daysToExpiry: bestCandidate.targetDays,
+            strike: bestCandidate.strike.toFixed(0)
+          },
+          pricing: {
+            type: "pass_through",
+            baseFee: baseFeeUsdc.toFixed(2),
+            hedgePremium: allInPremium.toFixed(2),
+            totalFee: allInPremium.toFixed(2),
+            ratio,
+            threshold,
+            explanation:
+              `Market volatility requires premium ${premiumFloor.ratio.toFixed(2)}× base fee. ` +
+              `Charging actual hedge cost of $${allInPremium.toFixed(2)} for full protection.`
+          },
+          warning: shouldNotify
+            ? {
+                type: "premium_pass_through",
+                ratio,
+                threshold,
+                message:
+                  `Premium is ${premiumFloor.ratio.toFixed(2)}× the base fee due to market conditions. ` +
+                  `You'll be charged the actual hedge cost of $${allInPremium.toFixed(2)}.`
+              }
+            : undefined
+        });
       }
-      if (!canPassThrough || !passThroughCapInfo.maxFee) {
-        return {
-          status: "premium_floor",
+
+      if (canPassThrough && passThroughCapInfo.capped && passThroughCapInfo.maxFee) {
+        const cappedFee = passThroughCapInfo.maxFee;
+        const subsidyNeededCapped = allInPremium.minus(cappedFee);
+        if (!isPremiumTier) {
+          const rejectReason = "premium_floor_pass_through_capped";
+          await audit("premium_floor_rejected", {
+            baseFee: baseFeeUsdc.toFixed(2),
+            allInPremium: allInPremium.toFixed(2),
+            ratio,
+            threshold,
+            reason: rejectReason,
+            canPassThrough,
+            capped: true,
+            capMultiplier: passThroughCapInfo.capMultiplier
+              ? passThroughCapInfo.capMultiplier.toFixed(4)
+              : null,
+            tierName,
+            leverage,
+            optionType,
+            instrument: optionInstrument
+          });
+          await audit("debug_feasibility_search_start", {
+            tierName,
+            optionType,
+            leverage,
+            targetDays,
+            premium: allInPremium.toFixed(2),
+            cap: cappedFee.toFixed(2)
+          });
+          // Bronze tier: calls (short positions) not supported
+          // Only puts (long positions) available at Bronze tier
+          const feasibility = null;
+          await audit("debug_feasibility_search_result", {
+            found: feasibility?.found ?? false,
+            suggestionType: feasibility?.suggestion?.type,
+            newLeverage: feasibility?.suggestion?.newLeverage,
+            newDuration: feasibility?.suggestion?.newDuration,
+            estimatedPremium: feasibility?.suggestion?.estimatedPremium?.toFixed(2)
+          });
+          const leverageSuggestion = Math.max(1, Math.floor(leverage / 2));
+          const suggestedCap = resolvePassThroughCapMultiplier(leverageSuggestion, tierName);
+          const currentDays = bestCandidate.targetDays;
+          const currentFloorPct = drawdownFloorPct.toNumber();
+          const enhancedMessage =
+            optionType === "call" && tierName === "Pro (Bronze)"
+              ? `Bronze tier call protection limit reached. Current request: ` +
+                `${leverage}× leverage, ${currentDays} days, ${(currentFloorPct * 100).toFixed(
+                  0
+                )}% floor.`
+              : "Protection cost exceeds Bronze tier limits for this request.";
+          const baseSuggestions = [
+            `Reduce leverage from ${leverage}× to ${leverageSuggestion}× ` +
+              `(cap ${suggestedCap ? `${suggestedCap.toFixed(1)}×` : "N/A"})`,
+            `Reduce protection duration from ${currentDays} days to ${Math.max(
+              1,
+              Math.floor(currentDays / 2)
+            )} days`,
+            `Increase drawdown floor to ${Math.min(0.25, currentFloorPct + 0.05).toFixed(2)}`,
+            "Reduce position size to lower premium"
+          ];
+          const dynamicSuggestions = baseSuggestions;
+          return cacheAndReturn({
+            status: "premium_floor",
+            expiryTag: bestCandidate.expiryTag,
+            targetDays: bestCandidate.targetDays,
+            optionType,
+            strike: bestCandidate.strike.toFixed(0),
+            instrument: optionInstrument,
+            spotPrice: spotPrice.toNumber(),
+            premiumUsdc: premiumTotal.toFixed(2),
+            premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
+            hedgeSize: requiredSize.toFixed(4),
+            sizingMethod: body.optionDelta ? "delta" : "notional",
+            bufferTargetPct: "0.00",
+            markIv: feeIv.raw,
+            subsidyUsdc: "0.00",
+            baseFeeUsdc: baseFeeUsdc.toFixed(2),
+            feeUsdc: baseFeeUsdc.toFixed(2),
+            feeRegime: feeRegime.regime,
+            feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
+            feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
+            passThroughCapMultiplier: passThroughCapInfo.capMultiplier
+              ? passThroughCapInfo.capMultiplier.toFixed(4)
+              : null,
+            passThroughCapped: true,
+            reason: rejectReason,
+            liquidityOverride: liquidityOverrideUsed,
+            replication: fallbackReplication,
+            survivalCheck,
+            selectionSnapshot: fallbackSnapshot,
+            rollMultiplier: bestCandidate.rollMultiplier,
+            rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+            message: enhancedMessage,
+            details:
+              optionType === "call" && tierName === "Pro (Bronze)"
+                ? {
+                    requestedPremium: premiumTotal.toFixed(2),
+                    tierCap: cappedFee.toFixed(2),
+                    exceedAmount: premiumTotal.minus(cappedFee).toFixed(2),
+                    currentParams: {
+                      leverage,
+                      duration: currentDays,
+                      drawdownFloor: currentFloorPct
+                    }
+                  }
+                : undefined,
+            // No guaranteed_working_option for Bronze
+            pricing: {
+              baseFee: baseFeeUsdc.toFixed(2),
+              hedgePremium: allInPremium.toFixed(2),
+              ratio,
+              threshold,
+              capMultiplier: passThroughCapInfo.capMultiplier
+                ? passThroughCapInfo.capMultiplier.toFixed(2)
+                : "N/A",
+              explanation:
+                `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
+                `of ${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}×. ` +
+                `Reduce leverage, duration, or widen the floor to lower premium.`
+            },
+            warning: {
+              type: "premium_floor",
+              ratio,
+              threshold,
+              message:
+                "Premium too high for Bronze tier. Reduce leverage, duration, or widen the floor."
+            },
+            suggestions: dynamicSuggestions
+          });
+        }
+        const subsidyCheckCapped = subsidyNeededCapped.gt(0)
+          ? canApplySubsidy(
+              tierName,
+              body.accountId || null,
+              subsidyNeededCapped.toNumber(),
+              feeIv.scaled
+            )
+          : { allowed: true, reason: "ok" };
+        if (subsidyNeededCapped.gt(0) && !subsidyCheckCapped.allowed) {
+          const rejectReason = "premium_floor_pass_through_capped";
+          await audit("premium_floor_rejected", {
+            baseFee: baseFeeUsdc.toFixed(2),
+            allInPremium: allInPremium.toFixed(2),
+            ratio,
+            threshold,
+            reason: rejectReason,
+            canPassThrough,
+            capped: true,
+            capMultiplier: passThroughCapInfo.capMultiplier
+              ? passThroughCapInfo.capMultiplier.toFixed(4)
+              : null,
+            tierName,
+            leverage,
+            optionType,
+            instrument: optionInstrument
+          });
+          const leverageSuggestion = Math.max(1, Math.floor(leverage / 2));
+          const suggestedCap = resolvePassThroughCapMultiplier(leverageSuggestion, tierName);
+          return cacheAndReturn({
+            status: "premium_floor",
+            expiryTag: bestCandidate.expiryTag,
+            targetDays: bestCandidate.targetDays,
+            optionType,
+            strike: bestCandidate.strike.toFixed(0),
+            instrument: optionInstrument,
+            spotPrice: spotPrice.toNumber(),
+            premiumUsdc: premiumTotal.toFixed(2),
+            premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
+            hedgeSize: requiredSize.toFixed(4),
+            sizingMethod: body.optionDelta ? "delta" : "notional",
+            bufferTargetPct: "0.00",
+            markIv: feeIv.raw,
+            subsidyUsdc: "0.00",
+            baseFeeUsdc: baseFeeUsdc.toFixed(2),
+            feeUsdc: baseFeeUsdc.toFixed(2),
+            feeRegime: feeRegime.regime,
+            feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
+            feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
+            passThroughCapMultiplier: passThroughCapInfo.capMultiplier
+              ? passThroughCapInfo.capMultiplier.toFixed(4)
+              : null,
+            passThroughCapped: true,
+            reason: rejectReason,
+            liquidityOverride: liquidityOverrideUsed,
+            replication: fallbackReplication,
+            survivalCheck,
+            selectionSnapshot: fallbackSnapshot,
+            rollMultiplier: bestCandidate.rollMultiplier,
+            rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+            pricing: {
+              baseFee: baseFeeUsdc.toFixed(2),
+              hedgePremium: allInPremium.toFixed(2),
+              ratio,
+              threshold,
+              capMultiplier: passThroughCapInfo.capMultiplier
+                ? passThroughCapInfo.capMultiplier.toFixed(2)
+                : "N/A",
+              explanation:
+                `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds maximum ` +
+                `${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
+                `Try: lower leverage, shorter duration, wider floor, or smaller size.`
+            },
+            warning: {
+              type: "premium_floor",
+              ratio,
+              threshold,
+              message:
+                `Premium too high for ${tierName} tier at ${leverage}× leverage. ` +
+                `Reduce leverage, duration, or widen the floor.`
+            },
+            suggestions: [
+              `Reduce leverage from ${leverage}× to ${leverageSuggestion}× ` +
+                `(cap ${suggestedCap ? `${suggestedCap.toFixed(1)}×` : "N/A"})`,
+              `Reduce protection duration from ${bestCandidate.targetDays} days to ${Math.max(
+                1,
+                Math.floor(bestCandidate.targetDays / 2)
+              )} days`,
+              "Increase drawdown floor percentage to reduce premium",
+              "Reduce position size to lower premium"
+            ]
+          });
+        }
+
+        await audit("premium_pass_through", {
+          type: "capped",
+          baseFee: baseFeeUsdc.toFixed(2),
+          allInPremium: allInPremium.toFixed(2),
+          cappedFee: cappedFee.toFixed(2),
+          capMultiplier: passThroughCapInfo.capMultiplier
+            ? passThroughCapInfo.capMultiplier.toFixed(4)
+            : null,
+          ratio,
+          tierName,
+          leverage,
+          optionType,
+          instrument: optionInstrument
+        });
+        return cacheAndReturn({
+          status: "pass_through_capped",
           expiryTag: bestCandidate.expiryTag,
           targetDays: bestCandidate.targetDays,
           optionType,
           strike: bestCandidate.strike.toFixed(0),
+          instrument: optionInstrument,
+          spotPrice: spotPrice.toNumber(),
+          drawdownFloorPct: drawdownFloorPct.toNumber(),
+          targetStrike: targetStrike.toNumber(),
           premiumUsdc: premiumTotal.toFixed(2),
           premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
           hedgeSize: requiredSize.toFixed(4),
           sizingMethod: body.optionDelta ? "delta" : "notional",
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
-          subsidyUsdc: "0.00",
-          feeUsdc: feeUsdc.toFixed(2),
+          subsidyUsdc: subsidyNeededCapped.toFixed(2),
+          baseFeeUsdc: baseFeeUsdc.toFixed(2),
+          feeUsdc: cappedFee.toFixed(2),
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
           passThroughCapMultiplier: passThroughCapInfo.capMultiplier
             ? passThroughCapInfo.capMultiplier.toFixed(4)
             : null,
-          passThroughCapped: passThroughCapInfo.capped,
-          reason: passThroughCapInfo.capped ? "premium_floor_pass_through_capped" : "premium_floor",
+          passThroughCapped: true,
+          reason: "premium_floor_pass_through_capped",
           liquidityOverride: liquidityOverrideUsed,
           replication: fallbackReplication,
           survivalCheck,
           selectionSnapshot: fallbackSnapshot,
           rollMultiplier: bestCandidate.rollMultiplier,
           rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-          warning: {
-            type: "premium_floor",
-            ratio: premiumFloor.ratio.toFixed(4),
-            threshold: premiumFloor.threshold.toFixed(4)
-          }
-        };
+          hedge: {
+            instrument: optionInstrument,
+            size: requiredSize.toFixed(4),
+            premiumUsdc: allInPremium.toFixed(2),
+            expiryTag: bestCandidate.expiryTag,
+            daysToExpiry: bestCandidate.targetDays,
+            strike: bestCandidate.strike.toFixed(0)
+          },
+          pricing: {
+            type: "pass_through_capped",
+            baseFee: baseFeeUsdc.toFixed(2),
+            hedgePremium: allInPremium.toFixed(2),
+            cappedFee: cappedFee.toFixed(2),
+            capMultiplier: passThroughCapInfo.capMultiplier
+              ? passThroughCapInfo.capMultiplier.toFixed(2)
+              : "N/A",
+            platformSubsidy: subsidyNeededCapped.toFixed(2),
+            totalFee: cappedFee.toFixed(2),
+            ratio,
+            threshold,
+            explanation:
+              `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds ${tierName} tier cap. ` +
+              `Fee capped at $${cappedFee.toFixed(2)} ` +
+              `(${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× base). ` +
+              `Platform subsidizing $${subsidyNeededCapped.toFixed(2)} for full protection.`
+          },
+          warning: shouldNotify
+            ? {
+                type: "premium_capped",
+                ratio,
+                threshold,
+                message:
+                  `Premium exceeds tier cap. Fee capped at $${cappedFee.toFixed(2)}. ` +
+                  `You're still fully protected.`
+              }
+            : undefined
+        });
       }
-      feeUsdc = passThroughCapInfo.maxFee;
-      const bronzeFixedCapped = applyBronzeFixedFee(tierName, leverage, feeUsdc);
-      feeUsdc = bronzeFixedCapped.fee;
-      subsidyNeeded = allInPremium.minus(feeUsdc);
-      subsidyCheck = canApplySubsidy(
+
+      const rejectReason = passThroughCapInfo.capped
+        ? "premium_floor_pass_through_capped"
+        : "premium_floor_no_pass_through";
+      await audit("premium_floor_rejected", {
+        baseFee: baseFeeUsdc.toFixed(2),
+        allInPremium: allInPremium.toFixed(2),
+        ratio,
+        threshold,
+        reason: rejectReason,
+        canPassThrough,
+        capped: passThroughCapInfo.capped,
+        capMultiplier: passThroughCapInfo.capMultiplier
+          ? passThroughCapInfo.capMultiplier.toFixed(4)
+          : null,
         tierName,
-        body.accountId || null,
-        subsidyNeeded.toNumber(),
-      feeIv.scaled
-      );
+        leverage,
+        optionType,
+        instrument: optionInstrument
+      });
+      await audit("debug_feasibility_search_start", {
+        tierName,
+        optionType,
+        leverage,
+        targetDays,
+        premium: allInPremium.toFixed(2),
+        cap: passThroughCapInfo.maxFee ? passThroughCapInfo.maxFee.toFixed(2) : null
+      });
+      // Bronze tier: calls (short positions) not supported
+      // Only puts (long positions) available at Bronze tier
+      const feasibility = null;
+      await audit("debug_feasibility_search_result", {
+        found: feasibility?.found ?? false,
+        suggestionType: feasibility?.suggestion?.type,
+        newLeverage: feasibility?.suggestion?.newLeverage,
+        newDuration: feasibility?.suggestion?.newDuration,
+        estimatedPremium: feasibility?.suggestion?.estimatedPremium?.toFixed(2)
+      });
+      const currentDays = bestCandidate.targetDays;
+      const currentFloorPct = drawdownFloorPct.toNumber();
+      const baseSuggestions = passThroughCapInfo.capped
+        ? [
+            `Reduce leverage from ${leverage}× to ${Math.max(1, Math.floor(leverage / 2))}×`,
+            `Reduce protection duration from ${currentDays} days to ${Math.max(
+              1,
+              Math.floor(currentDays / 2)
+            )} days`,
+            "Increase drawdown floor percentage to reduce premium",
+            "Reduce position size to lower premium"
+          ]
+        : [
+            "Reduce leverage or duration to lower premium",
+            "Increase drawdown floor percentage to reduce premium",
+            "Contact support to enable premium pass-through"
+          ];
+      const dynamicSuggestions = baseSuggestions;
+      return cacheAndReturn({
+        status: "premium_floor",
+        expiryTag: bestCandidate.expiryTag,
+        targetDays: bestCandidate.targetDays,
+        optionType,
+        strike: bestCandidate.strike.toFixed(0),
+        instrument: optionInstrument,
+        spotPrice: spotPrice.toNumber(),
+        premiumUsdc: premiumTotal.toFixed(2),
+        premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
+        hedgeSize: requiredSize.toFixed(4),
+        sizingMethod: body.optionDelta ? "delta" : "notional",
+        bufferTargetPct: "0.00",
+        markIv: feeIv.raw,
+        subsidyUsdc: "0.00",
+        baseFeeUsdc: baseFeeUsdc.toFixed(2),
+        feeUsdc: baseFeeUsdc.toFixed(2),
+        feeRegime: feeRegime.regime,
+        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
+        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
+        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
+          ? passThroughCapInfo.capMultiplier.toFixed(4)
+          : null,
+        passThroughCapped: passThroughCapInfo.capped,
+        reason: rejectReason,
+        liquidityOverride: liquidityOverrideUsed,
+        replication: fallbackReplication,
+        survivalCheck,
+        selectionSnapshot: fallbackSnapshot,
+        rollMultiplier: bestCandidate.rollMultiplier,
+        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+        // No guaranteed_working_option for Bronze
+        pricing: {
+          baseFee: baseFeeUsdc.toFixed(2),
+          hedgePremium: allInPremium.toFixed(2),
+          ratio,
+          threshold,
+          capMultiplier: passThroughCapInfo.capMultiplier
+            ? passThroughCapInfo.capMultiplier.toFixed(2)
+            : "N/A",
+          explanation: passThroughCapInfo.capped
+            ? `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds maximum ` +
+              `${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
+              `Try: lower leverage, shorter duration, wider floor, or smaller size.`
+            : `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds threshold. ` +
+              `Pass-through not enabled. Contact support if you need higher limits.`
+        },
+        warning: {
+          type: "premium_floor",
+          ratio,
+          threshold,
+          message: passThroughCapInfo.capped
+            ? `Premium too high for ${tierName} tier at ${leverage}× leverage. ` +
+              `Reduce leverage, duration, or widen the floor.`
+            : `Premium ${premiumFloor.ratio.toFixed(2)}× base fee cannot be accommodated.`
+        },
+        suggestions: dynamicSuggestions
+      });
     }
 
     if (subsidyNeeded.gt(0) && subsidyCheck.allowed && canFullyCover) {
@@ -2132,7 +2996,7 @@ app.post("/put/quote", async (req) => {
         bestCandidate.strike.toFixed(0),
         optionSymbol
       );
-      return {
+      return cacheAndReturn({
         status: "subsidized",
         expiryTag: bestCandidate.expiryTag,
         targetDays: bestCandidate.targetDays,
@@ -2162,7 +3026,7 @@ app.post("/put/quote", async (req) => {
         selectionSnapshot: fallbackSnapshot,
         rollMultiplier: bestCandidate.rollMultiplier,
         rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-      };
+      });
     }
 
     if (subsidyNeeded.gt(0) && canFullyCover && canCoverageOverride(tierName)) {
@@ -2173,7 +3037,7 @@ app.post("/put/quote", async (req) => {
         bestCandidate.strike.toFixed(0),
         optionSymbol
       );
-      return {
+      return cacheAndReturn({
         status: "subsidized",
         expiryTag: bestCandidate.expiryTag,
         targetDays: bestCandidate.targetDays,
@@ -2204,11 +3068,11 @@ app.post("/put/quote", async (req) => {
         selectionSnapshot: fallbackSnapshot,
         rollMultiplier: bestCandidate.rollMultiplier,
         rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-      };
+      });
     }
 
     if (canPassThrough && allInPremium.gt(feeUsdc)) {
-      const passThroughCapInfoLate = applyPassThroughCap(feeUsdc, allInPremium, leverage);
+      const passThroughCapInfoLate = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
       if (!passThroughCapInfoLate.capped) {
         const optionSymbol = optionType === "put" ? "P" : "C";
         const optionInstrument = buildInstrumentName(
@@ -2217,7 +3081,7 @@ app.post("/put/quote", async (req) => {
           bestCandidate.strike.toFixed(0),
           optionSymbol
         );
-        return {
+        return cacheAndReturn({
           status: "pass_through",
           expiryTag: bestCandidate.expiryTag,
           targetDays: bestCandidate.targetDays,
@@ -2246,7 +3110,7 @@ app.post("/put/quote", async (req) => {
           selectionSnapshot: fallbackSnapshot,
           rollMultiplier: bestCandidate.rollMultiplier,
           rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-        };
+        });
       }
     }
 
@@ -2255,6 +3119,65 @@ app.post("/put/quote", async (req) => {
     );
     const partialSize = Decimal.min(bestCandidate.availableSize, affordableSize);
     if (partialSize.greaterThanOrEqualTo(minSize)) {
+      if (!allowPartialCoverage) {
+        await audit("premium_floor_rejected", {
+          baseFee: baseFeeUsdc.toFixed(2),
+          allInPremium: allInPremium.toFixed(2),
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4),
+          reason: "partial_not_allowed",
+          canPassThrough,
+          capped: passThroughCapInfo.capped,
+          capMultiplier: passThroughCapInfo.capMultiplier
+            ? passThroughCapInfo.capMultiplier.toFixed(4)
+            : null,
+          tierName,
+          leverage,
+          optionType
+        });
+        return cacheAndReturn({
+          status: "premium_floor",
+          expiryTag: bestCandidate.expiryTag,
+          targetDays: bestCandidate.targetDays,
+          optionType,
+          strike: bestCandidate.strike.toFixed(0),
+          premiumUsdc: bestCandidate.premiumPerUnit.mul(partialSize).toFixed(2),
+          premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
+          hedgeSize: requiredSize.toFixed(4),
+          sizingMethod: body.optionDelta ? "delta" : "notional",
+          bufferTargetPct: "0.00",
+          markIv: feeIv.raw,
+          subsidyUsdc: "0.00",
+          baseFeeUsdc: baseFeeUsdc.toFixed(2),
+          feeUsdc: feeUsdc.toFixed(2),
+          feeRegime: feeRegime.regime,
+          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
+          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
+          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
+            ? passThroughCapInfo.capMultiplier.toFixed(4)
+            : null,
+          passThroughCapped: passThroughCapInfo.capped,
+          reason: "partial_not_allowed",
+          liquidityOverride: liquidityOverrideUsed,
+          replication: fallbackReplication,
+          survivalCheck,
+          selectionSnapshot: fallbackSnapshot,
+          rollMultiplier: bestCandidate.rollMultiplier,
+          rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+          warning: {
+            type: "premium_floor",
+            ratio: premiumFloor.ratio.toFixed(4),
+            threshold: premiumFloor.threshold.toFixed(4),
+            message:
+              "Partial coverage not allowed for this tier. Reduce leverage, duration, or widen the floor."
+          },
+          suggestions: [
+            "Reduce leverage to lower hedge premium",
+            "Shorten duration to reduce premium",
+            "Increase drawdown floor percentage to reduce premium"
+          ]
+        });
+      }
       const coverageRatio = partialSize.div(requiredSize);
       const discountedFee = applyPartialDiscount(feeUsdc, coverageRatio);
       const optionSymbol = optionType === "put" ? "P" : "C";
@@ -2264,7 +3187,7 @@ app.post("/put/quote", async (req) => {
         bestCandidate.strike.toFixed(0),
         optionSymbol
       );
-      return {
+      return cacheAndReturn({
         status: "partial",
         expiryTag: bestCandidate.expiryTag,
         targetDays: bestCandidate.targetDays,
@@ -2295,10 +3218,10 @@ app.post("/put/quote", async (req) => {
         rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
         coveragePct: coverageRatio.mul(100).toFixed(2),
         feeDiscountPct: (riskControls.partial_coverage_discount_pct ?? 0) * 100
-      };
+      });
     }
 
-    return {
+    return cacheAndReturn({
       status: "perp_fallback",
       expiryTag: bestCandidate.expiryTag,
       targetDays: bestCandidate.targetDays,
@@ -2309,7 +3232,7 @@ app.post("/put/quote", async (req) => {
       selectionSnapshot: fallbackSnapshot,
       rollMultiplier: bestCandidate.rollMultiplier,
       rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-    };
+    });
   }
 
   const quoteIv =
@@ -2321,7 +3244,8 @@ app.post("/put/quote", async (req) => {
     targetDays: durationDays,
     leverage,
     asset,
-    ivCandidate: quoteIv
+    ivCandidate: quoteIv,
+    optionType
   });
   const feeIv = feeBase.feeIv;
   const baseBuffer = new Decimal(0.03);
@@ -2333,6 +3257,7 @@ app.post("/put/quote", async (req) => {
 
   const notionalUsdc = positionSize.mul(new Decimal(body.spotPrice)).mul(new Decimal(leverage)).toNumber();
   let feeUsdc = feeBase.feeUsdc;
+  const baseFeeUsdc = feeUsdc;
   const feeRegime = feeBase.feeRegime;
   const feeLeverage = feeBase.feeLeverage;
   const ctcSafety = calculateCtcSafetyFee({
@@ -2340,7 +3265,8 @@ app.post("/put/quote", async (req) => {
     drawdownPct: drawdownFloorPct,
     spotPrice,
     positionSize,
-    leverage
+    leverage,
+    optionType
   });
   let feeReason = "flat_fee";
   if (ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
@@ -2348,20 +3274,225 @@ app.post("/put/quote", async (req) => {
     feeReason = "ctc_safety";
   }
   const allInPremium = quote.allInPremium;
-  const isBronzeFixed = tierName === "Pro (Bronze)" && leverage <= 2;
-  const premiumFloor = isBronzeFixed
-    ? {
-        breached: false,
-        ratio: new Decimal(0),
-        threshold: new Decimal(riskControls.premium_floor_ratio ?? 1.25)
-      }
-    : premiumFloorBreached(allInPremium, feeUsdc);
-  const canPassThrough = FOXIFY_APPROVED && body.allowPremiumPassThrough;
-  const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage);
+  const premiumFloor = premiumFloorBreached(allInPremium, baseFeeUsdc);
+  const isPremiumTier =
+    tierName === "Pro (Silver)" ||
+    tierName === "Pro (Gold)" ||
+    tierName === "Pro (Platinum)";
+  const allowPartialCoverage = tierName === "Pro (Bronze)" && body.allowPartialCoverage === true;
+  const passThroughEnabled = riskControls.enable_premium_pass_through !== false;
+  const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
+  const userOptedIn = body.allowPremiumPassThrough !== false;
+  const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
+  const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
+  await audit("pass_through_gate", {
+    passThroughEnabled,
+    requiresUserOptIn,
+    userOptedIn,
+    canPassThrough,
+    tierName,
+    leverage,
+    premiumRatio: premiumFloor.ratio.toFixed(4)
+  });
   const canFullyCoverQuote = quote.availableSize.greaterThanOrEqualTo(requiredSize);
   if (premiumFloor.breached && canPassThrough && passThroughCapInfo.capped && passThroughCapInfo.maxFee) {
-    feeUsdc = passThroughCapInfo.maxFee;
-    const bronzeFixedCapped = applyBronzeFixedFee(tierName, leverage, feeUsdc);
+    const cappedFee = passThroughCapInfo.maxFee;
+    const optionSymbol = optionType === "put" ? "P" : "C";
+    const optionInstrument = buildInstrumentName(
+      asset,
+      quote.expiryTag || "",
+      quote.strike.toFixed(0),
+      optionSymbol
+    );
+    const subsidyNeededFull = allInPremium.minus(cappedFee);
+    if (isPremiumTier) {
+      await audit("premium_pass_through", {
+        type: "capped_with_subsidy",
+        baseFee: feeBase.feeUsdc.toFixed(2),
+        allInPremium: allInPremium.toFixed(2),
+        cappedFee: cappedFee.toFixed(2),
+        platformSubsidy: subsidyNeededFull.toFixed(2),
+        capMultiplier: passThroughCapInfo.capMultiplier
+          ? passThroughCapInfo.capMultiplier.toFixed(2)
+          : null,
+        ratio: premiumFloor.ratio.toFixed(4),
+        tierName,
+        leverage,
+        optionType,
+        instrument: optionInstrument,
+        hedgeSize: requiredSize.toFixed(4),
+        fullProtection: true
+      });
+      return cacheAndReturn({
+        status: "pass_through_capped",
+        optionType,
+        venue: "deribit",
+        strike: quote.strike.toFixed(0),
+        premiumUsdc: quote.premiumTotal.toFixed(2),
+        premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
+        hedgeSize: requiredSize.toFixed(4),
+        sizingMethod: body.optionDelta ? "delta" : "notional",
+        bufferTargetPct: "0.00",
+        markIv: feeIv.raw,
+        expiryTag: quote.expiryTag || "",
+        targetDays: quote.targetDays || 0,
+        instrument: optionInstrument,
+        feeUsdc: cappedFee.toFixed(2),
+        subsidyUsdc: subsidyNeededFull.toFixed(2),
+        feeRegime: feeRegime.regime,
+        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
+        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
+        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
+          ? passThroughCapInfo.capMultiplier.toFixed(4)
+          : null,
+        passThroughCapped: true,
+        reason: "pass_through_capped_subsidized",
+        liquidityOverride: liquidityOverrideUsed,
+        replication: replicationMeta,
+        survivalCheck: buildSurvivalCheck({
+          spotPrice,
+          drawdownFloorPct,
+          optionType,
+          strike: quote.strike,
+          hedgeSize: requiredSize,
+          requiredSize,
+          tolerancePct: survivalTolerance
+        }),
+        selectionSnapshot: bestSnapshots
+          ? {
+              expiryTag: quote.expiryTag,
+              targetDays: quote.targetDays,
+              strike: quote.strike.toFixed(0),
+              books: bestSnapshots
+            }
+          : null,
+        rollMultiplier: quote.rollMultiplier,
+        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+        coveragePct: "100.00",
+        feeDiscountPct: (riskControls.partial_coverage_discount_pct ?? 0) * 100,
+        pricing: {
+          baseFee: feeBase.feeUsdc.toFixed(2),
+          hedgePremium: allInPremium.toFixed(2),
+          cappedFee: cappedFee.toFixed(2),
+          capMultiplier: passThroughCapInfo.capMultiplier
+            ? passThroughCapInfo.capMultiplier.toFixed(2)
+            : "N/A",
+          platformSubsidy: subsidyNeededFull.toFixed(2),
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4),
+          explanation:
+            `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds ${tierName} tier cap. ` +
+            `Fee capped at $${cappedFee.toFixed(2)} ` +
+            `(${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× base). ` +
+            `Platform subsidizing $${subsidyNeededFull.toFixed(2)} for full protection.`
+        },
+        warning: {
+          type: "premium_capped_full_protection",
+          ratio: premiumFloor.ratio.toFixed(4),
+          capMultiplier: passThroughCapInfo.capMultiplier
+            ? passThroughCapInfo.capMultiplier.toFixed(2)
+            : "N/A",
+          message:
+            `Premium exceeds tier cap. Fee capped at $${cappedFee.toFixed(2)}. ` +
+            `You're fully protected (100% hedge). Platform covers excess.`
+        }
+      });
+    }
+    if (!allowPartialCoverage) {
+      await audit("premium_floor_rejected", {
+        baseFee: feeBase.feeUsdc.toFixed(2),
+        allInPremium: allInPremium.toFixed(2),
+        ratio: premiumFloor.ratio.toFixed(4),
+        threshold: premiumFloor.threshold.toFixed(4),
+        reason: "premium_floor_pass_through_capped",
+        canPassThrough,
+        capped: true,
+        capMultiplier: passThroughCapInfo.capMultiplier
+          ? passThroughCapInfo.capMultiplier.toFixed(2)
+          : null,
+        tierName,
+        leverage,
+        optionType,
+        instrument: optionInstrument
+      });
+      return cacheAndReturn({
+        status: "premium_floor",
+        reason: "premium_floor_pass_through_capped",
+        optionType,
+        venue: "deribit",
+        strike: quote.strike.toFixed(0),
+        premiumUsdc: quote.premiumTotal.toFixed(2),
+        premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
+        hedgeSize: requiredSize.toFixed(4),
+        sizingMethod: body.optionDelta ? "delta" : "notional",
+        bufferTargetPct: "0.00",
+        markIv: feeIv.raw,
+        expiryTag: quote.expiryTag || "",
+        targetDays: quote.targetDays || 0,
+        instrument: optionInstrument,
+        feeUsdc: cappedFee.toFixed(2),
+        subsidyUsdc: "0.00",
+        feeRegime: feeRegime.regime,
+        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
+        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
+        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
+          ? passThroughCapInfo.capMultiplier.toFixed(4)
+          : null,
+        passThroughCapped: true,
+        liquidityOverride: liquidityOverrideUsed,
+        replication: replicationMeta,
+        survivalCheck: buildSurvivalCheck({
+          spotPrice,
+          drawdownFloorPct,
+          optionType,
+          strike: quote.strike,
+          hedgeSize: requiredSize,
+          requiredSize,
+          tolerancePct: survivalTolerance
+        }),
+        selectionSnapshot: bestSnapshots
+          ? {
+              expiryTag: quote.expiryTag,
+              targetDays: quote.targetDays,
+              strike: quote.strike.toFixed(0),
+              books: bestSnapshots
+            }
+          : null,
+        rollMultiplier: quote.rollMultiplier,
+        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+        pricing: {
+          baseFee: feeBase.feeUsdc.toFixed(2),
+          hedgePremium: allInPremium.toFixed(2),
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4),
+          capMultiplier: passThroughCapInfo.capMultiplier
+            ? passThroughCapInfo.capMultiplier.toFixed(2)
+            : "N/A",
+          explanation:
+            `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
+            `of ${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}×. ` +
+            `Reduce leverage, duration, or widen the floor to lower premium.`
+        },
+        warning: {
+          type: "premium_floor",
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4),
+          message:
+            "Premium too high for Bronze tier. Reduce leverage, duration, or widen the floor."
+        },
+        suggestions: [
+          `Reduce leverage from ${leverage}× to ${Math.max(1, Math.floor(leverage / 2))}×`,
+          `Reduce protection duration from ${quote.targetDays || 0} days to ${Math.max(
+            1,
+            Math.floor((quote.targetDays || 0) / 2)
+          )} days`,
+          "Increase drawdown floor percentage to reduce premium",
+          "Reduce position size to lower premium"
+        ]
+      });
+    }
+    feeUsdc = cappedFee;
+    const bronzeFixedCapped = applyBronzeFixedFee(tierName, leverage, feeUsdc, optionType);
     feeUsdc = bronzeFixedCapped.fee;
     const subsidyNeeded = allInPremium.minus(feeUsdc);
     const subsidyCheck = canApplySubsidy(
@@ -2370,22 +3501,80 @@ app.post("/put/quote", async (req) => {
       subsidyNeeded.toNumber(),
       feeIv.scaled
     );
-    const optionSymbol = optionType === "put" ? "P" : "C";
-    const optionInstrument = buildInstrumentName(
-      asset,
-      quote.expiryTag || "",
-      quote.strike.toFixed(0),
-      optionSymbol
-    );
     if (subsidyNeeded.gt(0)) {
       const affordableSize = feeUsdc.div(
         quote.premiumPerUnit.mul(new Decimal(quote.rollMultiplier))
       );
       const partialSize = Decimal.min(quote.availableSize, affordableSize);
       if (partialSize.greaterThanOrEqualTo(minSize)) {
+        if (!allowPartialCoverage) {
+          return cacheAndReturn({
+            status: "premium_floor",
+            reason: "partial_not_allowed",
+            optionType,
+            venue: "deribit",
+            strike: quote.strike.toFixed(0),
+            premiumUsdc: quote.premiumPerUnit.mul(partialSize).toFixed(2),
+            premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
+            hedgeSize: requiredSize.toFixed(4),
+            sizingMethod: body.optionDelta ? "delta" : "notional",
+            bufferTargetPct: "0.00",
+            markIv: feeIv.raw,
+            expiryTag: quote.expiryTag || "",
+            targetDays: quote.targetDays || 0,
+            instrument: optionInstrument,
+            feeUsdc: feeUsdc.toFixed(2),
+            subsidyUsdc: "0.00",
+            feeRegime: feeRegime.regime,
+            feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
+            feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
+            passThroughCapMultiplier: passThroughCapInfo.capMultiplier
+              ? passThroughCapInfo.capMultiplier.toFixed(4)
+              : null,
+            passThroughCapped: true,
+            liquidityOverride: liquidityOverrideUsed,
+            replication: replicationMeta,
+            survivalCheck: buildSurvivalCheck({
+              spotPrice,
+              drawdownFloorPct,
+              optionType,
+              strike: quote.strike,
+              hedgeSize: requiredSize,
+              requiredSize,
+              tolerancePct: survivalTolerance
+            }),
+            selectionSnapshot: bestSnapshots
+              ? {
+                  expiryTag: quote.expiryTag,
+                  targetDays: quote.targetDays,
+                  strike: quote.strike.toFixed(0),
+                  books: bestSnapshots
+                }
+              : null,
+            rollMultiplier: quote.rollMultiplier,
+            rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+            pricing: {
+              baseFee: feeBase.feeUsdc.toFixed(2),
+              hedgePremium: allInPremium.toFixed(2),
+              ratio: premiumFloor.ratio.toFixed(4),
+              threshold: premiumFloor.threshold.toFixed(4),
+              capMultiplier: passThroughCapInfo.capMultiplier
+                ? passThroughCapInfo.capMultiplier.toFixed(2)
+                : "N/A",
+              explanation:
+                "Partial coverage not allowed for this tier. Reduce leverage or duration to lower premium."
+            },
+            warning: {
+              type: "premium_floor",
+              ratio: premiumFloor.ratio.toFixed(4),
+              threshold: premiumFloor.threshold.toFixed(4),
+              message: "Partial coverage not allowed for this tier."
+            }
+          });
+        }
         const coverageRatio = partialSize.div(requiredSize);
         const discountedFee = applyPartialDiscount(feeUsdc, coverageRatio);
-        return {
+        return cacheAndReturn({
           status: "partial",
           optionType,
           venue: "deribit",
@@ -2432,10 +3621,10 @@ app.post("/put/quote", async (req) => {
           rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
           coveragePct: coverageRatio.mul(100).toFixed(2),
           feeDiscountPct: (riskControls.partial_coverage_discount_pct ?? 0) * 100
-        };
+        });
       }
       if (subsidyNeeded.gt(0) && subsidyCheck.allowed && canFullyCoverQuote) {
-        return {
+        return cacheAndReturn({
           status: "subsidized",
           optionType,
           venue: "deribit",
@@ -2480,10 +3669,10 @@ app.post("/put/quote", async (req) => {
             : null,
           rollMultiplier: quote.rollMultiplier,
           rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-        };
+        });
       }
       if (subsidyNeeded.gt(0) && canFullyCoverQuote && canCoverageOverride(tierName)) {
-        return {
+        return cacheAndReturn({
           status: "subsidized",
           optionType,
           venue: "deribit",
@@ -2530,9 +3719,9 @@ app.post("/put/quote", async (req) => {
             : null,
           rollMultiplier: quote.rollMultiplier,
           rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-        };
+        });
       }
-      return {
+      return cacheAndReturn({
         status: "perp_fallback",
         expiryTag: quote.expiryTag || "",
         targetDays: quote.targetDays || 0,
@@ -2556,7 +3745,7 @@ app.post("/put/quote", async (req) => {
           : null,
         rollMultiplier: quote.rollMultiplier,
         rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-      };
+      });
     }
   }
   const cap = riskControls.net_exposure_cap_usdc[tierName] ?? Number.POSITIVE_INFINITY;
@@ -2638,39 +3827,80 @@ app.post("/put/quote", async (req) => {
   response["selectionSnapshot"] = selectedSnapshot;
   response["rollMultiplier"] = quote.rollMultiplier;
   response["rollEstimatedPremiumUsdc"] = allInPremium.toFixed(2);
+  response["baseFeeUsdc"] = feeBase.feeUsdc.toFixed(2);
   response["feeUsdc"] = feeUsdc.toFixed(2);
   response["feeRegime"] = feeRegime.regime;
   response["feeRegimeMultiplier"] = feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null;
   response["feeLeverageMultiplier"] = feeLeverage.multiplier
     ? feeLeverage.multiplier.toFixed(4)
     : null;
-  const quotePassThroughCap = applyPassThroughCap(feeUsdc, allInPremium, leverage);
+  const quotePassThroughCap = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
   response["passThroughCapMultiplier"] = quotePassThroughCap.capMultiplier
     ? quotePassThroughCap.capMultiplier.toFixed(4)
     : null;
   response["passThroughCapped"] = quotePassThroughCap.capped;
   response["subsidyUsdc"] = "0.00";
   response["reason"] = feeReason;
+  const minNotificationRatio = new Decimal(
+    riskControls.pass_through_min_notification_ratio ?? 1.5
+  );
+  const shouldNotify = premiumFloor.ratio.gte(minNotificationRatio);
   if (premiumFloor.breached) {
     if (canPassThrough && !quotePassThroughCap.capped) {
       response["status"] = "pass_through";
       response["feeUsdc"] = allInPremium.toFixed(2);
       response["reason"] = "premium_floor_pass_through";
+      response["pricing"] = {
+        type: "pass_through",
+        baseFee: feeBase.feeUsdc.toFixed(2),
+        hedgePremium: allInPremium.toFixed(2),
+        totalFee: allInPremium.toFixed(2),
+        ratio: premiumFloor.ratio.toFixed(4),
+        threshold: premiumFloor.threshold.toFixed(4)
+      };
+      response["warning"] = shouldNotify
+        ? {
+            type: "premium_pass_through",
+            ratio: premiumFloor.ratio.toFixed(4),
+            threshold: premiumFloor.threshold.toFixed(4)
+          }
+        : undefined;
+    } else if (canPassThrough && quotePassThroughCap.capped && quotePassThroughCap.maxFee) {
+      response["status"] = "pass_through_capped";
+      response["feeUsdc"] = quotePassThroughCap.maxFee.toFixed(2);
+      response["reason"] = "premium_floor_pass_through_capped";
+      response["pricing"] = {
+        type: "pass_through_capped",
+        baseFee: feeBase.feeUsdc.toFixed(2),
+        hedgePremium: allInPremium.toFixed(2),
+        cappedFee: quotePassThroughCap.maxFee.toFixed(2),
+        capMultiplier: quotePassThroughCap.capMultiplier
+          ? quotePassThroughCap.capMultiplier.toFixed(2)
+          : null,
+        ratio: premiumFloor.ratio.toFixed(4),
+        threshold: premiumFloor.threshold.toFixed(4)
+      };
+      response["warning"] = shouldNotify
+        ? {
+            type: "premium_capped",
+            ratio: premiumFloor.ratio.toFixed(4),
+            threshold: premiumFloor.threshold.toFixed(4)
+          }
+        : undefined;
     } else {
       response["status"] = "premium_floor";
       response["reason"] = quotePassThroughCap.capped
         ? "premium_floor_pass_through_capped"
         : "premium_floor";
+      response["warning"] = {
+        type: "premium_floor",
+        ratio: premiumFloor.ratio.toFixed(4),
+        threshold: premiumFloor.threshold.toFixed(4)
+      };
     }
-    response["warning"] = {
-      type: "premium_floor",
-      ratio: premiumFloor.ratio.toFixed(4),
-      threshold: premiumFloor.threshold.toFixed(4)
-    };
   }
   await audit("put_quote", response);
-  setQuoteCache(cacheKey, response);
-  return response;
+  return cacheAndReturn(response);
 });
 
 function buildInstrumentName(currency: string, expiryTag: string, strike: string, type: "P" | "C"): string {
@@ -2984,7 +4214,8 @@ app.post("/put/auto-renew", async (req) => {
     targetDays: renewDurationDays,
     leverage: renewLeverage,
     asset,
-    ivCandidate: quote?.iv
+    ivCandidate: quote?.iv,
+    optionType
   });
   effectiveFeeUsdc = renewFeeBase.feeUsdc;
   const renewFeeRegime = renewFeeBase.feeRegime;
@@ -2995,21 +4226,19 @@ app.post("/put/auto-renew", async (req) => {
     drawdownPct: drawdownFloorPct,
     spotPrice,
     positionSize: requiredSize,
-    leverage: renewLeverage
+    leverage: renewLeverage,
+    optionType
   });
   if (renewSafety.feeUsdc && renewSafety.feeUsdc.gt(effectiveFeeUsdc)) {
     effectiveFeeUsdc = renewSafety.feeUsdc;
     renewReason = "ctc_safety";
   }
-  const isBronzeFixed = tierName === "Pro (Bronze)" && renewLeverage <= 2;
-  const renewPremiumFloor = isBronzeFixed
-    ? {
-        breached: false,
-        ratio: new Decimal(0),
-        threshold: new Decimal(riskControls.premium_floor_ratio ?? 1.25)
-      }
-    : premiumFloorBreached(effectiveAllInPremium, effectiveFeeUsdc);
-  const renewCanPassThrough = FOXIFY_APPROVED && body.allowPremiumPassThrough;
+  const renewPremiumFloor = premiumFloorBreached(effectiveAllInPremium, effectiveFeeUsdc);
+  const renewPassThroughEnabled = riskControls.enable_premium_pass_through !== false;
+  const renewRequiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
+  const renewUserOptedIn = body.allowPremiumPassThrough !== false;
+  const renewCanPassThrough =
+    renewPassThroughEnabled && (!renewRequiresUserOptIn || renewUserOptedIn);
   let subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
   let subsidyCheck = canApplySubsidy(
     tierName,
@@ -3020,8 +4249,18 @@ app.post("/put/auto-renew", async (req) => {
   const renewPassThroughCap = applyPassThroughCap(
     effectiveFeeUsdc,
     effectiveAllInPremium,
-    renewLeverage
+    renewLeverage,
+    tierName
   );
+  await audit("pass_through_gate", {
+    passThroughEnabled: renewPassThroughEnabled,
+    requiresUserOptIn: renewRequiresUserOptIn,
+    userOptedIn: renewUserOptedIn,
+    canPassThrough: renewCanPassThrough,
+    tierName,
+    leverage: renewLeverage,
+    premiumRatio: renewPremiumFloor.ratio.toFixed(4)
+  });
   const canFullyCover = effectiveAvailableSize
     ? effectiveAvailableSize.greaterThanOrEqualTo(requiredSize)
     : false;
@@ -3093,7 +4332,8 @@ app.post("/put/auto-renew", async (req) => {
         const lateCap = applyPassThroughCap(
           effectiveFeeUsdc,
           effectiveAllInPremium,
-          renewLeverage
+          renewLeverage,
+          tierName
         );
         if (!lateCap.capped) {
           renewReason = "pass_through";
@@ -3334,6 +4574,8 @@ app.post("/loop/tick", async (req) => {
       size: number;
       leverage: number;
     }>;
+    positionSide?: "long" | "short";
+    optionType?: "put" | "call";
   };
 
   const combined = getCombinedExposureBook();
@@ -3355,6 +4597,12 @@ app.post("/loop/tick", async (req) => {
     drawdownBufferPct: string;
   };
 
+  const coverage = body.coverageId ? activeCoverages.get(body.coverageId) : null;
+  const inferredPositionSide =
+    body.positionSide || (coverage?.positions?.[0]?.side as "long" | "short" | undefined) || "long";
+  const inferredOptionType = body.optionType || (inferredPositionSide === "short" ? "call" : "put");
+  const inferredHedgeType = body.hedgeType || "option";
+
   const decision = evaluateRollingHedge({
     bufferPct: new Decimal(riskPayload.drawdownBufferPct).div(100),
     hedgeState: {
@@ -3362,7 +4610,10 @@ app.post("/loop/tick", async (req) => {
       hysteresisPct: new Decimal(body.hysteresisPct)
     },
     expiryIso: body.expiryIso,
-    renewWindowMinutes: body.renewWindowMinutes
+    renewWindowMinutes: body.renewWindowMinutes,
+    positionSide: inferredPositionSide,
+    currentOptionType: inferredOptionType,
+    hedgeType: inferredHedgeType
   });
 
   let renewalResult: unknown = { status: "skipped" };
@@ -3394,22 +4645,25 @@ app.post("/loop/tick", async (req) => {
       size: body.hedgeSize,
       coverageId: body.coverageId || null,
       notionalUsdc: body.notionalUsdc ?? null,
-      hedgeType: body.hedgeType || "option"
+      hedgeType: inferredHedgeType,
+      positionSide: inferredPositionSide,
+      recommendedSide: decision.recommendedSide
     });
     await executionRegistry.placeOrder("deribit", {
       instrument: body.hedgeInstrument,
       amount: body.hedgeSize,
-      side: "buy",
+      side: decision.recommendedSide,
       type: "market"
     });
     await audit("hedge_order", {
       instrument: body.hedgeInstrument,
-      side: "buy",
+      side: decision.recommendedSide,
       amount: body.hedgeSize,
       type: "market",
       coverageId: body.coverageId || null,
       notionalUsdc: body.notionalUsdc ?? null,
-      hedgeType: body.hedgeType || "option"
+      hedgeType: inferredHedgeType,
+      positionSide: inferredPositionSide
     });
   }
 
@@ -3478,7 +4732,9 @@ app.post("/loop/tick", async (req) => {
         Math.max(1, Math.round(riskControls.default_target_days ?? 7))
       );
       const preferredDays = buildDayLadder(netTargetDays, maxPreferredDays, maxFallbackDays);
-      const optionType = plan.targetNotional.gt(0) ? "put" : "call";
+      const isNetLong = plan.targetNotional.gt(0);
+      const optionType = isNetLong ? "put" : "call";
+      const perpSide = isNetLong ? "sell" : "buy";
       const drawdownPct = new Decimal(1).minus(
         new Decimal(body.drawdownLimitUsdc).div(new Decimal(body.initialBalanceUsdc))
       );
@@ -3707,6 +4963,7 @@ app.post("/loop/tick", async (req) => {
               coverageId: body.coverageId || `net-${plan.asset}`,
               notionalUsdc: plan.targetNotional.abs().toNumber(),
               hedgeType: "option",
+              optionType,
               feeUsdc: 0,
               tierName,
               premiumUsdc: candidate.premiumUsd.toFixed(2),
@@ -3761,6 +5018,7 @@ app.post("/loop/tick", async (req) => {
             coverageId: body.coverageId || `net-${plan.asset}`,
             notionalUsdc: plan.targetNotional.abs().toNumber(),
             hedgeType: "option",
+            optionType,
             feeUsdc: 0,
             tierName,
             premiumUsdc: optionChosen.premiumUsd.toFixed(2),
@@ -3771,7 +5029,7 @@ app.post("/loop/tick", async (req) => {
         continue;
       }
 
-      const side = plan.targetNotional.gt(0) ? "buy" : "sell";
+      const side = perpSide;
       const quotes = await pricingEngine.getQuotes({
         instrument,
         type: "perp",
@@ -3797,12 +5055,12 @@ app.post("/loop/tick", async (req) => {
       await executionRegistry.placeOrder(routedPlan.venue || "deribit", {
         instrument,
         amount: routedPlan.size.toNumber(),
-        side: plan.targetNotional.gt(0) ? "buy" : "sell",
+        side: perpSide,
         type: "market"
       });
       await audit("hedge_order", {
         instrument,
-        side: plan.targetNotional.gt(0) ? "buy" : "sell",
+        side: perpSide,
         amount: routedPlan.size.toNumber(),
         type: "market",
         notionalUsdc: plan.targetNotional.abs().toNumber(),
@@ -3871,6 +5129,7 @@ app.post("/audit/export", async (req) => {
       expiryIso: expiryValue,
       positions
     });
+    await saveCoverages();
   }
   if (feeUsd > 0) {
     const accounting = recordRevenue(tierName, feeUsd);
@@ -3899,10 +5158,27 @@ app.post("/admin/reset", async () => {
   };
 });
 
-app.get("/audit/entries", async (req) => {
-  const query = req.query as { limit?: string };
+app.get("/audit/logs", async (req) => {
+  const query = req.query as { limit?: string; showAll?: string };
   const limit = Number(query.limit || "200");
-  return readAuditEntries(limit);
+  const showAll = query.showAll === "true";
+
+  const allEntries = await readAuditEntries(limit);
+  const entries = showAll
+    ? allEntries
+    : allEntries.filter((entry) => isCeoRelevantEvent(entry.event as string));
+
+  console.log(
+    `[Audit] Total: ${allEntries.length}, Filtered: ${entries.length}, ShowAll: ${showAll}`
+  );
+
+  return {
+    status: "ok",
+    entries,
+    count: entries.length,
+    totalEvents: allEntries.length,
+    filtered: !showAll
+  };
 });
 
 app.get("/audit/summary", async (req) => {
@@ -3986,6 +5262,9 @@ app.post("/hedge/roll", async (req) => {
     renewWindowMinutes: number;
     hedgeInstrument: string;
     hedgeSize: number;
+    hedgeType?: "option" | "perp";
+    positionSide?: "long" | "short";
+    optionType?: "put" | "call";
   };
 
   const bufferPct = new Decimal(body.bufferPct);
@@ -3996,14 +5275,17 @@ app.post("/hedge/roll", async (req) => {
       hysteresisPct: new Decimal(body.hysteresisPct)
     },
     expiryIso: body.expiryIso,
-    renewWindowMinutes: body.renewWindowMinutes
+    renewWindowMinutes: body.renewWindowMinutes,
+    positionSide: body.positionSide || "long",
+    currentOptionType: body.optionType || "put",
+    hedgeType: body.hedgeType || "option"
   });
 
   if (decision.hedgeAction === "increase") {
     await deribit.placeOrder({
       instrument: body.hedgeInstrument,
       amount: body.hedgeSize,
-      side: "buy",
+      side: decision.recommendedSide,
       type: "market"
     });
   }
@@ -4019,6 +5301,10 @@ app.listen({ port: 4100, host: "0.0.0.0" }).catch((err) => {
 });
 
 await seedAuditIfEmpty();
+
+// Load persisted state
+await loadCoverages();
+await loadHedgeLedger();
 
 // Optional lightweight interval runner (enabled when LOOP_INTERVAL_MS > 0)
 if (LOOP_INTERVAL_MS > 0) {

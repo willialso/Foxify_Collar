@@ -13,7 +13,7 @@ export class RollingNetHedgingEngine implements HedgingEngine {
       plans.push({
         asset: exposure.asset,
         type: "option",
-        targetNotional: exposure.netNotional.abs(),
+        targetNotional: exposure.netNotional,
         bufferTargetPct,
         reason: "net_exposure_hedge"
       });

@@ -1,6 +1,22 @@
 {
   "accounts": [
     {
+      "accountId": "foxify_trader_001",
+      "drawdownLimitUsdc": "9000.00",
+      "initialBalanceUsdc": "10000.00",
+      "hedgeInstrument": "BTC-29MAR24-50000-P",
+      "hedgeSize": 0.1,
+      "bufferTargetPct": 0.05,
+      "hysteresisPct": 0.02,
+      "expiryIso": "2024-03-29T08:00:00.000Z",
+      "renewWindowMinutes": 1440,
+      "renewPayload": {
+        "tierName": "Pro (Bronze)",
+        "leverage": 5
+      },
+      "alertWebhookUrl": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+    },
+    {
       "accountId": "demo",
       "drawdownLimitUsdc": "9000",
       "initialBalanceUsdc": "10000",

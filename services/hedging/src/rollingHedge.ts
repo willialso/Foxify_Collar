@@ -7,12 +7,17 @@ export interface RollInputs {
   hedgeState: HedgeState;
   expiryIso: string;
   renewWindowMinutes: number;
+  positionSide?: "long" | "short";
+  currentOptionType?: "put" | "call";
+  hedgeType?: "option" | "perp";
 }
 
 export interface RollDecision {
   hedgeAction: "increase" | "decrease" | "hold";
   renew: boolean;
   reason: string;
+  recommendedSide: "buy" | "sell";
+  perpFallbackSide: "buy" | "sell";
 }
 
 export function evaluateRollingHedge(inputs: RollInputs): RollDecision {
@@ -22,9 +27,16 @@ export function evaluateRollingHedge(inputs: RollInputs): RollDecision {
     renewWindowMinutes: inputs.renewWindowMinutes
   });
 
+  const isLongPosition = inputs.positionSide === "long";
+  const optionSide: "buy" = "buy";
+  const perpSide: "buy" | "sell" = isLongPosition ? "sell" : "buy";
+  const recommendedSide = inputs.hedgeType === "perp" ? perpSide : optionSide;
+
   return {
     hedgeAction: hedgeDecision.action,
     renew,
-    reason: renew ? "renew_window" : hedgeDecision.reason
+    reason: renew ? "renew_window" : hedgeDecision.reason,
+    recommendedSide,
+    perpFallbackSide: perpSide
   };
 }

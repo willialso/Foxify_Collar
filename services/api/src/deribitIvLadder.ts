@@ -21,6 +21,7 @@ type LadderSnapshot = {
 
 type LadderOptions = {
   asset: string;
+  optionType?: "put" | "call";
   expiriesDays: number[];
   floorPcts: number[];
   refreshMs?: number;
@@ -45,6 +46,7 @@ export function createDeribitIvLadderCache(
   options: LadderOptions
 ) {
   const asset = options.asset.toUpperCase();
+  const optionType = options.optionType ?? "put";
   const expiriesDays = options.expiriesDays;
   const floorPcts = options.floorPcts;
   const refreshMs = options.refreshMs ?? 300000;
@@ -112,12 +114,14 @@ export function createDeribitIvLadderCache(
     if (!spot) return [];
     lastSpot = spot;
 
-    const puts = results.filter((inst: any) => inst.option_type === "put" && inst.expiration_timestamp);
-    if (!puts.length) return [];
+    const optionsPool = results.filter(
+      (inst: any) => inst.option_type === optionType && inst.expiration_timestamp
+    );
+    if (!optionsPool.length) return [];
 
     const now = Date.now();
     const byExpiry: Record<string, Array<any>> = {};
-    for (const inst of puts) {
+    for (const inst of optionsPool) {
       const tag = String(inst.instrument_name || "").split("-")[1] || "";
       if (!tag) continue;
       if (!byExpiry[tag]) byExpiry[tag] = [];
@@ -129,7 +133,7 @@ export function createDeribitIvLadderCache(
         const targetMs = now + days * 24 * 60 * 60 * 1000;
         let bestTag = "";
         let bestDiff = Number.POSITIVE_INFINITY;
-        for (const inst of puts) {
+        for (const inst of optionsPool) {
           const diff = Math.abs(inst.expiration_timestamp - targetMs);
           if (diff < bestDiff) {
             bestDiff = diff;
@@ -151,7 +155,7 @@ export function createDeribitIvLadderCache(
         )
       );
       for (const floor of floorPcts) {
-        const targetStrike = spot * (1 - floor);
+      const targetStrike = optionType === "put" ? spot * (1 - floor) : spot * (1 + floor);
         let bestAbove: any | null = null;
         let bestAboveDiff = Number.POSITIVE_INFINITY;
         let bestAny = pool[0];

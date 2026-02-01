@@ -52,6 +52,11 @@ export interface RiskControlsConfig {
   >;
   fee_leverage_multipliers_by_x?: Record<string, number>;
   pass_through_cap_by_leverage?: Record<string, number>;
+  pass_through_cap_by_tier?: Record<string, Record<string, number>>;
+  max_leverage_by_tier?: Record<string, { put: number; call: number }>;
+  enable_premium_pass_through?: boolean;
+  require_user_opt_in_for_pass_through?: boolean;
+  pass_through_min_notification_ratio?: number;
   coverage_override_tiers?: string[];
   duration_fee_per_day_pct?: number;
   duration_fee_max_pct?: number;
@@ -134,6 +139,10 @@ const DEFAULTS: RiskControlsConfig = {
   fee_iv_regime_multipliers_by_tier: {},
   fee_leverage_multipliers_by_x: {},
   pass_through_cap_by_leverage: {},
+  pass_through_cap_by_tier: {},
+  enable_premium_pass_through: true,
+  require_user_opt_in_for_pass_through: false,
+  pass_through_min_notification_ratio: 1.5,
   coverage_override_tiers: ["Pro (Gold)", "Pro (Platinum)"],
   duration_fee_per_day_pct: 0.04,
   duration_fee_max_pct: 0.6,

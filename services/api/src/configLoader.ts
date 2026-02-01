@@ -12,7 +12,10 @@ const accountSchema = z.object({
   expiryIso: z.string(),
   renewWindowMinutes: z.number(),
   renewPayload: z.record(z.unknown()),
-  alertWebhookUrl: z.string().optional()
+  alertWebhookUrl: z.string().optional(),
+  hedgeType: z.enum(["option", "perp"]).optional(),
+  positionSide: z.enum(["long", "short"]).optional(),
+  optionType: z.enum(["put", "call"]).optional()
 });
 
 const configSchema = z.object({

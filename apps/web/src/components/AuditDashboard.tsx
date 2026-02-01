@@ -64,16 +64,22 @@ export function AuditDashboard({
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
   const [showNetExposure, setShowNetExposure] = useState(false);
+  const [showGlossary, setShowGlossary] = useState(false);
 
   const load = useCallback(async () => {
     const [summaryRes, entriesRes] = await Promise.all([
       fetch(`${API_BASE}/audit/summary?mode=internal`),
-      fetch(`${API_BASE}/audit/entries?limit=200`)
+      fetch(`${API_BASE}/audit/logs?limit=200`)
     ]);
     const summaryData = await summaryRes.json();
     const entriesData = await entriesRes.json();
     setSummary(summaryData);
-    setEntries(Array.isArray(entriesData) ? entriesData : []);
+    setEntries(Array.isArray(entriesData?.entries) ? entriesData.entries : []);
+    if (entriesData?.count !== undefined) {
+      console.log(
+        `✓ Loaded ${entriesData.count} CEO-relevant events (${entriesData.totalEvents || 0} total)`
+      );
+    }
   }, []);
 
   useEffect(() => {
@@ -105,27 +111,37 @@ export function AuditDashboard({
   if (!summary) return <div className="empty">Loading audit summary...</div>;
 
   const liquidity = summary.liquidity;
-  const subsidy = summary.subsidy;
   const profitability = summary.profitability;
+  const stats = {
+    coverageCount: summary.totals?.coverage_activated || 0,
+    hedgeCount: summary.totals?.hedge_action || 0,
+    liquidity: liquidity?.liquidityBalanceUsdc ?? 0,
+    revenue: liquidity?.revenueUsdc ?? 0,
+    hedgeSpend: liquidity?.hedgeSpendUsdc ?? 0,
+    unrealizedPnl: profitability?.unrealizedHedgePnlUsdc ?? 0
+  };
+  // ═══════════════════════════════════════════════════════════
+  // CEO AUDIT EVENTS FILTER
+  // Must match CEO_AUDIT_EVENTS in services/api/src/server.ts
+  // Last synced: 2026-01-31
+  // Count: 13 events
+  // ═══════════════════════════════════════════════════════════
   const allowedEvents = new Set([
     "coverage_activated",
+    "coverage_renewed",
+    "coverage_expired",
+    "coverage_duplicate",
+    "liquidity_update",
     "hedge_order",
     "hedge_action",
-    "coverage_renewed",
-    "mtm_credit",
-    "liquidity_update"
+    "put_quote_failed",
+    "put_renew_failed",
+    "option_exec_failed",
+    "close_blocked",
+    "put_renew"
   ]);
-  const hasMtmCredit = (entry: AuditEntry) => {
-    const positionPnl = Number((entry.payload as any)?.positionPnlUsdc ?? 0);
-    const hedgeMtm = Number((entry.payload as any)?.hedgeMtmUsdc ?? 0);
-    if (!Number.isFinite(positionPnl) && !Number.isFinite(hedgeMtm)) return false;
-    return positionPnl !== 0 || hedgeMtm !== 0;
-  };
-  const visibleEntries = entries.filter((entry) => {
-    if (!allowedEvents.has(entry.event)) return false;
-    if (entry.event === "mtm_credit") return hasMtmCredit(entry);
-    return true;
-  });
+  console.log(`✓ Frontend audit filter: ${allowedEvents.size} event types`);
+  const visibleEntries = entries.filter((entry) => allowedEvents.has(entry.event));
   const isNetExposure = (entry: AuditEntry) => {
     const coverageId = String(entry.payload?.coverageId || "");
     if (coverageId.startsWith("net-") || coverageId === "platform-risk") return true;
@@ -212,174 +228,87 @@ export function AuditDashboard({
   }, 0);
 
   return (
-    <div className="section">
-      <h4>Audit Dashboard (Internal)</h4>
-      <div className="stats stats-buffer">
-        <div className="stat">
-          <div className="label">Coverage Activated</div>
-          <div className="value">{summary.totals.coverage_activated || 0}</div>
-          <div className="inline">
-            <span>Last</span>
-            <span>{summary.lastCoverage ? "Yes" : "—"}</span>
+    <div>
+      <div className="section">
+        <div className="audit-header">
+          <div className="audit-header-bar">
+            <div>
+              <h2 className="audit-header-title">Platform Health Dashboard</h2>
+              <p className="audit-header-subtitle">Real-time protection and hedge monitoring</p>
+            </div>
+            <div className="audit-header-actions">
+              <button className="audit-glossary-btn" onClick={() => setShowGlossary(true)}>
+                <svg className="audit-glossary-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"
+                  />
+                </svg>
+                <span>Glossary</span>
+              </button>
+              <div className="audit-status">
+                <span className="audit-status-dot" />
+                <span className="audit-status-text">Operational</span>
+              </div>
+            </div>
           </div>
-        </div>
-        <div className="stat">
-          <div className="label">Hedge Actions</div>
-          <div className="value">{summary.totals.hedge_action || 0}</div>
-          <div className="inline">
-            <span>Last</span>
-            <span>{summary.lastHedgeAction ? "Yes" : "—"}</span>
-          </div>
-        </div>
-      </div>
 
-      <div className="section">
-        <h4>Liquidity Panel</h4>
-        <div className="recommendation">
-          <div className="row row-align">
-            <span>Liquidity</span>
-            <strong>${liquidity ? liquidity.liquidityBalanceUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Hedge Spend</span>
-            <strong>${liquidity ? liquidity.hedgeSpendUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Hedge Margin</span>
-            <strong>${liquidity ? liquidity.hedgeMarginUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Revenue</span>
-            <strong>${liquidity ? liquidity.revenueUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Profit</span>
-            <strong>${liquidity ? liquidity.profitUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Reinvest</span>
-            <strong>${liquidity ? liquidity.reinvestUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Reserve</span>
-            <strong>${liquidity ? liquidity.reserveUsdc.toFixed(2) : "—"}</strong>
-          </div>
-        </div>
-      </div>
-      <div className="section">
-        <h4>Subsidy Budget</h4>
-        <div className="recommendation">
-          <div className="row row-align">
-            <span>Total Today</span>
-            <strong>${subsidy ? subsidy.totalUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Date</span>
-            <strong>{subsidy?.dateKey ?? "—"}</strong>
-          </div>
-        </div>
-      </div>
+          <div className="audit-metrics">
+            <div className="audit-metric">
+              <span className="audit-metric-label">Active Coverage</span>
+              <span className="audit-metric-value">{stats.coverageCount || 0}</span>
+              <span className="audit-metric-sub">protections active</span>
+            </div>
 
-      <div className="section">
-        <h4>Profitability</h4>
-        <div className="recommendation">
-          <div className="row row-align">
-            <span>Gross Revenue</span>
-            <strong>${profitability?.grossRevenueUsdc !== undefined ? profitability.grossRevenueUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Hedge Spend</span>
-            <strong>${profitability?.grossHedgeSpendUsdc !== undefined ? profitability.grossHedgeSpendUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Subsidy</span>
-            <strong>${profitability?.grossSubsidyUsdc !== undefined ? profitability.grossSubsidyUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Gross Profit</span>
-            <strong>${profitability?.grossProfitUsdc !== undefined ? profitability.grossProfitUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Gross Margin</span>
-            <strong>
-              {profitability?.grossMarginPct !== undefined && profitability?.grossMarginPct !== null
-                ? `${profitability.grossMarginPct.toFixed(2)}%`
-                : "—"}
-            </strong>
-          </div>
-          <div className="row row-align">
-            <span>Booked Profit</span>
-            <strong>
-              {profitability?.bookedProfitUsdc !== undefined
-                ? profitability.bookedProfitUsdc.toFixed(2)
-                : "—"}
-            </strong>
-          </div>
-          <div className="row row-align">
-            <span>Expected Profit</span>
-            <strong>
-              {profitability?.expectedProfitUsdc !== undefined
-                ? profitability.expectedProfitUsdc.toFixed(2)
-                : "—"}
-            </strong>
-          </div>
-          <div className="row row-align">
-            <span>Cash Profit</span>
-            <strong>${profitability ? profitability.cashProfitUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Hedge MTM</span>
-            <strong>${profitability ? profitability.hedgeMtmUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Realized Hedge PnL</span>
-            <strong>${profitability ? profitability.realizedHedgePnlUsdc.toFixed(2) : "—"}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Unrealized Hedge PnL</span>
-            <strong>
-              {profitability?.unrealizedHedgePnlUsdc !== undefined
-                ? profitability.unrealizedHedgePnlUsdc.toFixed(2)
-                : "—"}
-            </strong>
-          </div>
-          <div className="row row-align">
-            <span>Hedge Notional</span>
-            <strong>
-              {profitability?.hedgeNotionalUsdc !== undefined
-                ? `$${profitability.hedgeNotionalUsdc.toFixed(2)}`
-                : "—"}
-            </strong>
-          </div>
-          <div className="row row-align">
-            <span>Hedge Margin %</span>
-            <strong>
-              {profitability?.hedgeMarginPct !== undefined && profitability?.hedgeMarginPct !== null
-                ? `${profitability.hedgeMarginPct.toFixed(2)}%`
-                : "—"}
-            </strong>
-          </div>
-          <div className="row row-align">
-            <span>Net Profit</span>
-            <strong>${profitability ? profitability.netProfitUsdc.toFixed(2) : "—"}</strong>
-          </div>
-        </div>
-      </div>
+            <div className="audit-metric">
+              <span className="audit-metric-label">Hedge Actions</span>
+              <span className="audit-metric-value">{stats.hedgeCount || 0}</span>
+              <span className="audit-metric-sub">executed (24h)</span>
+            </div>
 
-      <div className="section">
-        <h4>Hedge Cost Breakdown</h4>
-        <div className="recommendation">
-          <div className="row row-align">
-            <span>Per-User Hedge Cost</span>
-            <strong>${perUserHedgeCost.toFixed(2)}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Pool Hedge Cost</span>
-            <strong>${poolHedgeCost.toFixed(2)}</strong>
-          </div>
-          <div className="row row-align">
-            <span>Fee Collected</span>
-            <strong>${feeCollected.toFixed(2)}</strong>
+            <div className="audit-metric">
+              <span className="audit-metric-label">Available Reserves</span>
+              <span className="audit-metric-value audit-metric-value-blue">
+                ${(stats.liquidity || 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              </span>
+              <span className="audit-metric-sub">capital available</span>
+            </div>
+
+            <div className="audit-metrics-divider" />
+
+            <div className="audit-metric">
+              <span className="audit-metric-label">Revenue Collected</span>
+              <span className="audit-metric-value audit-metric-value-positive">
+                ${(stats.revenue || 0).toFixed(2)}
+              </span>
+              <span className="audit-metric-sub">fees charged</span>
+            </div>
+
+            <div className="audit-metric">
+              <span className="audit-metric-label">Hedging Spend</span>
+              <span className="audit-metric-value audit-metric-value-warn">
+                ${(stats.hedgeSpend || 0).toFixed(2)}
+              </span>
+              <span className="audit-metric-sub">premiums paid</span>
+            </div>
+
+            <div className="audit-metric">
+              <span className="audit-metric-label">Protocol Margin</span>
+              <span
+                className={`audit-metric-value ${
+                  stats.revenue - stats.hedgeSpend >= 0
+                    ? "audit-metric-value-positive"
+                    : "audit-metric-value-warn"
+                }`}
+              >
+                ${(stats.revenue - stats.hedgeSpend).toFixed(2)}
+              </span>
+              <span className="audit-metric-sub">
+                {(stats.revenue - stats.hedgeSpend) >= 0 ? "operating profit" : "coverage cost"}
+              </span>
+            </div>
           </div>
         </div>
       </div>
@@ -531,6 +460,280 @@ export function AuditDashboard({
           </div>
         </div>
       </div>
+
+      {showGlossary && (
+        <>
+          <div
+            className="glossary-backdrop animate-fadeIn"
+            onClick={() => setShowGlossary(false)}
+          />
+          <div className="glossary-panel animate-slideIn">
+            <div className="glossary-header">
+              <div className="glossary-header-title">
+                <svg className="glossary-header-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"
+                  />
+                </svg>
+                <h3>Platform Glossary</h3>
+              </div>
+              <button className="glossary-close" onClick={() => setShowGlossary(false)}>
+                <svg className="glossary-close-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+              <p className="glossary-subtitle">
+                Quick reference for dashboard metrics and terminology
+              </p>
+            </div>
+
+            <div className="glossary-content">
+              <div className="glossary-section">
+                <div className="glossary-section-title">
+                  <span className="glossary-section-accent glossary-accent-blue" />
+                  <h4>Dashboard Metrics</h4>
+                </div>
+                <div className="glossary-cards">
+                  <div className="glossary-card">
+                    <dt>
+                      <span className="glossary-dot glossary-dot-blue" />
+                      Active Coverage
+                    </dt>
+                    <dd>
+                      Number of protection policies currently active. Each policy covers a specific
+                      cryptocurrency amount against price drops below the strike price.
+                    </dd>
+                  </div>
+                  <div className="glossary-card">
+                    <dt>
+                      <span className="glossary-dot glossary-dot-blue" />
+                      Hedge Actions (24h)
+                    </dt>
+                    <dd>
+                      Number of offsetting trades executed in the last 24 hours to reduce platform risk
+                      exposure. Hedges protect the platform from large payouts.
+                    </dd>
+                  </div>
+                  <div className="glossary-card">
+                    <dt>
+                      <span className="glossary-dot glossary-dot-blue" />
+                      Available Reserves
+                    </dt>
+                    <dd>
+                      Total capital in the liquidity pool available to pay claims and execute hedges.
+                      Must maintain minimum 1.5× ratio to total obligations.
+                    </dd>
+                  </div>
+                  <div className="glossary-card">
+                    <dt className="glossary-title-green">
+                      <span className="glossary-dot glossary-dot-green" />
+                      Revenue Collected
+                    </dt>
+                    <dd>
+                      Total premiums paid by users to purchase protections. Primary revenue source.
+                      Higher coverage volume generates higher revenue.
+                    </dd>
+                  </div>
+                  <div className="glossary-card">
+                    <dt className="glossary-title-orange">
+                      <span className="glossary-dot glossary-dot-orange" />
+                      Hedging Spend
+                    </dt>
+                    <dd>
+                      Cost of premiums paid to DEXs and option protocols to hedge risk. This is
+                      operational cost for protection, not a loss.
+                    </dd>
+                  </div>
+                  <div className="glossary-card">
+                    <dt className="glossary-title-green">
+                      <span className="glossary-dot glossary-dot-green" />
+                      Protocol Margin
+                    </dt>
+                    <dd>
+                      Revenue minus hedge costs. Positive = profitable operations. Negative = investing
+                      in coverage (hedges pay out later when protections are claimed).
+                    </dd>
+                  </div>
+                </div>
+              </div>
+
+              <div className="glossary-divider" />
+
+              <div className="glossary-section">
+                <div className="glossary-section-title">
+                  <span className="glossary-section-accent glossary-accent-purple" />
+                  <h4>Key Terms</h4>
+                </div>
+                <div className="glossary-terms">
+                  <div className="glossary-term">
+                    <dt>Protection Policy</dt>
+                    <dd>
+                      Financial instrument that pays out if crypto price drops below strike. Similar to
+                      insurance but not regulated as insurance.
+                    </dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>Strike Price</dt>
+                    <dd>Price level at which protection activates and becomes eligible for payout.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>Premium</dt>
+                    <dd>
+                      Fee paid by user to purchase protection. Calculated based on amount, duration,
+                      volatility, and market conditions.
+                    </dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>Hedge</dt>
+                    <dd>
+                      Offsetting position (options or perpetual futures) taken to reduce directional
+                      risk exposure.
+                    </dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>Delta</dt>
+                    <dd>
+                      Sensitivity of protection value to price changes. Tells us how much to hedge.
+                      Ranges from -1 to 0 for put-like protections.
+                    </dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>Liquidity Ratio</dt>
+                    <dd>
+                      Available reserves divided by maximum potential obligations. Target minimum 1.5×.
+                    </dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>DEX</dt>
+                    <dd>
+                      Decentralized exchange used for executing hedge trades (e.g., Uniswap, GMX).
+                    </dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>Net Exposure</dt>
+                    <dd>
+                      Audit filter showing net risk exposure calculations (excludes individual hedge
+                      transactions).
+                    </dd>
+                  </div>
+                </div>
+              </div>
+
+              <div className="glossary-divider" />
+
+              <div className="glossary-section">
+                <div className="glossary-section-title">
+                  <span className="glossary-section-accent glossary-accent-yellow" />
+                  <h4>Status Colors</h4>
+                </div>
+                <div className="glossary-statuses">
+                  <div className="glossary-status">
+                    <span className="glossary-status-dot glossary-dot-green" />
+                    <div>
+                      <dt className="glossary-title-green">Green</dt>
+                      <dd>Optimal. System healthy, metrics within targets.</dd>
+                    </div>
+                  </div>
+                  <div className="glossary-status">
+                    <span className="glossary-status-dot glossary-dot-yellow" />
+                    <div>
+                      <dt className="glossary-title-yellow">Yellow</dt>
+                      <dd>Caution. Approaching limits, monitor closely.</dd>
+                    </div>
+                  </div>
+                  <div className="glossary-status">
+                    <span className="glossary-status-dot glossary-dot-orange" />
+                    <div>
+                      <dt className="glossary-title-orange">Orange</dt>
+                      <dd>Warning. Below target but operational, action may be needed.</dd>
+                    </div>
+                  </div>
+                  <div className="glossary-status">
+                    <span className="glossary-status-dot glossary-dot-red" />
+                    <div>
+                      <dt className="glossary-title-red">Red</dt>
+                      <dd>Critical. Immediate attention required, may halt operations.</dd>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="glossary-divider" />
+
+              <div className="glossary-section">
+                <div className="glossary-section-title">
+                  <span className="glossary-section-accent glossary-accent-blue" />
+                  <h4>Audit Event Categories</h4>
+                </div>
+                <div className="glossary-terms">
+                  <div className="glossary-term">
+                    <dt>coverage_activated</dt>
+                    <dd>
+                      Protection policy created. Payload includes tier, portfolio positions, notional,
+                      floor, and expiry.
+                    </dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>coverage_renewed</dt>
+                    <dd>Auto-renew executed. Includes new expiry and hedge instrument.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>coverage_expired</dt>
+                    <dd>Coverage reached expiry and is no longer active.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>coverage_duplicate</dt>
+                    <dd>Duplicate activation detected for an existing live coverageId.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>hedge_action</dt>
+                    <dd>Decision to increase/decrease/hold a hedge; includes reason and size.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>hedge_order</dt>
+                    <dd>Order placed for a hedge action; includes instrument, side, size, and status.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>liquidity_update</dt>
+                    <dd>
+                      Liquidity accounting update after fees/hedges. Includes deltas and totals.
+                    </dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>mtm_credit</dt>
+                    <dd>Equity update that includes hedge MTM contribution.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>put_quote_failed</dt>
+                    <dd>Protective put quote failed due to pricing or liquidity constraints.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>put_renew_failed</dt>
+                    <dd>Auto-renew attempt failed.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>option_exec_failed</dt>
+                    <dd>Hedge option execution failed (insufficient liquidity or venue issue).</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>close_blocked</dt>
+                    <dd>Close request blocked due to drawdown buffer guard.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>put_renew</dt>
+                    <dd>Auto-renew result payload (pricing, instrument, status).</dd>
+                  </div>
+                </div>
+              </div>
+
+              <div className="glossary-spacer" />
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
