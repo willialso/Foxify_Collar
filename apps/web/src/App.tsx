@@ -134,6 +134,7 @@ export function App() {
   const [lastCoverageId, setLastCoverageId] = useState<string | null>(null);
   const [portfolioError, setPortfolioError] = useState<string | null>(null);
   const [isActivating, setIsActivating] = useState(false);
+  const [fetchingDotCount, setFetchingDotCount] = useState(1);
   const [toast, setToast] = useState<string | null>(null);
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditPrefetchSummary, setAuditPrefetchSummary] = useState<Record<string, unknown> | null>(
@@ -1384,6 +1385,19 @@ export function App() {
     volStatusLabel && volIvLabel ? `${volStatusLabel} · IV ${volIvLabel}` : null;
   const previewError = previewState === "error";
   const hasSelection = selectedPositions.length > 0;
+  const isFetchingQuote =
+    previewState === "loading" || previewGate === "fetching" || previewGate === "pending";
+  useEffect(() => {
+    if (!isFetchingQuote) {
+      setFetchingDotCount(1);
+      return;
+    }
+    const id = window.setInterval(() => {
+      setFetchingDotCount((prev) => (prev >= 3 ? 1 : prev + 1));
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [isFetchingQuote]);
+  const fetchingLabel = `Fetching${".".repeat(fetchingDotCount)}`;
   const displayFeeUsd = (() => {
     if (!hasSelection) return null;
     if (lockedQuote?.key === pricingKey) return lockedQuote.feeUsdc;
@@ -1399,6 +1413,11 @@ export function App() {
     previewError ||
     previewState === "idle";
   const pricingStatusLabel = null;
+  const feeDisplayLabel = displayFeeUsd
+    ? `$${formatUsd(displayFeeUsd)}`
+    : isFetchingQuote
+      ? fetchingLabel
+      : "—";
 
   return (
     <div className="shell">
@@ -1581,9 +1600,7 @@ export function App() {
                     {pricingStatusLabel && (
                       <span className="vol-status">{pricingStatusLabel}</span>
                     )}
-                    <strong className="fee-amount">
-                      {displayFeeUsd ? `$${formatUsd(displayFeeUsd)}` : "—"}
-                    </strong>
+                    <strong className="fee-amount">{feeDisplayLabel}</strong>
                   </div>
                 </div>
               </div>
