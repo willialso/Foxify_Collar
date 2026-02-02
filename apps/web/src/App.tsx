@@ -183,6 +183,7 @@ export function App() {
   const previewLoadingTimerRef = useRef<number | null>(null);
   const previewRequestIdRef = useRef(0);
   const previewRetryTimerRef = useRef<number | null>(null);
+  const lastPricingKeyRef = useRef<string | null>(null);
   const [hedgeContext, setHedgeContext] = useState<{
     coverageId: string;
     hedgeInstrument: string;
@@ -718,6 +719,25 @@ export function App() {
     if (Date.now() - lockedQuote.lockedAt <= QUOTE_LOCK_TTL_MS) return;
     setLockedQuote(null);
   }, [lockedQuote, QUOTE_LOCK_TTL_MS]);
+
+  useEffect(() => {
+    if (!pricingKey) {
+      lastPricingKeyRef.current = null;
+      return;
+    }
+    if (lastPricingKeyRef.current && lastPricingKeyRef.current !== pricingKey) {
+      setPreviewQuote(null);
+      setPreviewQuoteRaw(null);
+      setPreviewState("idle");
+      setPreviewGate("idle");
+      setPreviewLastError(null);
+      previewLastRequestAtRef.current = 0;
+      if (lockedQuote?.key !== pricingKey) {
+        setLockedQuote(null);
+      }
+    }
+    lastPricingKeyRef.current = pricingKey;
+  }, [pricingKey, lockedQuote]);
 
   useEffect(() => {
     if (!level || selectedIds.length !== 1) {
@@ -1642,11 +1662,11 @@ export function App() {
                   />
                 </div>
                 <div className="row row-align">
-                    <span>
+                  <span>
                     Premium
                     {isFetchingQuote && (
                       <span className="fetching-status">
-                        <em>(Fetching<span className="fetching-dots">{fetchingDots}</span>)</em>
+                        <em>Fetching<span className="fetching-dots">{fetchingDots}</span></em>
                       </span>
                     )}
                   </span>
