@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { appendFile, readdir, rm, writeFile, readFile } from "node:fs/promises";
+import { appendFile, readdir, rm, writeFile, readFile, mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import Decimal from "decimal.js";
 import {
@@ -101,6 +101,13 @@ const VENUE_CONFIG_PATH = new URL("../config.json", import.meta.url);
 const COVERAGE_FILE_PATH = new URL("../../../logs/coverages.json", import.meta.url);
 const HEDGE_LEDGER_PATH = new URL("../../../logs/hedge-ledger.json", import.meta.url);
 const QUOTE_CACHE_TTL_MS = Number(process.env.QUOTE_CACHE_TTL_MS || "300000");
+async function ensureLogsDir(): Promise<void> {
+  try {
+    await mkdir(LOGS_DIR, { recursive: true });
+  } catch (error) {
+    console.error("Failed to ensure logs directory:", error);
+  }
+}
 const QUOTE_CACHE_STALE_MS = Number(process.env.QUOTE_CACHE_STALE_MS || "20000");
 const QUOTE_CACHE_HARD_MS = Number(process.env.QUOTE_CACHE_HARD_MS || "120000");
 
@@ -6026,16 +6033,38 @@ app.post("/hedge/roll", async (req) => {
   };
 });
 
-app.listen({ port: 4100, host: "0.0.0.0" }).catch((err) => {
-  app.log.error(err);
-  process.exit(1);
-});
+const startServer = async () => {
+  try {
+    console.log("[API] Starting server...");
+    await app.listen({ port: 4100, host: "0.0.0.0" });
+    console.log("[API] Listening on http://0.0.0.0:4100");
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+};
 
-await seedAuditIfEmpty();
+const bootstrapState = async () => {
+  await ensureLogsDir();
+  try {
+    await seedAuditIfEmpty();
+  } catch (error) {
+    console.error("Failed to seed audit log:", error);
+  }
+  try {
+    await loadCoverages();
+  } catch (error) {
+    console.error("Failed to load coverages:", error);
+  }
+  try {
+    await loadHedgeLedger();
+  } catch (error) {
+    console.error("Failed to load hedge ledger:", error);
+  }
+};
 
-// Load persisted state
-await loadCoverages();
-await loadHedgeLedger();
+await startServer();
+void bootstrapState();
 
 // Optional lightweight interval runner (enabled when LOOP_INTERVAL_MS > 0)
 if (LOOP_INTERVAL_MS > 0) {
