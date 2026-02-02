@@ -1626,18 +1626,20 @@ export function App() {
                           {p.pnl >= 0 ? "+" : "-"}$
                           {formatUsd(Math.abs(p.pnl))}
                         </span>
-                        {isProtected && <span className="pill pill-inline">Protected</span>}
-                        <button
-                          className={selectedIds.includes(p.id) ? "btn active" : "btn"}
-                          onClick={() => toggleSelected(p.id)}
-                          disabled={isProtected}
-                        >
-                          {isProtected
-                            ? "Protected"
-                            : selectedIds.includes(p.id)
-                              ? "Selected"
-                              : "Protect"}
-                        </button>
+                        <div className="position-actions-right">
+                          {isProtected && <span className="pill pill-inline">Protected</span>}
+                          <button
+                            className={selectedIds.includes(p.id) ? "btn active" : "btn"}
+                            onClick={() => toggleSelected(p.id)}
+                            disabled={isProtected}
+                          >
+                            {isProtected
+                              ? "Protected"
+                              : selectedIds.includes(p.id)
+                                ? "Selected"
+                                : "Protect"}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   );
@@ -1749,7 +1751,7 @@ export function App() {
                         {p.asset} {p.side === "long" ? "Long" : "Short"}
                       </strong>
                       {protectedIds.includes(p.id) ? (
-                        <span className="pill pill-inline">Protected</span>
+                        <span className="pill pill-inline pill-left">Protected</span>
                       ) : null}
                       <div className="muted">
                         ${formatUsd(p.marginUsd)} • {p.leverage}x • Entry $
@@ -1760,19 +1762,21 @@ export function App() {
                       <span className={p.pnl >= 0 ? "pill" : "danger"}>
                         {p.pnl >= 0 ? "+" : "-"}${formatUsd(Math.abs(p.pnl))}
                       </span>
-                      {protectedIds.includes(p.id) ? (
-                        <span className="pill pill-inline">Protected</span>
-                      ) : (
-                        <button
-                          className="btn"
-                          onClick={() => {
-                            setProtectionActive(false);
-                            setSelectedIds([p.id]);
-                          }}
-                        >
-                          Protect
-                        </button>
-                      )}
+                      <div className="position-actions-right">
+                        {protectedIds.includes(p.id) ? (
+                          <span className="pill pill-inline">Protected</span>
+                        ) : (
+                          <button
+                            className="btn"
+                            onClick={() => {
+                              setProtectionActive(false);
+                              setSelectedIds([p.id]);
+                            }}
+                          >
+                            Protect
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -1871,21 +1875,23 @@ export function App() {
                       </div>
                     </div>
                     <div className="position-actions">
-                      {isProtected && <span className="pill pill-inline">Protected</span>}
-                      {!isProtected && (
-                        <button
-                          className="btn"
-                          onClick={() => {
-                            setPortfolio((prev) => ({
-                              tierName: prev?.tierName || "",
-                              positions: prev?.positions.filter((item) => item.id !== p.id) || []
-                            }));
-                            setSelectedIds((prev) => (prev.includes(p.id) ? [] : prev));
-                          }}
-                        >
-                          Remove
-                        </button>
-                      )}
+                      <div className="position-actions-right">
+                        {isProtected && <span className="pill pill-inline">Protected</span>}
+                        {!isProtected && (
+                          <button
+                            className="btn"
+                            onClick={() => {
+                              setPortfolio((prev) => ({
+                                tierName: prev?.tierName || "",
+                                positions: prev?.positions.filter((item) => item.id !== p.id) || []
+                              }));
+                              setSelectedIds((prev) => (prev.includes(p.id) ? [] : prev));
+                            }}
+                          >
+                            Remove
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 );

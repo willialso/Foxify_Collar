@@ -760,10 +760,17 @@ select.input {
   }
 
   .title {
-    flex-direction: column;
-    align-items: flex-start;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
     gap: 6px;
     font-size: 14px;
+  }
+
+  .brand {
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
   .subtitle {
@@ -771,7 +778,9 @@ select.input {
   }
 
   .header-actions {
-    width: 100%;
+    width: auto;
+    margin-left: auto;
+    justify-content: flex-end;
     flex-wrap: wrap;
     gap: 6px;
   }
@@ -831,6 +840,24 @@ select.input {
     margin-top: 4px;
   }
 
+  .position-actions-right {
+    margin-left: auto;
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+  }
+
+  .position-actions-right > .btn {
+    order: 1;
+  }
+
+  .position-actions-right > .pill-inline {
+    order: 2;
+    margin-left: 0;
+  }
+
   .position-actions .btn {
     width: auto;
     font-size: 11px;
@@ -848,13 +875,13 @@ select.input {
     display: none;
   }
 
-  .position-actions > button {
-    margin-left: auto;
-  }
-
   .position-actions > span {
     font-size: 10px;
     padding: 4px 8px;
+  }
+
+  .position-row .pill-left {
+    display: none;
   }
 
   .row {
@@ -1170,6 +1197,12 @@ select.input {
 
 .position-actions {
   display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.position-actions-right {
+  display: inline-flex;
   align-items: center;
   gap: 8px;
 }
