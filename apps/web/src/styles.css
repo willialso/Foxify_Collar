@@ -736,12 +736,15 @@ select.input {
 }
 
 @media (max-width: 767px) {
+  .audit-dashboard {
+    display: none;
+  }
   .shell {
     padding: 16px;
   }
 
   .card {
-    padding: 14px;
+    padding: 12px;
     border-radius: 14px;
   }
 
@@ -752,7 +755,7 @@ select.input {
   .title {
     flex-direction: column;
     align-items: flex-start;
-    gap: 8px;
+    gap: 6px;
     font-size: 14px;
   }
 
@@ -772,19 +775,19 @@ select.input {
 
   .stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
+    gap: 6px;
   }
 
   .stat {
-    padding: 10px;
+    padding: 8px;
   }
 
   .value {
-    font-size: 15px;
+    font-size: 14px;
   }
 
   .positions {
-    gap: 12px;
+    gap: 10px;
   }
 
   .position-row {
@@ -793,12 +796,12 @@ select.input {
     background: linear-gradient(135deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
     border-color: rgba(255, 255, 255, 0.08);
     border-radius: 14px;
-    padding: 12px 14px;
+    padding: 10px 12px;
   }
 
   .position-row strong {
     display: block;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
     margin-bottom: 4px;
   }
@@ -812,13 +815,13 @@ select.input {
     width: 100%;
     justify-content: space-between;
     gap: 8px;
-    margin-top: 8px;
+    margin-top: 6px;
   }
 
   .position-actions .btn {
     width: 100%;
-    font-size: 12px;
-    padding: 10px 12px;
+    font-size: 11px;
+    padding: 8px 10px;
   }
 
   .row {
@@ -834,11 +837,11 @@ select.input {
     background: linear-gradient(140deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
     border-color: rgba(255, 255, 255, 0.08);
     border-radius: 14px;
-    padding: 14px;
+    padding: 12px;
   }
 
   .recommendation .row {
-    padding: 8px 0;
+    padding: 6px 0;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   }
 
@@ -847,14 +850,14 @@ select.input {
   }
 
   .recommendation .row > span {
-    font-size: 11px;
+    font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.4px;
     color: var(--muted);
   }
 
   .recommendation .row > strong {
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
     color: var(--text);
   }
@@ -873,7 +876,7 @@ select.input {
   .input {
     width: 100%;
     text-align: left;
-    padding: 10px 12px;
+    padding: 8px 10px;
   }
 
   select.input {
@@ -886,7 +889,7 @@ select.input {
   }
 
   .modal {
-    padding: 12px;
+    padding: 10px;
   }
 
   .modal-card {
@@ -894,7 +897,7 @@ select.input {
     max-height: 90vh;
     overflow: auto;
     border-radius: 14px;
-    padding: 14px;
+    padding: 12px;
   }
 
   .modal-title {
@@ -919,8 +922,8 @@ select.input {
 
   .modal-actions .btn {
     width: 100%;
-    font-size: 12px;
-    padding: 10px 12px;
+    font-size: 11px;
+    padding: 8px 10px;
   }
 }
 
