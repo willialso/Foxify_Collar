@@ -82,7 +82,7 @@
   "max_leverage_by_tier": {
     "Pro (Bronze)": {
       "put": 10,
-      "call": 0
+      "call": 10
     },
     "Pro (Silver)": {
       "put": 10,

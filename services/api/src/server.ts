@@ -738,7 +738,10 @@ function applyBronzeFixedFee(
   feeUsdc: Decimal,
   optionType?: "put" | "call"
 ): { fee: Decimal; applied: boolean } {
-  return { fee: feeUsdc, applied: false };
+  if (tierName !== "Pro (Bronze)") {
+    return { fee: feeUsdc, applied: false };
+  }
+  return { fee: feeUsdc, applied: true };
 }
 
 function applyIvFeeUplift(tierName: string, feeUsdc: Decimal, iv?: number): Decimal {
@@ -789,6 +792,15 @@ async function calculateFeeBase(params: {
   feeIv: NormalizedIv;
 }> {
   const feeIv = await resolveFeeIv(params.asset, params.ivCandidate);
+  if (params.tierName === "Pro (Bronze)") {
+    const fixedFee = applyMinFee(params.tierName, params.baseFeeUsdc);
+    return {
+      feeUsdc: fixedFee,
+      feeRegime: { regime: null, multiplier: null },
+      feeLeverage: { multiplier: new Decimal(1) },
+      feeIv
+    };
+  }
   let feeUsdc = applyMinFee(params.tierName, params.baseFeeUsdc);
   feeUsdc = applyDurationFee(feeUsdc, params.targetDays);
   const ctcEnabled = riskControls.ctc_enabled ?? false;
@@ -2556,8 +2568,8 @@ app.post("/put/quote", async (req) => {
     return responseAny as Record<string, unknown>;
   };
   if (cached && isQuoteCacheFresh(cached)) {
-    // Temporarily bypass cache for Bronze call testing or explicit cache busting
-    if (body._cacheBust || (body.tierName === "Pro (Bronze)" && body.side === "short")) {
+    // Bypass cache only for explicit cache busting.
+    if (body._cacheBust) {
       await audit("debug_cache_bypass", {
         tierName: body.tierName,
         side: body.side,
@@ -2742,31 +2754,6 @@ app.post("/put/quote", async (req) => {
       ? spotPrice.mul(new Decimal(1).minus(drawdownFloorPct))
       : spotPrice.mul(new Decimal(1).plus(drawdownFloorPct));
   const tierName = body.tierName || "Unknown";
-  if (tierName === "Pro (Bronze)" && optionType === "call") {
-    await audit("bronze_call_not_supported", {
-      tierName,
-      side: body.side,
-      optionType,
-      requestedLeverage: leverage
-    });
-    return cacheAndReturn({
-      status: "error",
-      error: "option_type_not_supported",
-      message:
-        "Bronze tier supports put protection (long positions) only. Call protection (short positions) not available.",
-      details: {
-        tierName,
-        requestedOptionType: optionType,
-        supportedTypes: ["put"],
-        reason: "Bronze tier optimized for long position protection due to cost dynamics"
-      },
-      suggestions: [
-        "Bronze tier: Use put protection for long positions (up to 10× leverage)",
-        "Short position protection not available at Bronze tier",
-        "Reduce position size or use unprotected shorts if comfortable with risk"
-      ]
-    });
-  }
   const tierLeverageLimits = riskControls.max_leverage_by_tier?.[tierName];
   if (tierLeverageLimits && optionType === "put") {
     const maxLeverageForOption = tierLeverageLimits[optionType];
@@ -3034,7 +3021,7 @@ app.post("/put/quote", async (req) => {
       optionType
     });
     let feeReason = "flat_fee";
-    if (ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
+    if (tierName !== "Pro (Bronze)" && ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
       feeUsdc = ctcSafety.feeUsdc;
       feeReason = "ctc_safety";
     }
@@ -3224,8 +3211,7 @@ app.post("/put/quote", async (req) => {
             premium: allInPremium.toFixed(2),
             cap: cappedFee.toFixed(2)
           });
-          // Bronze tier: calls (short positions) not supported
-          // Only puts (long positions) available at Bronze tier
+          // Bronze tier does not receive capped pass-through subsidy.
           const feasibility = null;
           await audit("debug_feasibility_search_result", {
             found: feasibility?.found ?? false,
@@ -3537,8 +3523,7 @@ app.post("/put/quote", async (req) => {
         premium: allInPremium.toFixed(2),
         cap: passThroughCapInfo.maxFee ? passThroughCapInfo.maxFee.toFixed(2) : null
       });
-      // Bronze tier: calls (short positions) not supported
-      // Only puts (long positions) available at Bronze tier
+      // Bronze tier does not receive capped pass-through subsidy.
       const feasibility = null;
       await audit("debug_feasibility_search_result", {
         found: feasibility?.found ?? false,
@@ -3906,7 +3891,7 @@ app.post("/put/quote", async (req) => {
     optionType
   });
   let feeReason = "flat_fee";
-  if (ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
+  if (tierName !== "Pro (Bronze)" && ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
     feeUsdc = ctcSafety.feeUsdc;
     feeReason = "ctc_safety";
   }

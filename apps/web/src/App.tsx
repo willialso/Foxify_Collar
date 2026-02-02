@@ -56,15 +56,6 @@ type RiskSummary = {
 };
 
 const ASSETS: Asset[] = ["BTC"];
-const PER_ASSET_FEES: Record<Asset, Record<string, number>> = {
-  BTC: {
-    "Pro (Bronze)": 20,
-    "Pro (Silver)": 35,
-    "Pro (Gold)": 60,
-    "Pro (Platinum)": 80
-  }
-};
-
 const parseNumberString = (value: unknown): string | null => {
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
   if (typeof value === "string" && value.trim().length > 0 && Number.isFinite(Number(value))) {
@@ -598,13 +589,11 @@ export function App() {
     ].join("|");
   }, [level, selectedPositions, expiryDays, drawdownPct]);
   const QUOTE_LOCK_TTL_MS = 6000;
+  const baseFeeUsdRaw = level ? Number(level.fixed_price_usdc) : 0;
+  const baseFeeUsd = Number.isFinite(baseFeeUsdRaw) ? baseFeeUsdRaw : 0;
   const perAssetFeeUsd = level
-    ? selectedPositions.reduce(
-        (sum, p) => sum + (PER_ASSET_FEES[p.asset]?.[level.name] || 0),
-        0
-      )
+    ? selectedPositions.reduce((sum) => sum + baseFeeUsd, 0)
     : 0;
-  const baseFeeUsd = level ? PER_ASSET_FEES.BTC?.[level.name] || 0 : 0;
   const totalFeeUsd = perAssetFeeUsd;
 
   const shortTierLabel = () => {
@@ -644,10 +633,6 @@ export function App() {
   };
 
   useEffect(() => {
-    if (bronzeFixed && pricingKey && !lockedQuote) {
-      setLockedQuote({ key: pricingKey, feeUsdc: baseFeeUsd, lockedAt: Date.now(), markIv: null });
-      return;
-    }
     if (!pricingKey) {
       if (lockedQuote) setLockedQuote(null);
       return;
@@ -737,14 +722,6 @@ export function App() {
     const spot = spotPrices[primary.asset] || primary.entryPrice;
     if (!spot || baseFeeUsd <= 0) {
       setPreviewGate("no_spot_fee");
-      setPreviewQuote(null);
-      setPreviewQuoteRaw(null);
-      setPreviewLoading(false);
-      setPreviewState("idle");
-      return;
-    }
-    if (level.name === "Pro (Bronze)" && primary.leverage <= 2) {
-      setPreviewGate("bronze_fixed");
       setPreviewQuote(null);
       setPreviewQuoteRaw(null);
       setPreviewLoading(false);
@@ -1335,26 +1312,23 @@ export function App() {
     : 0;
   const hasProtectedPosition =
     portfolio?.positions?.some((pos) => protectedIds.includes(pos.id)) ?? false;
-  const bronzeFixed =
-    level?.name === "Pro (Bronze)" && (selectedPositions[0]?.leverage ?? 0) <= 2;
   const volAdjusted =
     previewQuote &&
     (previewQuote.feeRegime === "low" || previewQuote.feeRegime === "high") &&
     previewQuote.feeUsdc !== null &&
     Math.abs(previewQuote.feeUsdc - baseFeeUsd) > 0.01;
   const volStatusLabel =
-    volAdjusted && !bronzeFixed ? formatVolStatus(previewQuote?.feeRegime ?? null) : null;
+    volAdjusted ? formatVolStatus(previewQuote?.feeRegime ?? null) : null;
   const volIvLabel =
-    volAdjusted && !bronzeFixed && previewQuote?.markIv !== null
+    volAdjusted && previewQuote?.markIv !== null
       ? previewQuote.markIv.toFixed(2)
       : null;
   const volMessage =
     volStatusLabel && volIvLabel ? `${volStatusLabel} · IV ${volIvLabel}` : null;
-  const previewError = previewState === "error" && !bronzeFixed;
+  const previewError = previewState === "error";
   const hasSelection = selectedPositions.length > 0;
   const displayFeeUsd = (() => {
     if (!hasSelection) return null;
-    if (bronzeFixed) return baseFeeUsd;
     if (lockedQuote?.key === pricingKey) return lockedQuote.feeUsdc;
     if (previewState === "ok" && previewQuote && previewQuote.feeUsdc !== null && previewQuote.feeUsdc > 0) {
       return previewQuote.feeUsdc;
