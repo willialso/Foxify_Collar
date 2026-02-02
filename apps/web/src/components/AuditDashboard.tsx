@@ -431,7 +431,9 @@ export function AuditDashboard({
                 <span>{instrument}</span>
                 <span>{expiryTag || "—"}</span>
                 <span>
-                  {strikeNum !== null && Number.isFinite(strikeNum) ? strikeNum.toFixed(0) : "—"}
+                  {strikeNum !== null && Number.isFinite(strikeNum)
+                    ? strikeNum.toLocaleString(undefined, { maximumFractionDigits: 0 })
+                    : "—"}
                 </span>
                 <span>{side || "—"}</span>
                 <span>{status || "—"}</span>

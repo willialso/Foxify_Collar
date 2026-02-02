@@ -445,7 +445,7 @@ export function App() {
         return;
       }
       setPortfolioError(null);
-      const nextPortfolio = limitToSinglePosition(validated.value || null);
+      const nextPortfolio = validated.value || null;
       setPortfolio(nextPortfolio);
       if (nextPortfolio?.tierName) {
         const matched = levels.find((item) => item.name === nextPortfolio.tierName) || null;
@@ -463,7 +463,7 @@ export function App() {
       const parsed = JSON.parse(saved);
       const validated = validatePortfolio(parsed);
       if (!validated.ok) return;
-      const nextPortfolio = limitToSinglePosition(validated.value || null);
+      const nextPortfolio = validated.value || null;
       setPortfolio(nextPortfolio);
       if (nextPortfolio?.tierName) {
         const matched = levels.find((item) => item.name === nextPortfolio.tierName) || null;
@@ -1345,6 +1345,8 @@ export function App() {
     value.toLocaleString(undefined, { maximumFractionDigits: 0 });
   const formatPrice = (value: number) =>
     value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const formatSpot = (value: number) =>
+    value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   const mtmEquity = riskSummary ? Number(riskSummary.equityUsdc) : portfolioStats.equityUsd;
   const mtmDistanceToFloor = mtmEquity - portfolioStats.floorUsd;
@@ -1639,11 +1641,11 @@ export function App() {
                   />
                 </div>
                 <div className="row row-align">
-                  <span>
+                    <span>
                     Premium
                     {isFetchingQuote && (
                       <span className="fetching-status">
-                        Fetching<span className="fetching-dots">{fetchingDots}</span>
+                        <em>(Fetching<span className="fetching-dots">{fetchingDots}</span>)</em>
                       </span>
                     )}
                   </span>
@@ -1817,24 +1819,17 @@ export function App() {
                 <strong>${formatUsd(Math.max(0, remainingMargin))}</strong>
               </div>
               <div className="divider" />
-              {protectionActive && hasProtectedPosition && (
-                <div className="disclaimer">
-                  Protected position is locked. Add a new position after protection ends.
-                </div>
-              )}
               <PortfolioForm
                 levels={levels}
                 level={level}
                 remainingMargin={remainingMargin}
                 spotPrices={spotPrices}
-                existingPosition={
-                  protectionActive && hasProtectedPosition ? null : portfolio?.positions?.[0] ?? null
-                }
-                disabled={protectionActive && hasProtectedPosition}
+                existingPosition={null}
+                disabled={false}
                 onSave={async (position) => {
                   const nextPortfolio = {
                     tierName: portfolio?.tierName || level?.name || "Pro (Bronze)",
-                    positions: [position]
+                    positions: [...(portfolio?.positions ?? []), position]
                   };
                   setPortfolio(nextPortfolio);
                   await syncPositions(nextPortfolio);
@@ -2054,7 +2049,7 @@ function PortfolioForm({
       </div>
       <div className="row">
         <span>Entry</span>
-        <strong>{spot ? `$${spot.toFixed(2)}` : "—"}</strong>
+        <strong>{spot ? `$${formatSpot(spot)}` : "—"}</strong>
       </div>
       {!existingPosition && (
         <button

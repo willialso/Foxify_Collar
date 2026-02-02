@@ -259,6 +259,10 @@ body {
   color: var(--muted);
 }
 
+.fetching-status em {
+  font-style: italic;
+}
+
 .fetching-dots {
   display: inline-block;
   min-width: 12px;
@@ -1066,7 +1070,7 @@ select.input {
 .audit-table {
   display: grid;
   gap: 6px;
-  min-width: 1160px;
+  min-width: 1320px;
 }
 
 .audit-row {
@@ -1080,6 +1084,7 @@ select.input {
     80px
     70px
     80px
+    90px
     90px
     90px
     90px
