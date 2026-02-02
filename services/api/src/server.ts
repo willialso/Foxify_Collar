@@ -93,6 +93,8 @@ const LOOP_INTERVAL_MS = Number(process.env.LOOP_INTERVAL_MS || "600000");
 const MTM_INTERVAL_MS = Number(process.env.MTM_INTERVAL_MS || "300000");
 const APP_MODE = process.env.APP_MODE || "demo";
 const AUDIT_SEED = process.env.AUDIT_SEED !== "false";
+const API_PORT = Number(process.env.PORT || process.env.API_PORT || "4100");
+const API_HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_PATH = process.env.ACCOUNTS_CONFIG_PATH || "../../../configs/live_accounts.json";
 const AUDIT_LOG_PATH = new URL("../../../logs/audit.log", import.meta.url);
 const LOGS_DIR = new URL("../../../logs/", import.meta.url);
@@ -6147,8 +6149,8 @@ app.post("/hedge/roll", async (req) => {
 const startServer = async () => {
   try {
     console.log("[API] Starting server...");
-    await app.listen({ port: 4100, host: "0.0.0.0" });
-    console.log("[API] Listening on http://0.0.0.0:4100");
+    await app.listen({ port: API_PORT, host: API_HOST });
+    console.log(`[API] Listening on http://${API_HOST}:${API_PORT}`);
   } catch (err) {
     app.log.error(err);
     process.exit(1);
