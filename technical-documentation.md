@@ -327,7 +327,9 @@ Validation:
 Response: quote payload with premium, strike, buffer target, and scoring.
 Behavior notes:
 - Bronze tier rejects **call** protection with `status: "error"` and `error: "option_type_not_supported"`.
-- Responses are cached for **all status types**; cache key is derived from request inputs in `buildQuoteCacheKey`.
+- Responses are cached for **all status types**; cache key uses **fuzzy buckets** (spot rounded to $500, drawdown rounded to 5%, days rounded to whole days) in `buildQuoteCacheKey`.
+- Cache hit/miss logging includes a live hit-rate (`[Cache] HIT/MISS - Hit rate ...`).
+- Dual-venue pricing uses a **hybrid fast path**: Bybit wins the race when it responds first; Deribit comparison is logged asynchronously via `hybrid_comparison`.
 
 #### POST /put/auto-renew
 Purpose: Renew protection near expiry  
@@ -497,6 +499,7 @@ Implementation:
 - `services/connectors/src/deribitConnector.ts`
   - `getTicker()`, `listInstruments()`, `getOrderBook()`, `getIndexPrice()`, `getPositions()`
   - `placeOrder()` supports paper mode and live mode (authenticated).
+  - Requests use `fetchWithTimeout` with default 6s timeout (`DERIBIT_TIMEOUT_MS`).
 
 REST endpoints (Deribit):
 - `https://test.deribit.com/api/v2` (testnet)
@@ -505,10 +508,25 @@ REST endpoints (Deribit):
 WS usage:
 - `services/api/src/deribitIvLadder.ts` subscribes to `ticker.<instrument>.100ms` channels for IV ladder snapshots.
 
-### 7.2 Price Oracle Integration
+### 7.2 Bybit Integration
+Secondary options venue for dual-venue pricing.
+
+Implementation:
+- `services/api/src/bybitAdapter.ts`
+  - `getBybitOrderbook()`, `getBybitSpotPrice()`, `formatBybitInstrument()`
+  - Mainnet requires VPN or allowed region
+  - Timeout tuned for performance (5s)
+
+### 7.3 Dual-Venue Pricing (Hybrid)
+Pricing engine queries Deribit + Bybit in parallel:
+- **Hybrid fast path** returns Bybit immediately if it responds first with valid prices.
+- **Background comparison** logs `hybrid_comparison` to audit (captures savings and alerts if Deribit is cheaper).
+- Deribit is still queried for competition data, preserving savings analytics.
+
+### 7.4 Price Oracle Integration
 ⚠️ NOT IMPLEMENTED — price data is pulled from Deribit index endpoints.
 
-### 7.3 Notification Services
+### 7.5 Notification Services
 Webhook alerts only:
 - `sendWebhookAlert()` in `services/hedging/src/alerts.ts`
 - Used in `/loop/tick` when `alertWebhookUrl` is provided.

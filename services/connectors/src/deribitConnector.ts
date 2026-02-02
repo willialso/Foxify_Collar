@@ -35,6 +35,19 @@ async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
   throw lastError;
 }
 
+const DERIBIT_TIMEOUT_MS = Number(process.env.DERIBIT_TIMEOUT_MS || "6000");
+console.log("[Deribit] Timeout set to 6s (optimized for performance)");
+
+async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DERIBIT_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export interface DeribitPosition {
   instrument_name: string;
   kind: "option" | "future";
@@ -62,7 +75,7 @@ export class DeribitConnector {
   async getTicker(instrument: string): Promise<unknown> {
     const url = `${this.baseUrl()}/public/ticker?instrument_name=${encodeURIComponent(instrument)}`;
     return withRetry(async () => {
-      const res = await fetch(url);
+      const res = await fetchWithTimeout(url);
       return res.json();
     });
   }
@@ -70,7 +83,7 @@ export class DeribitConnector {
   async listInstruments(currency = "BTC"): Promise<unknown> {
     const url = `${this.baseUrl()}/public/get_instruments?currency=${currency}&kind=option&expired=false`;
     return withRetry(async () => {
-      const res = await fetch(url);
+      const res = await fetchWithTimeout(url);
       return res.json();
     });
   }
@@ -78,7 +91,7 @@ export class DeribitConnector {
   async getOrderBook(instrument: string): Promise<unknown> {
     const url = `${this.baseUrl()}/public/get_order_book?instrument_name=${encodeURIComponent(instrument)}`;
     return withRetry(async () => {
-      const res = await fetch(url);
+      const res = await fetchWithTimeout(url);
       return res.json();
     });
   }
@@ -86,7 +99,7 @@ export class DeribitConnector {
   async getIndexPrice(indexName = "btc_usd"): Promise<unknown> {
     const url = `${this.baseUrl()}/public/get_index_price?index_name=${indexName}`;
     return withRetry(async () => {
-      const res = await fetch(url);
+      const res = await fetchWithTimeout(url);
       return res.json();
     });
   }
@@ -108,7 +121,7 @@ export class DeribitConnector {
 
     const url = `${this.baseUrl()}/public/auth?${params.toString()}`;
     const data = await withRetry(async () => {
-      const res = await fetch(url);
+      const res = await fetchWithTimeout(url);
       return res.json();
     });
 
@@ -133,7 +146,7 @@ export class DeribitConnector {
     }
     const url = `${this.baseUrl()}${path}?${urlParams.toString()}`;
     return withRetry(async () => {
-      const res = await fetch(url, {
+      const res = await fetchWithTimeout(url, {
         headers: { Authorization: `Bearer ${token}` }
       });
       return res.json();

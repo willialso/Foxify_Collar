@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { appendFile, readdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, readdir, rm, writeFile, readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import Decimal from "decimal.js";
 import {
   computeRiskSummary,
@@ -27,8 +28,16 @@ import { DeribitConnector } from "@foxify/connectors";
 import { runAutoRenewJob } from "./scheduler";
 import { loadAccountConfig } from "./configLoader";
 import { createDeribitIvCache } from "./deribitIvCache";
+import { createBybitIvCache } from "./bybitIvCache";
 import { createDeribitIvLadderCache } from "./deribitIvLadder";
-import { createDeribitExecutor, ExecutionRegistry } from "./executionRegistry";
+import { createBybitExecutor, createDeribitExecutor, ExecutionRegistry } from "./executionRegistry";
+import {
+  getBybitOrderbook,
+  getBybitAvailableStrikes,
+  formatBybitExpiryTag,
+  formatBybitInstrument,
+  BybitStrikeSnapshot
+} from "./bybitAdapter";
 import {
   loadRiskControls,
   applyRiskAccounting,
@@ -88,11 +97,50 @@ const CONFIG_PATH = process.env.ACCOUNTS_CONFIG_PATH || "../../../configs/live_a
 const AUDIT_LOG_PATH = new URL("../../../logs/audit.log", import.meta.url);
 const LOGS_DIR = new URL("../../../logs/", import.meta.url);
 const RISK_CONTROLS_PATH = new URL("../../../configs/risk_controls.json", import.meta.url);
+const VENUE_CONFIG_PATH = new URL("../config.json", import.meta.url);
 const COVERAGE_FILE_PATH = new URL("../../../logs/coverages.json", import.meta.url);
 const HEDGE_LEDGER_PATH = new URL("../../../logs/hedge-ledger.json", import.meta.url);
 const QUOTE_CACHE_TTL_MS = Number(process.env.QUOTE_CACHE_TTL_MS || "300000");
 const QUOTE_CACHE_STALE_MS = Number(process.env.QUOTE_CACHE_STALE_MS || "20000");
 const QUOTE_CACHE_HARD_MS = Number(process.env.QUOTE_CACHE_HARD_MS || "120000");
+
+type VenueMode = "bybit_only" | "deribit_only" | "dual_venue";
+type VenueConfig = {
+  mode: VenueMode;
+  bybit_enabled: boolean;
+  deribit_enabled: boolean;
+  dual_venue_enabled: boolean;
+};
+
+const DEFAULT_VENUE_CONFIG: VenueConfig = {
+  mode: "bybit_only",
+  bybit_enabled: true,
+  deribit_enabled: false,
+  dual_venue_enabled: false
+};
+
+function normalizeVenueMode(mode: unknown): VenueMode {
+  if (mode === "bybit_only" || mode === "deribit_only" || mode === "dual_venue") return mode;
+  return "bybit_only";
+}
+
+async function loadVenueConfig(): Promise<VenueConfig> {
+  try {
+    const raw = await readFile(VENUE_CONFIG_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    const fileVenue = parsed?.venue ?? {};
+    return {
+      ...DEFAULT_VENUE_CONFIG,
+      ...fileVenue,
+      mode: normalizeVenueMode(fileVenue.mode)
+    };
+  } catch (error: any) {
+    console.warn(
+      `[Config] Venue config unavailable, using defaults: ${error?.message ?? "unknown"}`
+    );
+    return { ...DEFAULT_VENUE_CONFIG };
+  }
+}
 
 console.log(
   `✓ Hedging loop interval: ${LOOP_INTERVAL_MS}ms (${(LOOP_INTERVAL_MS / 60000).toFixed(1)} minutes)`
@@ -105,10 +153,27 @@ console.log(
 const configUrl = new URL(CONFIG_PATH, import.meta.url);
 await loadAccountConfig(configUrl);
 const riskControls = await loadRiskControls(RISK_CONTROLS_PATH);
+const venueConfig = await loadVenueConfig();
+
+console.log("════════════════════════════════════════════════════════");
+console.log(`[Venue] Mode: ${venueConfig.mode.toUpperCase()}`);
+if (venueConfig.mode === "bybit_only") {
+  console.log("[Venue] ⚡ BYBIT-ONLY MODE (Demo optimized - 50% faster)");
+  console.log("[Venue] Deribit fallback: Available if Bybit fails");
+}
+console.log("════════════════════════════════════════════════════════");
 
 type QuoteCacheEntry = { ts: number; response: Record<string, unknown> };
 const quoteCache = new Map<string, QuoteCacheEntry>();
 const quoteInflight = new Map<string, Promise<Record<string, unknown>>>();
+type QuoteLock = {
+  feeUsdc: Decimal;
+  issuedAt: number;
+  expiresAt: number;
+  tierName: string;
+};
+const quoteLocks = new Map<string, QuoteLock>();
+const cacheStats = { hits: 0, misses: 0, avgHitTime: 0, avgMissTime: 0 };
 
 function buildQuoteCacheKey(body: {
   tierName?: string;
@@ -129,14 +194,20 @@ function buildQuoteCacheKey(body: {
   allowPremiumPassThrough?: boolean;
   ivSnapshot?: number;
 }): string {
+  const spot = Number(body.spotPrice || 0);
+  const drawdown = Number(body.drawdownFloorPct || 0);
+  const targetDays = Number(body.targetDays || 0);
+  const spotBucket = Math.round(spot / 500) * 500;
+  const drawdownBucket = Math.round(drawdown / 0.05) * 0.05;
+  const daysBucket = Math.round(targetDays);
   return JSON.stringify({
     tierName: body.tierName || "",
     asset: (body.asset || "BTC").toUpperCase(),
-    spot: Number(body.spotPrice || 0).toFixed(2),
-    drawdown: Number(body.drawdownFloorPct || 0).toFixed(4),
+    spot: spotBucket.toFixed(2),
+    drawdown: drawdownBucket.toFixed(4),
     fixed: Number(body.fixedPriceUsdc || 0).toFixed(2),
     expiryTag: body.expiryTag || "",
-    targetDays: Number(body.targetDays || 0),
+    targetDays: daysBucket,
     positionSize: Number(body.positionSize || 0).toFixed(6),
     contractSize: Number(body.contractSize || 0).toFixed(6),
     optionDelta: body.optionDelta ?? null,
@@ -168,6 +239,22 @@ function isQuoteCacheUsable(entry: QuoteCacheEntry): boolean {
 
 function setQuoteCache(key: string, response: Record<string, unknown>): void {
   quoteCache.set(key, { ts: Date.now(), response });
+}
+
+function recordCacheHit(elapsedMs: number): void {
+  cacheStats.hits += 1;
+  cacheStats.avgHitTime =
+    (cacheStats.avgHitTime * (cacheStats.hits - 1) + elapsedMs) / cacheStats.hits;
+  const total = cacheStats.hits + cacheStats.misses;
+  console.log(`[Cache] HIT - Hit rate: ${((cacheStats.hits / total) * 100).toFixed(1)}%`);
+}
+
+function recordCacheMiss(elapsedMs: number): void {
+  cacheStats.misses += 1;
+  cacheStats.avgMissTime =
+    (cacheStats.avgMissTime * (cacheStats.misses - 1) + elapsedMs) / cacheStats.misses;
+  const total = cacheStats.hits + cacheStats.misses;
+  console.log(`[Cache] MISS - Hit rate: ${((cacheStats.hits / total) * 100).toFixed(1)}%`);
 }
 
 async function audit(event: string, payload: Record<string, unknown>): Promise<void> {
@@ -632,6 +719,19 @@ function applyPassThroughCap(
   return { maxFee, capped, capMultiplier, tierName };
 }
 
+function resolvePremiumMarkupPct(tierName: string, leverage?: number): Decimal {
+  const tierMarkup = riskControls.premium_markup_pct_by_tier?.[tierName] ?? 0;
+  const leverageMarkup = findLeverageMultiplier(leverage, riskControls.leverage_markup_pct_by_x);
+  const leveragePct = Number.isFinite(leverageMarkup) ? leverageMarkup : 0;
+  return new Decimal(tierMarkup).add(new Decimal(leveragePct));
+}
+
+function resolveDriftTolerance(tierName: string): { pct: Decimal; usdc: Decimal } {
+  const pct = riskControls.drift_tolerance_pct_by_tier?.[tierName] ?? 0;
+  const usdc = riskControls.drift_tolerance_usdc_by_tier?.[tierName] ?? 0;
+  return { pct: new Decimal(pct), usdc: new Decimal(usdc) };
+}
+
 function applyBronzeFixedFee(
   tierName: string,
   leverage: number,
@@ -669,7 +769,8 @@ async function resolveFeeIv(asset: string, iv?: number): Promise<NormalizedIv> {
       return normalizeIvValue(ladder.hedgeIv);
     }
   }
-  const fallback = await ivCache.getAtmIv(asset);
+  const fallback =
+    venueConfig.mode === "bybit_only" ? await bybitIvCache.getAtmIv(asset) : await ivCache.getAtmIv(asset);
   return normalizeIvValue(Number(fallback.toFixed(6)));
 }
 
@@ -1179,7 +1280,8 @@ app.get("/risk/summary", async (req) => {
   return response;
 });
 
-const deribitEnv = (process.env.DERIBIT_ENV as "testnet" | "live") || "testnet";
+const deribitEnv = (process.env.DERIBIT_ENV as "testnet" | "live") || "live";
+console.log("[Deribit] Using MAINNET endpoint");
 const deribitPaper =
   process.env.DERIBIT_PAPER !== undefined
     ? process.env.DERIBIT_PAPER === "true"
@@ -1197,6 +1299,7 @@ const deribit = new DeribitConnector(
 );
 const executionRegistry = new ExecutionRegistry();
 executionRegistry.register(createDeribitExecutor(deribit));
+executionRegistry.register(createBybitExecutor());
 const pricingEngine = new MultiVenuePricingEngine([
   {
     name: "deribit",
@@ -1223,6 +1326,7 @@ const pricingEngine = new MultiVenuePricingEngine([
   }
 ]);
 const ivCache = createDeribitIvCache(deribit, { ttlMs: 15000, fallbackIv: 0.5 });
+const bybitIvCache = createBybitIvCache({ ttlMs: 15000, fallbackIv: 0.5 });
 const ivLadderPut = createDeribitIvLadderCache(deribit, {
   asset: "BTC",
   optionType: "put",
@@ -1266,6 +1370,9 @@ setTimeout(() => clearInterval(ladderWarmup), 15000);
 const predictionEngine = new VolatilityPredictionEngine(async (asset) => {
   if (!asset || asset.length === 0) return new Decimal(0.5);
   if (asset !== "BTC" && asset !== "ETH") return new Decimal(0.5);
+  if (venueConfig.mode === "bybit_only") {
+    return bybitIvCache.getAtmIv(asset);
+  }
   return ivCache.getAtmIv(asset);
 });
 const executionRouter = new BestPriceSplitRouter(3);
@@ -1375,20 +1482,188 @@ function selectStrikeCandidates(
   drawdownFloorPct: Decimal,
   maxCount: number
 ): Array<any> {
+  const buildBybitStrikeUniverse = (spot: Decimal): number[] => {
+    const increment = 1000;
+    const minStrike = Math.floor(spot.mul(0.5).toNumber() / increment) * increment;
+    const maxStrike = Math.ceil(spot.mul(1.3).toNumber() / increment) * increment;
+    const strikes: number[] = [];
+    for (let strike = minStrike; strike <= maxStrike; strike += increment) {
+      strikes.push(strike);
+    }
+    return strikes;
+  };
+
+  const rankStrikes = (
+    targetStrike: Decimal,
+    strikes: number[],
+    bufferPct = 0.02
+  ): number[] => {
+    const target = targetStrike.toNumber();
+    const buffer = target * bufferPct;
+    const minAcceptable = target - buffer;
+    const maxAcceptable = target + buffer;
+    const filtered = strikes.filter((strike) => {
+      if (optionType === "put") return strike >= minAcceptable;
+      return strike <= maxAcceptable;
+    });
+    const candidates = filtered.length ? filtered : strikes;
+    const penalty = target * 10;
+    return candidates.sort((a, b) => {
+      const scoreA =
+        optionType === "put"
+          ? (a >= target ? a - target : target - a + penalty)
+          : (a <= target ? target - a : a - target + penalty);
+      const scoreB =
+        optionType === "put"
+          ? (b >= target ? b - target : target - b + penalty)
+          : (b <= target ? target - b : b - target + penalty);
+      return scoreA - scoreB;
+    });
+  };
+
   const floorStrike =
     optionType === "put"
       ? spotPrice.mul(new Decimal(1).minus(drawdownFloorPct))
       : spotPrice.mul(new Decimal(1).plus(drawdownFloorPct));
+  if (venueConfig.mode === "bybit_only") {
+    const asset =
+      instruments[0]?.base_currency ||
+      instruments[0]?.instrument_name?.split("-")?.[0] ||
+      "BTC";
+    const strikes = buildBybitStrikeUniverse(spotPrice);
+    const ranked = rankStrikes(floorStrike, strikes);
+    return ranked.slice(0, maxCount).map((strike) => ({
+      strike,
+      option_type: optionType,
+      instrument_name: buildInstrumentName(
+        asset,
+        expiryTag,
+        String(strike),
+        optionType === "put" ? "P" : "C"
+      )
+    }));
+  }
+
   const scoped = instruments.filter(
     (inst) => inst.option_type === optionType && inst.instrument_name?.includes(expiryTag)
   );
-  return scoped
-    .sort((a, b) => {
-      const distA = new Decimal(a.strike || 0).minus(floorStrike).abs();
-      const distB = new Decimal(b.strike || 0).minus(floorStrike).abs();
-      return distA.sub(distB).toNumber();
-    })
+  const ranked = rankStrikes(
+    floorStrike,
+    scoped.map((inst) => Number(inst.strike || 0))
+  );
+  const byStrike = new Map<number, any>();
+  for (const inst of scoped) {
+    const strike = Number(inst.strike || 0);
+    if (!byStrike.has(strike)) byStrike.set(strike, inst);
+  }
+  return ranked
+    .map((strike) => byStrike.get(strike))
+    .filter(Boolean)
     .slice(0, maxCount);
+}
+
+function rankAvailableStrikes(
+  targetStrike: Decimal,
+  optionType: "put" | "call",
+  available: BybitStrikeSnapshot[],
+  bufferPct = 0.02
+): BybitStrikeSnapshot[] {
+  const target = targetStrike.toNumber();
+  const buffer = target * bufferPct;
+  const minAcceptable = target - buffer;
+  const maxAcceptable = target + buffer;
+  const filtered = available.filter((entry) => {
+    if (optionType === "put") return entry.strike >= minAcceptable;
+    return entry.strike <= maxAcceptable;
+  });
+  const candidates = filtered.length ? filtered : available;
+  const penalty = target * 10;
+  return candidates
+    .slice()
+    .sort((a, b) => {
+      const scoreA =
+        optionType === "put"
+          ? (a.strike >= target ? a.strike - target : target - a.strike + penalty)
+          : (a.strike <= target ? target - a.strike : a.strike - target + penalty);
+      const scoreB =
+        optionType === "put"
+          ? (b.strike >= target ? b.strike - target : target - b.strike + penalty)
+          : (b.strike <= target ? target - b.strike : b.strike - target + penalty);
+      return scoreA - scoreB;
+    });
+}
+
+async function selectBybitStrikeCandidates(
+  asset: string,
+  expiryTag: string,
+  optionType: "put" | "call",
+  targetStrike: Decimal,
+  maxCount: number
+): Promise<Array<any>> {
+  const expiryDate = parseExpiryTagToDate(expiryTag);
+  if (!expiryDate) return [];
+  const optionSymbol = optionType === "put" ? "P" : "C";
+  const available = await getBybitAvailableStrikes(asset, expiryDate, optionSymbol);
+  if (!available.length) return [];
+  const ranked = rankAvailableStrikes(targetStrike, optionType, available);
+  const selected = ranked.slice(0, Math.max(1, Math.min(maxCount, 3)));
+  const top = selected[0];
+  if (top) {
+    const delta = top.strike - targetStrike.toNumber();
+    const pct = targetStrike.gt(0) ? (delta / targetStrike.toNumber()) * 100 : 0;
+    console.log(
+      `[Strike Selection] target=${targetStrike.toFixed(2)} selected=${top.strike.toFixed(
+        0
+      )} delta=${delta.toFixed(2)} pct=${pct.toFixed(2)} available=${available.length}`
+    );
+  }
+  return selected.map((entry) => ({
+    strike: entry.strike,
+    option_type: optionType,
+    instrument_name: entry.symbol.replace(/-USDT$/, "")
+  }));
+}
+
+function getNextFridayUtc(fromDate: Date): Date {
+  const date = new Date(fromDate);
+  const dayOfWeek = date.getUTCDay();
+  let daysToAdd: number;
+  if (dayOfWeek <= 5) {
+    daysToAdd = 5 - dayOfWeek;
+  } else {
+    daysToAdd = 5 + (7 - dayOfWeek);
+  }
+  date.setUTCDate(date.getUTCDate() + daysToAdd);
+  date.setUTCHours(8, 0, 0, 0);
+  return date;
+}
+
+function buildBybitExpirySearchOrder(
+  targetDays: number,
+  maxOptions = 3
+): Array<{ expiryTag: string; targetDays: number }> {
+  const now = new Date();
+  const minExpiry = new Date(now);
+  minExpiry.setUTCDate(minExpiry.getUTCDate() + Math.max(1, Math.round(targetDays)));
+  minExpiry.setUTCHours(8, 0, 0, 0);
+
+  let candidate = getNextFridayUtc(minExpiry);
+  if (candidate < minExpiry) {
+    candidate = new Date(candidate);
+    candidate.setUTCDate(candidate.getUTCDate() + 7);
+  }
+
+  const order: Array<{ expiryTag: string; targetDays: number }> = [];
+  for (let i = 0; i < maxOptions; i += 1) {
+    const days = Math.max(
+      1,
+      Math.ceil((candidate.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))
+    );
+    order.push({ expiryTag: formatBybitExpiryTag(candidate), targetDays: days });
+    candidate = new Date(candidate);
+    candidate.setUTCDate(candidate.getUTCDate() + 7);
+  }
+  return order;
 }
 
 async function getOptionVenueQuotes(
@@ -1424,11 +1699,40 @@ async function getOptionVenueQuotes(
       markPriceUsd?: Decimal | null;
     };
   }> = [];
-  const deribitBook = await deribit.getOrderBook(instrument);
-  const deribitOrderBook = (deribitBook as any)?.result;
-  if (deribitOrderBook) {
-    const { bid, ask } = bestBidAsk(deribitOrderBook);
-    const markPrice = deribitOrderBook.mark_price ?? null;
+  const parts = instrument.split("-");
+  const asset = parts[0];
+  const expiryTag = parts[1];
+  const strike = Number(parts[2]);
+  const optionSymbol = parts[3]?.toUpperCase() as "C" | "P" | undefined;
+  const expiryDate = expiryTag ? parseExpiryTagToDate(expiryTag) : null;
+
+  const bybitSupported =
+    asset && expiryDate && Number.isFinite(strike) && (optionSymbol === "C" || optionSymbol === "P");
+  const bybitAllowed = venueConfig.bybit_enabled && bybitSupported;
+  const deribitAllowed = venueConfig.deribit_enabled;
+
+  const addBybitQuote = (bybit: any, instrumentName = instrument) => {
+    const bidUsd = new Decimal(bybit.bid);
+    const askUsd = new Decimal(bybit.ask);
+    quotes.push({
+      venue: "bybit",
+      instrument: instrumentName,
+      type: "option",
+      book: {
+        bid: bidUsd,
+        ask: askUsd,
+        bidSize: new Decimal(bybit.bidSize || 0),
+        askSize: new Decimal(bybit.askSize || 0),
+        spreadPct: spreadPct(bybit.bid, bybit.ask),
+        timestampMs: bybit.timestamp ?? null,
+        markPriceUsd: null
+      }
+    });
+  };
+
+  const addDeribitQuote = (orderBook: any) => {
+    const { bid, ask } = bestBidAsk(orderBook);
+    const markPrice = orderBook.mark_price ?? null;
     const bidUsd = bid ? new Decimal(bid).mul(spotPrice) : null;
     const askUsd = ask ? new Decimal(ask).mul(spotPrice) : null;
     const markUsd = markPrice ? new Decimal(markPrice).mul(spotPrice) : null;
@@ -1439,16 +1743,136 @@ async function getOptionVenueQuotes(
       book: {
         bid: bidUsd,
         ask: askUsd,
-        bidSize: new Decimal(deribitOrderBook.bids?.[0]?.[1] || 0),
-        askSize: new Decimal(deribitOrderBook.asks?.[0]?.[1] || 0),
+        bidSize: new Decimal(orderBook.bids?.[0]?.[1] || 0),
+        askSize: new Decimal(orderBook.asks?.[0]?.[1] || 0),
         spreadPct: spreadPct(bid || 0, ask || 0),
-        timestampMs: deribitOrderBook.timestamp ?? null,
+        timestampMs: orderBook.timestamp ?? null,
         markPriceUsd: markUsd
       }
     });
+  };
+
+  if (venueConfig.mode === "bybit_only") {
+    console.log("[Venue] Querying Bybit only (demo mode)");
+    if (bybitAllowed) {
+      try {
+        const bybit = await getBybitOrderbook(asset, strike, expiryDate!, optionSymbol!);
+        if (bybit?.ask) {
+          addBybitQuote(bybit, instrument);
+          return quotes;
+        }
+      } catch (error: any) {
+        console.log(`[Venue] Bybit failed, falling back to Deribit: ${error?.message ?? "unknown"}`);
+      }
+    }
+
+    if (deribitAllowed) {
+      try {
+        const deribitOrderBook = (await deribit.getOrderBook(instrument) as any)?.result;
+        if (deribitOrderBook) {
+          addDeribitQuote(deribitOrderBook);
+          return quotes;
+        }
+      } catch (error: any) {
+        console.log(`[Venue] Deribit fallback failed: ${error?.message ?? "unknown"}`);
+      }
+    }
+
+    throw new Error("Bybit and Deribit unavailable");
   }
 
-  return quotes;
+  if (venueConfig.mode === "deribit_only") {
+    console.log("[Venue] Querying Deribit only");
+    if (!deribitAllowed) {
+      throw new Error("Deribit disabled in config");
+    }
+    const deribitOrderBook = (await deribit.getOrderBook(instrument) as any)?.result;
+    if (deribitOrderBook) {
+      addDeribitQuote(deribitOrderBook);
+      return quotes;
+    }
+    throw new Error("Deribit unavailable");
+  }
+
+  if (venueConfig.mode === "dual_venue") {
+    if (!bybitAllowed && !deribitAllowed) {
+      throw new Error("Both venues disabled in config");
+    }
+    const deribitPromise = deribitAllowed ? deribit.getOrderBook(instrument) : Promise.resolve(null);
+    const bybitPromise = bybitAllowed
+      ? getBybitOrderbook(asset, strike, expiryDate!, optionSymbol!)
+      : Promise.resolve(null);
+
+    const hybridStart = Date.now();
+    if (bybitAllowed && deribitAllowed) {
+      const raceResult = await Promise.race([
+        bybitPromise
+          .then((data) => ({ venue: "bybit" as const, data }))
+          .catch((error) => ({ venue: "bybit" as const, error })),
+        deribitPromise
+          .then((data) => ({ venue: "deribit" as const, data }))
+          .catch((error) => ({ venue: "deribit" as const, error }))
+      ]);
+      const raceTime = Date.now() - hybridStart;
+      console.log(`[Hybrid] ${raceResult.venue} responded first in ${raceTime}ms`);
+
+      if (raceResult.venue === "bybit" && raceResult.data) {
+        console.log("[Hybrid] Fast path: returning Bybit price immediately");
+        const bybit = raceResult.data as any;
+        addBybitQuote(bybit, instrument);
+
+        Promise.resolve()
+          .then(async () => {
+            try {
+              const deribitOrderBook = (await deribitPromise as any)?.result;
+              if (!deribitOrderBook) return;
+              const { bid, ask } = bestBidAsk(deribitOrderBook);
+              if (!ask) return;
+              const deribitAskUsd = new Decimal(ask).mul(spotPrice).toNumber();
+              const savings = deribitAskUsd - bybit.ask;
+              await audit("hybrid_comparison", {
+                bybitPrice: bybit.ask,
+                deribitPrice: deribitAskUsd,
+                savings: savings.toFixed(2),
+                bybitTimeMs: raceTime,
+                deribitTimeMs: Date.now() - hybridStart,
+                fastPathUsed: true,
+                instrument
+              });
+              if (savings < -5) {
+                console.warn(
+                  `[Hybrid] ALERT: Deribit was $${Math.abs(savings).toFixed(2)} cheaper`
+                );
+              }
+            } catch (error: any) {
+              console.log(`[Hybrid] Background Deribit query failed: ${error?.message ?? "unknown"}`);
+            }
+          })
+          .catch(() => undefined);
+
+        return quotes;
+      }
+    }
+
+    const [deribitResult, bybitResult] = await Promise.allSettled([
+      deribitPromise,
+      bybitPromise
+    ]);
+
+    const deribitOrderBook =
+      deribitResult.status === "fulfilled" ? (deribitResult.value as any)?.result : null;
+    if (deribitOrderBook) {
+      addDeribitQuote(deribitOrderBook);
+    }
+
+    if (bybitResult.status === "fulfilled" && bybitResult.value) {
+      addBybitQuote(bybitResult.value, instrument);
+    }
+
+    return quotes;
+  }
+
+  throw new Error(`Unknown venue mode: ${venueConfig.mode}`);
 }
 
 function aggregateOptionQuotes(
@@ -1658,6 +2082,7 @@ app.post("/deribit/order", async (req) => {
     reason?: string;
     accountId?: string;
     intent?: "open" | "close" | "hedge";
+    quoteId?: string;
     drawdownLimitUsdc?: string;
     initialBalanceUsdc?: string;
     assets?: string[];
@@ -1666,6 +2091,28 @@ app.post("/deribit/order", async (req) => {
     hedgeMtmUsdc?: string;
     floorPrice?: number;
   };
+  if (body.intent !== "close" && body.quoteId && body.feeUsdc !== undefined) {
+    const lock = quoteLocks.get(body.quoteId);
+    if (!lock) {
+      return { status: "rejected", reason: "quote_unknown" };
+    }
+    if (Date.now() > lock.expiresAt) {
+      return { status: "rejected", reason: "quote_expired" };
+    }
+    const requestedFee = new Decimal(body.feeUsdc);
+    if (requestedFee.isFinite() && requestedFee.gt(0)) {
+      const tolerance = resolveDriftTolerance(lock.tierName);
+      const maxFee = lock.feeUsdc.mul(new Decimal(1).add(tolerance.pct)).add(tolerance.usdc);
+      if (requestedFee.gt(maxFee)) {
+        return {
+          status: "rejected",
+          reason: "quote_drift",
+          maxFeeUsdc: maxFee.toFixed(2),
+          quoteFeeUsdc: lock.feeUsdc.toFixed(2)
+        };
+      }
+    }
+  }
   if (body.intent === "close") {
     if (!body.drawdownLimitUsdc || !body.initialBalanceUsdc) {
       await audit("close_blocked", {
@@ -1711,15 +2158,20 @@ app.post("/deribit/order", async (req) => {
       };
     }
   }
-  const venue = body.venue || "deribit";
+  const venue = body.venue || (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
   const inferredHedgeType =
     body.hedgeType || (body.instrument.includes("PERPETUAL") ? "perp" : "option");
+  const instrument =
+    venue === "bybit" && typeof body.instrument === "string" && !body.instrument.endsWith("-USDT")
+      ? `${body.instrument}-USDT`
+      : body.instrument;
   const response = await executionRegistry.placeOrder(venue, {
-    instrument: body.instrument,
+    instrument,
     amount: body.amount,
     side: body.side,
     type: body.type,
-    price: body.price
+    price: body.price,
+    spotPrice: body.spotPrice
   });
   const status = String((response as any)?.status || "");
   const filledAmount = Number((response as any)?.filledAmount ?? body.amount);
@@ -1729,14 +2181,23 @@ app.post("/deribit/order", async (req) => {
     (response as any)?.fillPrice ??
     null;
   const spotPrice = body.spotPrice ?? null;
+  const isBybitExec = venue === "bybit";
   const executedPremiumUsdc =
-    inferredHedgeType === "option" && fillPrice && spotPrice
-      ? Number(new Decimal(fillPrice).mul(new Decimal(spotPrice)).mul(filledAmount))
+    inferredHedgeType === "option" && fillPrice
+      ? isBybitExec
+        ? Number(new Decimal(fillPrice).mul(filledAmount))
+        : spotPrice
+          ? Number(new Decimal(fillPrice).mul(new Decimal(spotPrice)).mul(filledAmount))
+          : null
       : null;
   const fillPriceUsdc =
     inferredHedgeType === "option"
-      ? fillPrice && spotPrice
-        ? new Decimal(fillPrice).mul(new Decimal(spotPrice))
+      ? fillPrice
+        ? isBybitExec
+          ? new Decimal(fillPrice)
+          : spotPrice
+            ? new Decimal(fillPrice).mul(new Decimal(spotPrice))
+            : null
         : null
       : fillPrice
         ? new Decimal(fillPrice)
@@ -1765,6 +2226,7 @@ app.post("/deribit/order", async (req) => {
     amount: filledAmount,
     type: body.type ?? "market",
     coverageId: body.coverageId || null,
+    quoteId: body.quoteId ?? null,
     notionalUsdc: body.notionalUsdc ?? null,
     hedgeType: inferredHedgeType,
     status: status || "submitted",
@@ -1832,7 +2294,8 @@ app.get("/pricing/iv/:asset", async (req) => {
   if (ladder) {
     return { asset, iv: Number(ladder.baseIv.toFixed(6)), ivHedge: Number(ladder.hedgeIv.toFixed(6)) };
   }
-  const iv = await ivCache.getAtmIv(asset);
+  const iv =
+    venueConfig.mode === "bybit_only" ? await bybitIvCache.getAtmIv(asset) : await ivCache.getAtmIv(asset);
   return { asset, iv: Number(iv.toFixed(6)) };
 });
 
@@ -2065,8 +2528,33 @@ app.post("/put/preview", async (req) => {
 
 app.post("/put/quote", async (req) => {
   const body = req.body as PutQuoteRequest;
+  const requestStart = Date.now();
+  const requestTimestamp = new Date().toISOString();
+  if (body.fixedPriceUsdc === undefined || body.fixedPriceUsdc === null) {
+    body.fixedPriceUsdc = 0;
+  }
+  const quoteTtlMs = QUOTE_CACHE_TTL_MS;
   const cacheKey = buildQuoteCacheKey(body);
   const cached = getQuoteCache(cacheKey);
+  const attachQuoteLock = (response: Record<string, unknown>, issuedAtMs?: number) => {
+    const issuedAt = issuedAtMs ?? Date.now();
+    const expiresAt = issuedAt + quoteTtlMs;
+    const responseAny = { ...response } as any;
+    const quoteId = responseAny.quoteId ?? randomUUID();
+    responseAny.quoteId = quoteId;
+    responseAny.quoteIssuedAt = new Date(issuedAt).toISOString();
+    responseAny.quoteExpiresAt = new Date(expiresAt).toISOString();
+    const feeRaw = Number(responseAny.feeUsdc ?? 0);
+    if (Number.isFinite(feeRaw) && feeRaw > 0) {
+      quoteLocks.set(quoteId, {
+        feeUsdc: new Decimal(feeRaw),
+        issuedAt,
+        expiresAt,
+        tierName: String(body.tierName || "Unknown")
+      });
+    }
+    return responseAny as Record<string, unknown>;
+  };
   if (cached && isQuoteCacheFresh(cached)) {
     // Temporarily bypass cache for Bronze call testing or explicit cache busting
     if (body._cacheBust || (body.tierName === "Pro (Bronze)" && body.side === "short")) {
@@ -2076,7 +2564,14 @@ app.post("/put/quote", async (req) => {
         cacheBust: body._cacheBust ?? null
       });
     } else {
-      return cached.response;
+      recordCacheHit(Date.now() - requestStart);
+      return attachQuoteLock({
+        ...cached.response,
+        cached: true,
+        responseTimeMs: Date.now() - requestStart,
+        cachedAt: new Date(cached.ts).toISOString(),
+        timestamp: requestTimestamp
+      }, cached.ts);
     }
   }
   await audit("debug_quote_request", {
@@ -2086,9 +2581,105 @@ app.post("/put/quote", async (req) => {
     cached: cached ? "yes" : "no",
     cacheBust: body._cacheBust ?? null
   });
-  const cacheAndReturn = (response: Record<string, unknown>) => {
-    setQuoteCache(cacheKey, response);
+  const attachVenueMetadata = (response: Record<string, unknown>) => {
+    if ((response as any).optionVenue || (response as any).venueComparison) return response;
+    const snapshot = (response as any).selectionSnapshot as { books?: Array<any> } | null;
+    if (!snapshot?.books || !Array.isArray(snapshot.books)) return response;
+    const prices: Record<string, string> = {};
+    let bestVenue: string | null = null;
+    let bestAsk: Decimal | null = null;
+    for (const book of snapshot.books) {
+      const askRaw = book?.askUsd ?? null;
+      if (askRaw === null || askRaw === undefined) continue;
+      const askValue = new Decimal(askRaw);
+      if (!askValue.isFinite() || askValue.lte(0)) continue;
+      prices[book.venue] = askValue.toFixed(6);
+      if (!bestAsk || askValue.lt(bestAsk)) {
+        bestAsk = askValue;
+        bestVenue = book.venue;
+      }
+    }
+    if (!bestVenue || !bestAsk) return response;
+    let savingsPerUnit = new Decimal(0);
+    const alternatives = Object.entries(prices)
+      .filter(([venue]) => venue !== bestVenue)
+      .map(([, price]) => new Decimal(price));
+    if (alternatives.length) {
+      const bestAlt = alternatives.reduce((acc, val) => (val.lt(acc) ? val : acc));
+      if (bestAlt.gt(bestAsk)) savingsPerUnit = bestAlt.minus(bestAsk);
+    }
+    const hedgeSizeRaw = (response as any).hedgeSize ?? "1";
+    const hedgeSize = new Decimal(hedgeSizeRaw || 1);
+    const savingsTotal = savingsPerUnit.mul(hedgeSize);
+    (response as any).optionVenue = bestVenue;
+    (response as any).venueComparison = {
+      selected: bestVenue,
+      prices,
+      savingsPerUnitUsdc: savingsPerUnit.toFixed(2),
+      savingsUsdc: savingsTotal.toFixed(2),
+      queryTimeMs: null
+    };
     return response;
+  };
+
+  const cacheAndReturn = async (response: Record<string, unknown>) => {
+    const withVenue = attachVenueMetadata(response);
+    const responseAny = withVenue as any;
+    let strikeDetails = responseAny.strikeDetails ?? null;
+    const strikeValue = Number(responseAny.strike ?? null);
+    const targetStrikeValue = Number(responseAny.targetStrike ?? null);
+    if (!strikeDetails && Number.isFinite(strikeValue) && Number.isFinite(targetStrikeValue)) {
+      const delta = strikeValue - targetStrikeValue;
+      const pct = targetStrikeValue ? (delta / targetStrikeValue) * 100 : 0;
+      strikeDetails = {
+        targetStrike: Number(targetStrikeValue.toFixed(4)),
+        selectedStrike: Number(strikeValue.toFixed(4)),
+        delta: Number(delta.toFixed(4)),
+        pct: Number(pct.toFixed(4))
+      };
+    }
+    const venueSelection = responseAny.venueSelection ?? {
+      selected: responseAny.optionVenue ?? responseAny.venueComparison?.selected ?? null,
+      prices: responseAny.venueComparison?.prices ?? null,
+      savingsUsdc: responseAny.venueComparison?.savingsUsdc ?? null,
+      savingsPerUnitUsdc: responseAny.venueComparison?.savingsPerUnitUsdc ?? null
+    };
+    const expirySelection = responseAny.expirySelection ?? {
+      expiryTag: responseAny.expiryTag ?? null,
+      targetDays: responseAny.targetDays ?? null
+    };
+    const withTiming = {
+      ...withVenue,
+      strikeDetails,
+      venueSelection,
+      expirySelection,
+      cached: false,
+      responseTimeMs: Date.now() - requestStart,
+      optimizationMode: responseAny.optimizationMode ?? null,
+      timestamp: requestTimestamp
+    };
+    const withLock = attachQuoteLock(withTiming);
+    const venueComparison = (withVenue as any).venueComparison;
+    if (venueComparison) {
+      const prices = venueComparison.prices || {};
+      await audit("venue_selection", {
+        selectedVenue: venueComparison.selected,
+        deribitAvailable: prices.deribit !== undefined,
+        bybitAvailable: prices.bybit !== undefined,
+        deribitPrice: prices.deribit ?? null,
+        bybitPrice: prices.bybit ?? null,
+        savingsUsdc: venueComparison.savingsUsdc ?? "0.00",
+        savingsPerUnitUsdc: venueComparison.savingsPerUnitUsdc ?? "0.00",
+        strike: (withVenue as any).strike ?? null,
+        expiryTag: (withVenue as any).expiryTag ?? null,
+        optionType: (withVenue as any).optionType ?? null,
+        tierName: body.tierName ?? null,
+        queryTimeMs: venueComparison.queryTimeMs ?? null
+      });
+    }
+    setQuoteCache(cacheKey, withLock);
+    recordCacheMiss(Date.now() - requestStart);
+    return withLock;
   };
 
   const asset = (body.asset || "BTC").toUpperCase();
@@ -2119,6 +2710,10 @@ app.post("/put/quote", async (req) => {
   const baseMaxSpreadPct = useBodySpread
     ? body.maxSpreadPct
     : (riskControls.max_spread_pct ?? 0.05);
+  const effectiveMaxSpreadPct =
+    venueConfig.mode === "bybit_only" && !useBodySpread
+      ? Math.max(baseMaxSpreadPct, 0.08)
+      : baseMaxSpreadPct;
   const baseMaxSlippagePct = useBodySlippage
     ? body.maxSlippagePct
     : (riskControls.max_slippage_pct ?? 0.01);
@@ -2214,17 +2809,19 @@ app.post("/put/quote", async (req) => {
   );
   const expirySearchOrder = body.expiryTag
     ? [{ expiryTag: body.expiryTag, targetDays: expiryTargetDays ?? targetDays }]
-    : await buildExpirySearchOrder(
-        results,
-        optionType,
-        spotPrice,
-        drawdownFloorPct,
-        requiredSize,
-        new Decimal(baseMaxSpreadPct ?? 0.05),
-        targetDays,
-        maxPreferredDays,
-        maxFallbackDays
-      );
+    : venueConfig.mode === "bybit_only"
+      ? buildBybitExpirySearchOrder(targetDays, 3)
+      : await buildExpirySearchOrder(
+          results,
+          optionType,
+          spotPrice,
+          drawdownFloorPct,
+          requiredSize,
+          new Decimal(effectiveMaxSpreadPct ?? 0.05),
+          targetDays,
+          maxPreferredDays,
+          maxFallbackDays
+        );
   let chosenExecutionPlans:
     | Array<{ venue: string; instrument: string; side: "buy" | "sell"; size: Decimal; price: Decimal }>
     | null = null;
@@ -2270,18 +2867,27 @@ app.post("/put/quote", async (req) => {
         Array<{ venue: string; instrument: string; side: "buy" | "sell"; size: Decimal; price: Decimal }>
       >();
       const snapshotsByStrike = new Map<string, QuoteBookSnapshot[]>();
-      const strikeCandidates = selectStrikeCandidates(
-        results,
-        expiryTag,
-        optionType,
-        spotPrice,
-        drawdownFloorPct,
-        40
-      );
+      const strikeCandidates =
+        venueConfig.mode === "bybit_only"
+          ? await selectBybitStrikeCandidates(
+              asset,
+              expiryTag,
+              optionType,
+              targetStrike,
+              40
+            )
+          : selectStrikeCandidates(
+              results,
+              expiryTag,
+              optionType,
+              spotPrice,
+              drawdownFloorPct,
+              40
+            );
       const { maxSpreadPct, maxSlippagePct } = resolveLiquidityThresholds(
         days,
         overridePass,
-        baseMaxSpreadPct ?? 0.05,
+        effectiveMaxSpreadPct ?? 0.05,
         baseMaxSlippagePct ?? 0.01,
         useBodySpread,
         useBodySlippage
@@ -2353,6 +2959,19 @@ app.post("/put/quote", async (req) => {
 
     if (bestCandidate) {
       liquidityOverrideUsed = overridePass;
+      const targetStrikeNumber = targetStrike.toNumber();
+      const selectedStrikeNumber = bestCandidate.strike.toNumber();
+      const strikeDelta = selectedStrikeNumber - targetStrikeNumber;
+      const strikePct = targetStrikeNumber
+        ? (strikeDelta / targetStrikeNumber) * 100
+        : 0;
+      console.log(
+        `[StrikeDetails] target=${targetStrikeNumber.toFixed(2)} selected=${selectedStrikeNumber.toFixed(
+          2
+        )} delta=${strikeDelta.toFixed(2)} pct=${strikePct.toFixed(2)} expiry=${
+          bestCandidate.expiryTag
+        } days=${bestCandidate.targetDays}`
+      );
       break;
     }
   }
@@ -2421,6 +3040,8 @@ app.post("/put/quote", async (req) => {
     }
     const premiumTotal = bestCandidate.premiumTotal;
     const allInPremium = bestCandidate.allInPremium;
+    const markupPct = resolvePremiumMarkupPct(tierName, leverage);
+    const passThroughFee = allInPremium.mul(new Decimal(1).add(markupPct));
     const premiumFloor = premiumFloorBreached(allInPremium, baseFeeUsdc);
     const isPremiumTier =
       tierName === "Pro (Silver)" ||
@@ -2439,6 +3060,9 @@ app.post("/put/quote", async (req) => {
     const userOptedIn = body.allowPremiumPassThrough !== false;
     const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
     const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
+    const passThroughCapped = passThroughCapInfo.maxFee
+      ? passThroughFee.gt(passThroughCapInfo.maxFee)
+      : false;
     await audit("pass_through_gate", {
       passThroughEnabled,
       requiresUserOptIn,
@@ -2478,7 +3102,7 @@ app.post("/put/quote", async (req) => {
       );
       const shouldNotify = premiumFloor.ratio.gte(minNotificationRatio);
       const optionSymbol = optionType === "put" ? "P" : "C";
-      const optionInstrument = buildInstrumentName(
+      const optionInstrument = buildVenueInstrumentName(
         asset,
         bestCandidate.expiryTag,
         bestCandidate.strike.toFixed(0),
@@ -2487,17 +3111,24 @@ app.post("/put/quote", async (req) => {
       const ratio = premiumFloor.ratio.toFixed(4);
       const threshold = premiumFloor.threshold.toFixed(4);
 
-      if (canPassThrough && !passThroughCapInfo.capped) {
+      if (canPassThrough && !passThroughCapped) {
+        const venueInfo = attachVenueMetadata({
+          selectionSnapshot: fallbackSnapshot,
+          hedgeSize: requiredSize.toFixed(4)
+        } as Record<string, unknown>);
         await audit("premium_pass_through", {
           type: "uncapped",
           baseFee: baseFeeUsdc.toFixed(2),
           allInPremium: allInPremium.toFixed(2),
+          markupPct: markupPct.mul(100).toFixed(2),
           ratio,
           threshold,
           tierName,
           leverage,
           optionType,
-          instrument: optionInstrument
+          instrument: optionInstrument,
+          optionVenue: (venueInfo as any).optionVenue ?? null,
+          venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
         });
         return cacheAndReturn({
           status: "pass_through",
@@ -2517,7 +3148,7 @@ app.post("/put/quote", async (req) => {
           markIv: feeIv.raw,
           subsidyUsdc: "0.00",
           baseFeeUsdc: baseFeeUsdc.toFixed(2),
-          feeUsdc: allInPremium.toFixed(2),
+          feeUsdc: passThroughFee.toFixed(2),
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
@@ -2564,7 +3195,7 @@ app.post("/put/quote", async (req) => {
         });
       }
 
-      if (canPassThrough && passThroughCapInfo.capped && passThroughCapInfo.maxFee) {
+      if (canPassThrough && passThroughCapped && passThroughCapInfo.maxFee) {
         const cappedFee = passThroughCapInfo.maxFee;
         const subsidyNeededCapped = allInPremium.minus(cappedFee);
         if (!isPremiumTier) {
@@ -2787,6 +3418,10 @@ app.post("/put/quote", async (req) => {
           });
         }
 
+        const venueInfo = attachVenueMetadata({
+          selectionSnapshot: fallbackSnapshot,
+          hedgeSize: requiredSize.toFixed(4)
+        } as Record<string, unknown>);
         await audit("premium_pass_through", {
           type: "capped",
           baseFee: baseFeeUsdc.toFixed(2),
@@ -2799,7 +3434,9 @@ app.post("/put/quote", async (req) => {
           tierName,
           leverage,
           optionType,
-          instrument: optionInstrument
+          instrument: optionInstrument,
+          optionVenue: (venueInfo as any).optionVenue ?? null,
+          venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
         });
         return cacheAndReturn({
           status: "pass_through_capped",
@@ -2873,7 +3510,7 @@ app.post("/put/quote", async (req) => {
         });
       }
 
-      const rejectReason = passThroughCapInfo.capped
+      const rejectReason = passThroughCapped
         ? "premium_floor_pass_through_capped"
         : "premium_floor_no_pass_through";
       await audit("premium_floor_rejected", {
@@ -2883,7 +3520,7 @@ app.post("/put/quote", async (req) => {
         threshold,
         reason: rejectReason,
         canPassThrough,
-        capped: passThroughCapInfo.capped,
+        capped: passThroughCapped,
         capMultiplier: passThroughCapInfo.capMultiplier
           ? passThroughCapInfo.capMultiplier.toFixed(4)
           : null,
@@ -2912,7 +3549,7 @@ app.post("/put/quote", async (req) => {
       });
       const currentDays = bestCandidate.targetDays;
       const currentFloorPct = drawdownFloorPct.toNumber();
-      const baseSuggestions = passThroughCapInfo.capped
+      const baseSuggestions = passThroughCapped
         ? [
             `Reduce leverage from ${leverage}× to ${Math.max(1, Math.floor(leverage / 2))}×`,
             `Reduce protection duration from ${currentDays} days to ${Math.max(
@@ -2951,7 +3588,7 @@ app.post("/put/quote", async (req) => {
         passThroughCapMultiplier: passThroughCapInfo.capMultiplier
           ? passThroughCapInfo.capMultiplier.toFixed(4)
           : null,
-        passThroughCapped: passThroughCapInfo.capped,
+        passThroughCapped: passThroughCapped,
         reason: rejectReason,
         liquidityOverride: liquidityOverrideUsed,
         replication: fallbackReplication,
@@ -2968,7 +3605,7 @@ app.post("/put/quote", async (req) => {
           capMultiplier: passThroughCapInfo.capMultiplier
             ? passThroughCapInfo.capMultiplier.toFixed(2)
             : "N/A",
-          explanation: passThroughCapInfo.capped
+          explanation: passThroughCapped
             ? `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds maximum ` +
               `${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
               `Try: lower leverage, shorter duration, wider floor, or smaller size.`
@@ -2979,7 +3616,7 @@ app.post("/put/quote", async (req) => {
           type: "premium_floor",
           ratio,
           threshold,
-          message: passThroughCapInfo.capped
+          message: passThroughCapped
             ? `Premium too high for ${tierName} tier at ${leverage}× leverage. ` +
               `Reduce leverage, duration, or widen the floor.`
             : `Premium ${premiumFloor.ratio.toFixed(2)}× base fee cannot be accommodated.`
@@ -2990,7 +3627,7 @@ app.post("/put/quote", async (req) => {
 
     if (subsidyNeeded.gt(0) && subsidyCheck.allowed && canFullyCover) {
       const optionSymbol = optionType === "put" ? "P" : "C";
-      const optionInstrument = buildInstrumentName(
+      const optionInstrument = buildVenueInstrumentName(
         asset,
         bestCandidate.expiryTag,
         bestCandidate.strike.toFixed(0),
@@ -3017,7 +3654,7 @@ app.post("/put/quote", async (req) => {
         passThroughCapMultiplier: passThroughCapInfo.capMultiplier
           ? passThroughCapInfo.capMultiplier.toFixed(4)
           : null,
-        passThroughCapped: passThroughCapInfo.capped,
+        passThroughCapped: passThroughCapped,
         reason: "subsidized",
         capBreached: false,
         liquidityOverride: liquidityOverrideUsed,
@@ -3031,7 +3668,7 @@ app.post("/put/quote", async (req) => {
 
     if (subsidyNeeded.gt(0) && canFullyCover && canCoverageOverride(tierName)) {
       const optionSymbol = optionType === "put" ? "P" : "C";
-      const optionInstrument = buildInstrumentName(
+      const optionInstrument = buildVenueInstrumentName(
         asset,
         bestCandidate.expiryTag,
         bestCandidate.strike.toFixed(0),
@@ -3058,7 +3695,7 @@ app.post("/put/quote", async (req) => {
         passThroughCapMultiplier: passThroughCapInfo.capMultiplier
           ? passThroughCapInfo.capMultiplier.toFixed(4)
           : null,
-        passThroughCapped: passThroughCapInfo.capped,
+        passThroughCapped: passThroughCapped,
         reason: "coverage_override",
         capBreached: true,
         subsidyCapReason: subsidyCheck.reason,
@@ -3075,7 +3712,7 @@ app.post("/put/quote", async (req) => {
       const passThroughCapInfoLate = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
       if (!passThroughCapInfoLate.capped) {
         const optionSymbol = optionType === "put" ? "P" : "C";
-        const optionInstrument = buildInstrumentName(
+        const optionInstrument = buildVenueInstrumentName(
           asset,
           bestCandidate.expiryTag,
           bestCandidate.strike.toFixed(0),
@@ -3127,7 +3764,7 @@ app.post("/put/quote", async (req) => {
           threshold: premiumFloor.threshold.toFixed(4),
           reason: "partial_not_allowed",
           canPassThrough,
-          capped: passThroughCapInfo.capped,
+          capped: passThroughCapped,
           capMultiplier: passThroughCapInfo.capMultiplier
             ? passThroughCapInfo.capMultiplier.toFixed(4)
             : null,
@@ -3156,7 +3793,7 @@ app.post("/put/quote", async (req) => {
           passThroughCapMultiplier: passThroughCapInfo.capMultiplier
             ? passThroughCapInfo.capMultiplier.toFixed(4)
             : null,
-          passThroughCapped: passThroughCapInfo.capped,
+          passThroughCapped: passThroughCapped,
           reason: "partial_not_allowed",
           liquidityOverride: liquidityOverrideUsed,
           replication: fallbackReplication,
@@ -3181,7 +3818,7 @@ app.post("/put/quote", async (req) => {
       const coverageRatio = partialSize.div(requiredSize);
       const discountedFee = applyPartialDiscount(feeUsdc, coverageRatio);
       const optionSymbol = optionType === "put" ? "P" : "C";
-      const optionInstrument = buildInstrumentName(
+      const optionInstrument = buildVenueInstrumentName(
         asset,
         bestCandidate.expiryTag,
         bestCandidate.strike.toFixed(0),
@@ -3208,7 +3845,7 @@ app.post("/put/quote", async (req) => {
         passThroughCapMultiplier: passThroughCapInfo.capMultiplier
           ? passThroughCapInfo.capMultiplier.toFixed(4)
           : null,
-        passThroughCapped: passThroughCapInfo.capped,
+        passThroughCapped: passThroughCapped,
         reason: "partial",
         liquidityOverride: liquidityOverrideUsed,
         replication: fallbackReplication,
@@ -3274,6 +3911,8 @@ app.post("/put/quote", async (req) => {
     feeReason = "ctc_safety";
   }
   const allInPremium = quote.allInPremium;
+  const markupPct = resolvePremiumMarkupPct(tierName, leverage);
+  const passThroughFee = allInPremium.mul(new Decimal(1).add(markupPct));
   const premiumFloor = premiumFloorBreached(allInPremium, baseFeeUsdc);
   const isPremiumTier =
     tierName === "Pro (Silver)" ||
@@ -3285,6 +3924,9 @@ app.post("/put/quote", async (req) => {
   const userOptedIn = body.allowPremiumPassThrough !== false;
   const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
   const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
+  const passThroughCapped = passThroughCapInfo.maxFee
+    ? passThroughFee.gt(passThroughCapInfo.maxFee)
+    : false;
   await audit("pass_through_gate", {
     passThroughEnabled,
     requiresUserOptIn,
@@ -3295,10 +3937,10 @@ app.post("/put/quote", async (req) => {
     premiumRatio: premiumFloor.ratio.toFixed(4)
   });
   const canFullyCoverQuote = quote.availableSize.greaterThanOrEqualTo(requiredSize);
-  if (premiumFloor.breached && canPassThrough && passThroughCapInfo.capped && passThroughCapInfo.maxFee) {
+  if (premiumFloor.breached && canPassThrough && passThroughCapped && passThroughCapInfo.maxFee) {
     const cappedFee = passThroughCapInfo.maxFee;
     const optionSymbol = optionType === "put" ? "P" : "C";
-    const optionInstrument = buildInstrumentName(
+    const optionInstrument = buildVenueInstrumentName(
       asset,
       quote.expiryTag || "",
       quote.strike.toFixed(0),
@@ -3306,6 +3948,17 @@ app.post("/put/quote", async (req) => {
     );
     const subsidyNeededFull = allInPremium.minus(cappedFee);
     if (isPremiumTier) {
+      const venueInfo = attachVenueMetadata({
+        selectionSnapshot: bestSnapshots
+          ? {
+              expiryTag: quote.expiryTag,
+              targetDays: quote.targetDays,
+              strike: quote.strike.toFixed(0),
+              books: bestSnapshots
+            }
+          : null,
+        hedgeSize: requiredSize.toFixed(4)
+      } as Record<string, unknown>);
       await audit("premium_pass_through", {
         type: "capped_with_subsidy",
         baseFee: feeBase.feeUsdc.toFixed(2),
@@ -3321,7 +3974,9 @@ app.post("/put/quote", async (req) => {
         optionType,
         instrument: optionInstrument,
         hedgeSize: requiredSize.toFixed(4),
-        fullProtection: true
+        fullProtection: true,
+        optionVenue: (venueInfo as any).optionVenue ?? null,
+        venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
       });
       return cacheAndReturn({
         status: "pass_through_capped",
@@ -3768,7 +4423,7 @@ app.post("/put/quote", async (req) => {
   hedgeFactor = Math.max(1, hedgeFactor);
 
   const optionSymbol = optionType === "put" ? "P" : "C";
-  const optionInstrument = buildInstrumentName(
+  const optionInstrument = buildVenueInstrumentName(
     asset,
     quote.expiryTag || "",
     quote.strike.toFixed(0),
@@ -3829,16 +4484,17 @@ app.post("/put/quote", async (req) => {
   response["rollEstimatedPremiumUsdc"] = allInPremium.toFixed(2);
   response["baseFeeUsdc"] = feeBase.feeUsdc.toFixed(2);
   response["feeUsdc"] = feeUsdc.toFixed(2);
+  response["premiumMarkupPct"] = markupPct.mul(100).toFixed(2);
+  response["premiumMarkupUsdc"] = passThroughFee.minus(allInPremium).toFixed(2);
   response["feeRegime"] = feeRegime.regime;
   response["feeRegimeMultiplier"] = feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null;
   response["feeLeverageMultiplier"] = feeLeverage.multiplier
     ? feeLeverage.multiplier.toFixed(4)
     : null;
-  const quotePassThroughCap = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
-  response["passThroughCapMultiplier"] = quotePassThroughCap.capMultiplier
-    ? quotePassThroughCap.capMultiplier.toFixed(4)
+  response["passThroughCapMultiplier"] = passThroughCapInfo.capMultiplier
+    ? passThroughCapInfo.capMultiplier.toFixed(4)
     : null;
-  response["passThroughCapped"] = quotePassThroughCap.capped;
+  response["passThroughCapped"] = passThroughCapped;
   response["subsidyUsdc"] = "0.00";
   response["reason"] = feeReason;
   const minNotificationRatio = new Decimal(
@@ -3846,15 +4502,17 @@ app.post("/put/quote", async (req) => {
   );
   const shouldNotify = premiumFloor.ratio.gte(minNotificationRatio);
   if (premiumFloor.breached) {
-    if (canPassThrough && !quotePassThroughCap.capped) {
+    if (canPassThrough && !passThroughCapped) {
       response["status"] = "pass_through";
-      response["feeUsdc"] = allInPremium.toFixed(2);
+      response["feeUsdc"] = passThroughFee.toFixed(2);
       response["reason"] = "premium_floor_pass_through";
       response["pricing"] = {
         type: "pass_through",
         baseFee: feeBase.feeUsdc.toFixed(2),
         hedgePremium: allInPremium.toFixed(2),
-        totalFee: allInPremium.toFixed(2),
+        totalFee: passThroughFee.toFixed(2),
+        markupPct: markupPct.mul(100).toFixed(2),
+        markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
         ratio: premiumFloor.ratio.toFixed(4),
         threshold: premiumFloor.threshold.toFixed(4)
       };
@@ -3865,18 +4523,19 @@ app.post("/put/quote", async (req) => {
             threshold: premiumFloor.threshold.toFixed(4)
           }
         : undefined;
-    } else if (canPassThrough && quotePassThroughCap.capped && quotePassThroughCap.maxFee) {
+    } else if (canPassThrough && passThroughCapped && passThroughCapInfo.maxFee) {
       response["status"] = "pass_through_capped";
-      response["feeUsdc"] = quotePassThroughCap.maxFee.toFixed(2);
+      response["feeUsdc"] = passThroughCapInfo.maxFee.toFixed(2);
       response["reason"] = "premium_floor_pass_through_capped";
       response["pricing"] = {
         type: "pass_through_capped",
         baseFee: feeBase.feeUsdc.toFixed(2),
         hedgePremium: allInPremium.toFixed(2),
-        cappedFee: quotePassThroughCap.maxFee.toFixed(2),
-        capMultiplier: quotePassThroughCap.capMultiplier
-          ? quotePassThroughCap.capMultiplier.toFixed(2)
+        cappedFee: passThroughCapInfo.maxFee.toFixed(2),
+        capMultiplier: passThroughCapInfo.capMultiplier
+          ? passThroughCapInfo.capMultiplier.toFixed(2)
           : null,
+        markupPct: markupPct.mul(100).toFixed(2),
         ratio: premiumFloor.ratio.toFixed(4),
         threshold: premiumFloor.threshold.toFixed(4)
       };
@@ -3889,7 +4548,7 @@ app.post("/put/quote", async (req) => {
         : undefined;
     } else {
       response["status"] = "premium_floor";
-      response["reason"] = quotePassThroughCap.capped
+      response["reason"] = passThroughCapped
         ? "premium_floor_pass_through_capped"
         : "premium_floor";
       response["warning"] = {
@@ -3907,9 +4566,49 @@ function buildInstrumentName(currency: string, expiryTag: string, strike: string
   return `${currency}-${expiryTag}-${strike}-${type}`;
 }
 
+function buildVenueInstrumentName(
+  currency: string,
+  expiryTag: string,
+  strike: string,
+  type: "P" | "C"
+): string {
+  if (venueConfig.mode === "bybit_only") {
+    const expiryDate = parseExpiryTagToDate(expiryTag);
+    if (expiryDate) {
+      return formatBybitInstrument(currency, expiryDate, Number(strike), type);
+    }
+  }
+  return buildInstrumentName(currency, expiryTag, strike, type);
+}
+
 function deriveExpiryTag(instrumentName: string): string {
   const parts = instrumentName.split("-");
   return parts.length >= 2 ? parts[1] : "";
+}
+
+function parseExpiryTagToDate(expiryTag: string): Date | null {
+  const match = expiryTag.match(/^(\d{1,2})([A-Z]{3})(\d{2})$/);
+  if (!match) return null;
+  const day = Number(match[1]);
+  const monthToken = match[2];
+  const year = 2000 + Number(match[3]);
+  const months: Record<string, number> = {
+    JAN: 0,
+    FEB: 1,
+    MAR: 2,
+    APR: 3,
+    MAY: 4,
+    JUN: 5,
+    JUL: 6,
+    AUG: 7,
+    SEP: 8,
+    OCT: 9,
+    NOV: 10,
+    DEC: 11
+  };
+  const month = months[monthToken];
+  if (month === undefined || !Number.isFinite(day) || day <= 0) return null;
+  return new Date(Date.UTC(year, month, day, 8, 0, 0, 0));
 }
 
 function targetDaysForExpiryTag(
@@ -4234,6 +4933,8 @@ app.post("/put/auto-renew", async (req) => {
     renewReason = "ctc_safety";
   }
   const renewPremiumFloor = premiumFloorBreached(effectiveAllInPremium, effectiveFeeUsdc);
+  const renewMarkupPct = resolvePremiumMarkupPct(tierName, renewLeverage);
+  const renewPassThroughFee = effectiveAllInPremium.mul(new Decimal(1).add(renewMarkupPct));
   const renewPassThroughEnabled = riskControls.enable_premium_pass_through !== false;
   const renewRequiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
   const renewUserOptedIn = body.allowPremiumPassThrough !== false;
@@ -4252,6 +4953,9 @@ app.post("/put/auto-renew", async (req) => {
     renewLeverage,
     tierName
   );
+  const renewPassThroughCapped = renewPassThroughCap.maxFee
+    ? renewPassThroughFee.gt(renewPassThroughCap.maxFee)
+    : false;
   await audit("pass_through_gate", {
     passThroughEnabled: renewPassThroughEnabled,
     requiresUserOptIn: renewRequiresUserOptIn,
@@ -4265,10 +4969,10 @@ app.post("/put/auto-renew", async (req) => {
     ? effectiveAvailableSize.greaterThanOrEqualTo(requiredSize)
     : false;
   if (renewPremiumFloor.breached && renewReason !== "pass_through") {
-    if (renewCanPassThrough && !renewPassThroughCap.capped) {
+    if (renewCanPassThrough && !renewPassThroughCapped) {
       renewReason = "pass_through";
-      effectiveFeeUsdc = effectiveAllInPremium;
-    } else if (renewCanPassThrough && renewPassThroughCap.capped && renewPassThroughCap.maxFee) {
+      effectiveFeeUsdc = renewPassThroughFee;
+    } else if (renewCanPassThrough && renewPassThroughCapped && renewPassThroughCap.maxFee) {
       renewReason = "pass_through_capped";
       effectiveFeeUsdc = renewPassThroughCap.maxFee;
       subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
@@ -4281,7 +4985,7 @@ app.post("/put/auto-renew", async (req) => {
     } else {
       return {
         status: "premium_floor",
-        reason: renewPassThroughCap.capped
+        reason: renewPassThroughCapped
           ? "premium_floor_pass_through_capped"
           : "premium_floor",
         liquidityOverride: liquidityOverrideUsed,
@@ -4295,7 +4999,7 @@ app.post("/put/auto-renew", async (req) => {
         passThroughCapMultiplier: renewPassThroughCap.capMultiplier
           ? renewPassThroughCap.capMultiplier.toFixed(4)
           : null,
-        passThroughCapped: renewPassThroughCap.capped,
+        passThroughCapped: renewPassThroughCapped,
         warning: {
           type: "premium_floor",
           ratio: renewPremiumFloor.ratio.toFixed(4),
@@ -4335,9 +5039,11 @@ app.post("/put/auto-renew", async (req) => {
           renewLeverage,
           tierName
         );
-        if (!lateCap.capped) {
+        const latePassThroughFee = effectiveAllInPremium.mul(new Decimal(1).add(renewMarkupPct));
+        const lateCapped = lateCap.maxFee ? latePassThroughFee.gt(lateCap.maxFee) : false;
+        if (!lateCapped) {
           renewReason = "pass_through";
-          effectiveFeeUsdc = effectiveAllInPremium;
+          effectiveFeeUsdc = latePassThroughFee;
         } else if (lateCap.maxFee) {
           renewReason = "pass_through_capped";
           effectiveFeeUsdc = lateCap.maxFee;
@@ -4391,7 +5097,7 @@ app.post("/put/auto-renew", async (req) => {
   }
 
   const optionSymbol = optionType === "put" ? "P" : "C";
-  const optionInstrument = buildInstrumentName(
+  const optionInstrument = buildVenueInstrumentName(
     asset,
     effectiveExpiryTag,
     (effectiveStrike ?? new Decimal(0)).toFixed(0),
@@ -4413,11 +5119,17 @@ app.post("/put/auto-renew", async (req) => {
   if (finalSurvivalCheck) {
     renewalSurvivalCheck = finalSurvivalCheck;
   }
-  const buyOption = await executionRegistry.placeOrder("deribit", {
-    instrument: optionInstrument,
+  const renewVenue = venueConfig.mode === "bybit_only" ? "bybit" : "deribit";
+  const renewInstrument =
+    renewVenue === "bybit" && !optionInstrument.endsWith("-USDT")
+      ? `${optionInstrument}-USDT`
+      : optionInstrument;
+  const buyOption = await executionRegistry.placeOrder(renewVenue, {
+    instrument: renewInstrument,
     amount: cappedAmount.toNumber(),
     side: "buy",
-    type: "market"
+    type: "market",
+    spotPrice: body.spotPrice
   });
 
   const renewStatus = String((buyOption as any)?.status || "");
@@ -4441,7 +5153,7 @@ app.post("/put/auto-renew", async (req) => {
 
   const response = {
     status: renewReason,
-    venue: "deribit",
+    venue: renewVenue,
     replication: renewalReplication,
     survivalCheck: renewalSurvivalCheck,
     selectionSnapshot: renewalSnapshot,
@@ -4649,11 +5361,19 @@ app.post("/loop/tick", async (req) => {
       positionSide: inferredPositionSide,
       recommendedSide: decision.recommendedSide
     });
-    await executionRegistry.placeOrder("deribit", {
-      instrument: body.hedgeInstrument,
+    const hedgeVenue = venueConfig.mode === "bybit_only" ? "bybit" : "deribit";
+    const hedgeInstrument =
+      hedgeVenue === "bybit" &&
+      typeof body.hedgeInstrument === "string" &&
+      !body.hedgeInstrument.endsWith("-USDT")
+        ? `${body.hedgeInstrument}-USDT`
+        : body.hedgeInstrument;
+    await executionRegistry.placeOrder(hedgeVenue, {
+      instrument: hedgeInstrument,
       amount: body.hedgeSize,
       side: decision.recommendedSide,
-      type: "market"
+      type: "market",
+      spotPrice: body.spotPrice
     });
     await audit("hedge_order", {
       instrument: body.hedgeInstrument,

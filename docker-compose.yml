@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  atticus:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - HOST=0.0.0.0
+      - DERIBIT_ENV=testnet
+      - DERIBIT_PAPER=true
+      - DERIBIT_CLIENT_ID=${DERIBIT_CLIENT_ID}
+      - DERIBIT_CLIENT_SECRET=${DERIBIT_CLIENT_SECRET}
+      - RISK_CONTROLS_PATH=/app/configs/risk_controls.json
+      - AUDIT_LOG_PATH=/app/logs/audit.log
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=atticus
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=atticus
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atticus"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

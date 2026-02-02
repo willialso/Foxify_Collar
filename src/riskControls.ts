@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import Decimal from "decimal.js";
 
 export interface RiskControlsConfig {
   risk_budget_pct_min: number;
@@ -53,14 +54,9 @@ export interface RiskControlsConfig {
   fee_leverage_multipliers_by_x?: Record<string, number>;
   pass_through_cap_by_leverage?: Record<string, number>;
   pass_through_cap_by_tier?: Record<string, Record<string, number>>;
-  max_leverage_by_tier?: Record<string, { put: number; call: number }>;
   enable_premium_pass_through?: boolean;
   require_user_opt_in_for_pass_through?: boolean;
   pass_through_min_notification_ratio?: number;
-  premium_markup_pct_by_tier?: Record<string, number>;
-  leverage_markup_pct_by_x?: Record<string, number>;
-  drift_tolerance_pct_by_tier?: Record<string, number>;
-  drift_tolerance_usdc_by_tier?: Record<string, number>;
   coverage_override_tiers?: string[];
   duration_fee_per_day_pct?: number;
   duration_fee_max_pct?: number;
@@ -77,25 +73,26 @@ export interface RiskControlsConfig {
 
 export interface RiskState {
   dateKey: string;
-  revenueUsdc: number;
-  overageUsdc: number;
-  notionalUsdc: number;
+  revenueUsdc: Decimal;
+  overageUsdc: Decimal;
+  notionalUsdc: Decimal;
 }
 
 export interface LiquidityState {
-  liquidityBalanceUsdc: number;
-  hedgeSpendUsdc: number;
-  hedgeMarginUsdc: number;
-  revenueUsdc: number;
-  profitUsdc: number;
-  reinvestUsdc: number;
-  reserveUsdc: number;
+  liquidityBalanceUsdc: Decimal;
+  hedgeSpendUsdc: Decimal;
+  hedgeMarginUsdc: Decimal;
+  revenueUsdc: Decimal;
+  profitUsdc: Decimal;
+  reinvestUsdc: Decimal;
+  reserveUsdc: Decimal;
 }
+
 export interface SubsidyState {
   dateKey: string;
-  totalUsdc: number;
-  byTier: Record<string, number>;
-  byAccount: Record<string, number>;
+  totalUsdc: Decimal;
+  byTier: Record<string, Decimal>;
+  byAccount: Record<string, Decimal>;
 }
 
 const DEFAULTS: RiskControlsConfig = {
@@ -147,10 +144,6 @@ const DEFAULTS: RiskControlsConfig = {
   enable_premium_pass_through: true,
   require_user_opt_in_for_pass_through: false,
   pass_through_min_notification_ratio: 1.5,
-  premium_markup_pct_by_tier: {},
-  leverage_markup_pct_by_x: {},
-  drift_tolerance_pct_by_tier: {},
-  drift_tolerance_usdc_by_tier: {},
   coverage_override_tiers: ["Pro (Gold)", "Pro (Platinum)"],
   duration_fee_per_day_pct: 0.04,
   duration_fee_max_pct: 0.6,
@@ -179,18 +172,20 @@ let cachedConfig: RiskControlsConfig | null = null;
 let cachedConfigMtime = 0;
 let stateByTier: Record<string, RiskState> = {};
 let liquidityState: LiquidityState = {
-  liquidityBalanceUsdc: DEFAULTS.initial_liquidity_usdc || 0,
-  hedgeSpendUsdc: 0,
-  hedgeMarginUsdc: 0,
-  revenueUsdc: 0,
-  profitUsdc: 0,
-  reinvestUsdc: 0,
-  reserveUsdc: 0
+  liquidityBalanceUsdc: new Decimal(DEFAULTS.initial_liquidity_usdc ?? 0),
+  hedgeSpendUsdc: new Decimal(0),
+  hedgeMarginUsdc: new Decimal(0),
+  revenueUsdc: new Decimal(0),
+  profitUsdc: new Decimal(0),
+  reinvestUsdc: new Decimal(0),
+  reserveUsdc: new Decimal(0)
 };
-let subsidyDailyTotal = 0;
-let subsidyByTier: Record<string, number> = {};
-let subsidyByAccount: Record<string, number> = {};
+let subsidyDailyTotal = new Decimal(0);
+let subsidyByTier: Record<string, Decimal> = {};
+let subsidyByAccount: Record<string, Decimal> = {};
 let subsidyDateKey = dayKey();
+
+const toDecimal = (value: Decimal.Value | null | undefined) => new Decimal(value ?? 0);
 
 function dayKey(): string {
   const now = new Date();
@@ -204,7 +199,7 @@ export async function loadRiskControls(path: URL): Promise<RiskControlsConfig> {
   cachedConfig = { ...DEFAULTS, ...JSON.parse(raw) };
   cachedConfigMtime = stat.mtimeMs;
   if (cachedConfig.initial_liquidity_usdc !== undefined) {
-    liquidityState.liquidityBalanceUsdc = cachedConfig.initial_liquidity_usdc;
+    liquidityState.liquidityBalanceUsdc = toDecimal(cachedConfig.initial_liquidity_usdc);
   }
   return cachedConfig;
 }
@@ -222,46 +217,60 @@ function ensureSubsidyDay(): void {
 export function canApplySubsidy(
   tier: string,
   accountId: string | null,
-  amountUsdc: number,
+  amountUsdc: Decimal,
   iv?: number
 ): { allowed: boolean; reason: string } {
   ensureSubsidyDay();
   const config = cachedConfig ?? DEFAULTS;
-  const baseDailyCap = config.subsidy_daily_cap_usdc ?? DEFAULTS.subsidy_daily_cap_usdc ?? 0;
-  const tierCap =
+  const baseDailyCap = toDecimal(
+    config.subsidy_daily_cap_usdc ?? DEFAULTS.subsidy_daily_cap_usdc ?? 0
+  );
+  const tierCap = toDecimal(
     config.subsidy_tier_daily_cap_usdc?.[tier] ??
-    DEFAULTS.subsidy_tier_daily_cap_usdc?.[tier] ??
-    baseDailyCap;
-  const accountCap = config.subsidy_account_daily_cap_usdc ?? DEFAULTS.subsidy_account_daily_cap_usdc ?? 0;
+      DEFAULTS.subsidy_tier_daily_cap_usdc?.[tier] ??
+      baseDailyCap
+  );
+  const accountCap = toDecimal(
+    config.subsidy_account_daily_cap_usdc ?? DEFAULTS.subsidy_account_daily_cap_usdc ?? 0
+  );
   const ivThreshold = config.volatility_throttle_iv ?? DEFAULTS.volatility_throttle_iv ?? 0.8;
   const multiplier = config.subsidy_volatility_multiplier ?? DEFAULTS.subsidy_volatility_multiplier ?? 1;
   const highVol = iv !== undefined && iv > ivThreshold;
-  const effectiveDailyCap = baseDailyCap * (highVol ? multiplier : 1);
-  const effectiveTierCap = tierCap * (highVol ? multiplier : 1);
-  const effectiveAccountCap = accountCap * (highVol ? multiplier : 1);
+  const multiplierDecimal = highVol ? toDecimal(multiplier) : new Decimal(1);
+  const effectiveDailyCap = baseDailyCap.mul(multiplierDecimal);
+  const effectiveTierCap = tierCap.mul(multiplierDecimal);
+  const effectiveAccountCap = accountCap.mul(multiplierDecimal);
 
-  const tierUsed = subsidyByTier[tier] ?? 0;
+  const tierUsed = toDecimal(subsidyByTier[tier] ?? new Decimal(0));
   const accountKey = accountId || "unknown";
-  const accountUsed = subsidyByAccount[accountKey] ?? 0;
+  const accountUsed = toDecimal(subsidyByAccount[accountKey] ?? new Decimal(0));
+  const amount = toDecimal(amountUsdc);
+  const dailyTotal = toDecimal(subsidyDailyTotal);
 
-  if (subsidyDailyTotal + amountUsdc > effectiveDailyCap) {
+  if (dailyTotal.add(amount).gt(effectiveDailyCap)) {
     return { allowed: false, reason: "daily_cap" };
   }
-  if (tierUsed + amountUsdc > effectiveTierCap) {
+  if (tierUsed.add(amount).gt(effectiveTierCap)) {
     return { allowed: false, reason: "tier_cap" };
   }
-  if (effectiveAccountCap > 0 && accountUsed + amountUsdc > effectiveAccountCap) {
+  if (effectiveAccountCap.gt(0) && accountUsed.add(amount).gt(effectiveAccountCap)) {
     return { allowed: false, reason: "account_cap" };
   }
   return { allowed: true, reason: "ok" };
 }
 
-export function recordSubsidy(tier: string, accountId: string | null, amountUsdc: number): void {
+export function recordSubsidy(
+  tier: string,
+  accountId: string | null,
+  amountUsdc: Decimal
+): void {
   ensureSubsidyDay();
-  subsidyDailyTotal += amountUsdc;
-  subsidyByTier[tier] = (subsidyByTier[tier] ?? 0) + amountUsdc;
+  subsidyDailyTotal = subsidyDailyTotal.add(amountUsdc);
+  subsidyByTier[tier] = toDecimal(subsidyByTier[tier] ?? new Decimal(0)).add(amountUsdc);
   const accountKey = accountId || "unknown";
-  subsidyByAccount[accountKey] = (subsidyByAccount[accountKey] ?? 0) + amountUsdc;
+  subsidyByAccount[accountKey] = toDecimal(subsidyByAccount[accountKey] ?? new Decimal(0)).add(
+    amountUsdc
+  );
 }
 
 export function subsidySummary(): SubsidyState {
@@ -277,72 +286,94 @@ export function subsidySummary(): SubsidyState {
 export function getRiskState(tier: string): RiskState {
   const key = dayKey();
   if (!stateByTier[tier] || stateByTier[tier].dateKey !== key) {
-    stateByTier[tier] = { dateKey: key, revenueUsdc: 0, overageUsdc: 0, notionalUsdc: 0 };
+    stateByTier[tier] = {
+      dateKey: key,
+      revenueUsdc: new Decimal(0),
+      overageUsdc: new Decimal(0),
+      notionalUsdc: new Decimal(0)
+    };
   }
   return stateByTier[tier];
 }
 
 export function applyRiskAccounting(
   tier: string,
-  feeUsdc: number,
-  premiumUsdc: number,
-  notionalUsdc: number,
-  hedgeMarginUsdc = 0
+  feeUsdc: Decimal,
+  premiumUsdc: Decimal,
+  notionalUsdc: Decimal,
+  hedgeMarginUsdc: Decimal = new Decimal(0)
 ): { state: RiskState; liquidityDelta: LiquidityState } {
   const state = getRiskState(tier);
   const before = { ...liquidityState };
-  state.revenueUsdc += feeUsdc;
-  state.overageUsdc += Math.max(0, premiumUsdc - feeUsdc);
-  state.notionalUsdc += notionalUsdc;
-  const profit = feeUsdc - premiumUsdc;
-  liquidityState.revenueUsdc += feeUsdc;
-  liquidityState.hedgeSpendUsdc += premiumUsdc;
-  liquidityState.hedgeMarginUsdc += hedgeMarginUsdc;
-  liquidityState.profitUsdc += profit;
+  const fee = toDecimal(feeUsdc);
+  const premium = toDecimal(premiumUsdc);
+  const hedgeMargin = toDecimal(hedgeMarginUsdc);
+
+  state.revenueUsdc = state.revenueUsdc.add(fee);
+  state.overageUsdc = state.overageUsdc.add(Decimal.max(new Decimal(0), premium.sub(fee)));
+  state.notionalUsdc = state.notionalUsdc.add(notionalUsdc);
+
+  const profit = fee.sub(premium);
+  liquidityState.revenueUsdc = liquidityState.revenueUsdc.add(fee);
+  liquidityState.hedgeSpendUsdc = liquidityState.hedgeSpendUsdc.add(premium);
+  liquidityState.hedgeMarginUsdc = liquidityState.hedgeMarginUsdc.add(hedgeMargin);
+  liquidityState.profitUsdc = liquidityState.profitUsdc.add(profit);
+
   const reinvestPct = cachedConfig?.reinvest_pct ?? DEFAULTS.reinvest_pct ?? 0;
   const reservePct = cachedConfig?.reserve_pct ?? DEFAULTS.reserve_pct ?? 0;
-  const reinvest = profit > 0 ? profit * reinvestPct : 0;
-  const reserve = profit > 0 ? profit * reservePct : 0;
-  liquidityState.reinvestUsdc += reinvest;
-  liquidityState.reserveUsdc += reserve;
-  liquidityState.liquidityBalanceUsdc += feeUsdc - premiumUsdc - hedgeMarginUsdc;
+  const reinvest = profit.gt(0) ? profit.mul(reinvestPct) : new Decimal(0);
+  const reserve = profit.gt(0) ? profit.mul(reservePct) : new Decimal(0);
+
+  liquidityState.reinvestUsdc = liquidityState.reinvestUsdc.add(reinvest);
+  liquidityState.reserveUsdc = liquidityState.reserveUsdc.add(reserve);
+  liquidityState.liquidityBalanceUsdc = liquidityState.liquidityBalanceUsdc
+    .add(fee)
+    .sub(premium)
+    .sub(hedgeMargin);
+
   const liquidityDelta = {
-    liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc - before.liquidityBalanceUsdc,
-    hedgeSpendUsdc: liquidityState.hedgeSpendUsdc - before.hedgeSpendUsdc,
-    hedgeMarginUsdc: liquidityState.hedgeMarginUsdc - before.hedgeMarginUsdc,
-    revenueUsdc: liquidityState.revenueUsdc - before.revenueUsdc,
-    profitUsdc: liquidityState.profitUsdc - before.profitUsdc,
-    reinvestUsdc: liquidityState.reinvestUsdc - before.reinvestUsdc,
-    reserveUsdc: liquidityState.reserveUsdc - before.reserveUsdc
+    liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc.minus(before.liquidityBalanceUsdc),
+    hedgeSpendUsdc: liquidityState.hedgeSpendUsdc.minus(before.hedgeSpendUsdc),
+    hedgeMarginUsdc: liquidityState.hedgeMarginUsdc.minus(before.hedgeMarginUsdc),
+    revenueUsdc: liquidityState.revenueUsdc.minus(before.revenueUsdc),
+    profitUsdc: liquidityState.profitUsdc.minus(before.profitUsdc),
+    reinvestUsdc: liquidityState.reinvestUsdc.minus(before.reinvestUsdc),
+    reserveUsdc: liquidityState.reserveUsdc.minus(before.reserveUsdc)
   };
   return { state, liquidityDelta };
 }
 
 export function recordRevenue(
   tier: string,
-  feeUsdc: number
+  feeUsdc: Decimal
 ): { state: RiskState; liquidityDelta: LiquidityState } {
   const state = getRiskState(tier);
   const before = { ...liquidityState };
-  state.revenueUsdc += feeUsdc;
-  liquidityState.revenueUsdc += feeUsdc;
-  liquidityState.profitUsdc += feeUsdc;
+  const fee = toDecimal(feeUsdc);
+
+  state.revenueUsdc = state.revenueUsdc.add(fee);
+  liquidityState.revenueUsdc = liquidityState.revenueUsdc.add(fee);
+  liquidityState.profitUsdc = liquidityState.profitUsdc.add(fee);
+
   const reinvestPct = cachedConfig?.reinvest_pct ?? DEFAULTS.reinvest_pct ?? 0;
   const reservePct = cachedConfig?.reserve_pct ?? DEFAULTS.reserve_pct ?? 0;
-  const reinvest = feeUsdc > 0 ? feeUsdc * reinvestPct : 0;
-  const reserve = feeUsdc > 0 ? feeUsdc * reservePct : 0;
-  liquidityState.reinvestUsdc += reinvest;
-  liquidityState.reserveUsdc += reserve;
-  liquidityState.liquidityBalanceUsdc += feeUsdc;
+  const reinvest = fee.gt(0) ? fee.mul(reinvestPct) : new Decimal(0);
+  const reserve = fee.gt(0) ? fee.mul(reservePct) : new Decimal(0);
+
+  liquidityState.reinvestUsdc = liquidityState.reinvestUsdc.add(reinvest);
+  liquidityState.reserveUsdc = liquidityState.reserveUsdc.add(reserve);
+  liquidityState.liquidityBalanceUsdc = liquidityState.liquidityBalanceUsdc.add(fee);
+
   const liquidityDelta = {
-    liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc - before.liquidityBalanceUsdc,
-    hedgeSpendUsdc: liquidityState.hedgeSpendUsdc - before.hedgeSpendUsdc,
-    hedgeMarginUsdc: liquidityState.hedgeMarginUsdc - before.hedgeMarginUsdc,
-    revenueUsdc: liquidityState.revenueUsdc - before.revenueUsdc,
-    profitUsdc: liquidityState.profitUsdc - before.profitUsdc,
-    reinvestUsdc: liquidityState.reinvestUsdc - before.reinvestUsdc,
-    reserveUsdc: liquidityState.reserveUsdc - before.reserveUsdc
+    liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc.minus(before.liquidityBalanceUsdc),
+    hedgeSpendUsdc: liquidityState.hedgeSpendUsdc.minus(before.hedgeSpendUsdc),
+    hedgeMarginUsdc: liquidityState.hedgeMarginUsdc.minus(before.hedgeMarginUsdc),
+    revenueUsdc: liquidityState.revenueUsdc.minus(before.revenueUsdc),
+    profitUsdc: liquidityState.profitUsdc.minus(before.profitUsdc),
+    reinvestUsdc: liquidityState.reinvestUsdc.minus(before.reinvestUsdc),
+    reserveUsdc: liquidityState.reserveUsdc.minus(before.reserveUsdc)
   };
+
   return { state, liquidityDelta };
 }
 
@@ -356,18 +387,32 @@ export function liquiditySummary(): LiquidityState {
 
 export function resetRiskState(): void {
   stateByTier = {};
-  const baseLiquidity = cachedConfig?.initial_liquidity_usdc ?? DEFAULTS.initial_liquidity_usdc ?? 0;
+  const baseLiquidity = toDecimal(
+    cachedConfig?.initial_liquidity_usdc ?? DEFAULTS.initial_liquidity_usdc ?? 0
+  );
   liquidityState = {
     liquidityBalanceUsdc: baseLiquidity,
-    hedgeSpendUsdc: 0,
-    hedgeMarginUsdc: 0,
-    revenueUsdc: 0,
-    profitUsdc: 0,
-    reinvestUsdc: 0,
-    reserveUsdc: 0
+    hedgeSpendUsdc: new Decimal(0),
+    hedgeMarginUsdc: new Decimal(0),
+    revenueUsdc: new Decimal(0),
+    profitUsdc: new Decimal(0),
+    reinvestUsdc: new Decimal(0),
+    reserveUsdc: new Decimal(0)
   };
-  subsidyDailyTotal = 0;
+  subsidyDailyTotal = new Decimal(0);
   subsidyByTier = {};
   subsidyByAccount = {};
   subsidyDateKey = dayKey();
+}
+
+export function serializeLiquidityState(state: LiquidityState): Record<string, string> {
+  return {
+    liquidityBalanceUsdc: state.liquidityBalanceUsdc.toFixed(2),
+    hedgeSpendUsdc: state.hedgeSpendUsdc.toFixed(2),
+    hedgeMarginUsdc: state.hedgeMarginUsdc.toFixed(2),
+    revenueUsdc: state.revenueUsdc.toFixed(2),
+    profitUsdc: state.profitUsdc.toFixed(2),
+    reinvestUsdc: state.reinvestUsdc.toFixed(2),
+    reserveUsdc: state.reserveUsdc.toFixed(2)
+  };
 }

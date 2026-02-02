@@ -14,6 +14,34 @@
     "Pro (Platinum)": 4
   },
   "premium_floor_ratio": 1.25,
+  "min_fee_usdc_by_tier": {
+    "Pro (Bronze)": 10
+  },
+  "premium_markup_pct_by_tier": {
+    "Pro (Bronze)": 0,
+    "Pro (Silver)": 0.03,
+    "Pro (Gold)": 0.04,
+    "Pro (Platinum)": 0.05
+  },
+  "leverage_markup_pct_by_x": {
+    "1": 0,
+    "2": 0.005,
+    "3": 0.01,
+    "5": 0.015,
+    "10": 0.02
+  },
+  "drift_tolerance_pct_by_tier": {
+    "Pro (Bronze)": 0.01,
+    "Pro (Silver)": 0.01,
+    "Pro (Gold)": 0.01,
+    "Pro (Platinum)": 0.01
+  },
+  "drift_tolerance_usdc_by_tier": {
+    "Pro (Bronze)": 1,
+    "Pro (Silver)": 2,
+    "Pro (Gold)": 2,
+    "Pro (Platinum)": 3
+  },
   "pass_through_cap_by_leverage": {
     "1": 6.0,
     "2": 5.0,

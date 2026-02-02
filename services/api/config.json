@@ -1,0 +1,12 @@
+{
+  "venue": {
+    "mode": "bybit_only",
+    "bybit_enabled": true,
+    "deribit_enabled": true,
+    "dual_venue_enabled": false
+  },
+  "demo_mode": {
+    "enabled": true,
+    "fast_response_priority": true
+  }
+}

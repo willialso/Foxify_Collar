@@ -161,9 +161,12 @@ export function App() {
     feeRegime: string | null;
     markIv: number | null;
     feeUsdc: number | null;
+    quoteId?: string | null;
+    quoteExpiresAt?: string | null;
     status?: string | null;
     reason?: string | null;
   } | null>(null);
+  const [previewQuoteRaw, setPreviewQuoteRaw] = useState<Record<string, unknown> | null>(null);
   const [lockedQuote, setLockedQuote] = useState<{
     key: string;
     feeUsdc: number;
@@ -692,9 +695,12 @@ export function App() {
         feeRegime: data?.feeRegime ?? null,
         markIv: Number.isFinite(markIv) ? markIv : null,
         feeUsdc: Number.isFinite(feeUsdc) ? feeUsdc : null,
+        quoteId: data?.quoteId ?? null,
+        quoteExpiresAt: data?.quoteExpiresAt ?? null,
         status: data?.status ?? null,
         reason: data?.reason ?? null
       });
+      setPreviewQuoteRaw(data && typeof data === "object" ? (data as Record<string, unknown>) : null);
       setPreviewState("ok");
     } catch {
       setPreviewLastError("request_failed");
@@ -714,6 +720,7 @@ export function App() {
     if (!level || selectedIds.length !== 1) {
       setPreviewGate("no_selection");
       setPreviewQuote(null);
+      setPreviewQuoteRaw(null);
       setPreviewLoading(false);
       setPreviewState("idle");
       return;
@@ -722,6 +729,7 @@ export function App() {
     if (!primary) {
       setPreviewGate("no_primary");
       setPreviewQuote(null);
+      setPreviewQuoteRaw(null);
       setPreviewLoading(false);
       setPreviewState("idle");
       return;
@@ -730,6 +738,7 @@ export function App() {
     if (!spot || baseFeeUsd <= 0) {
       setPreviewGate("no_spot_fee");
       setPreviewQuote(null);
+      setPreviewQuoteRaw(null);
       setPreviewLoading(false);
       setPreviewState("idle");
       return;
@@ -737,6 +746,7 @@ export function App() {
     if (level.name === "Pro (Bronze)" && primary.leverage <= 2) {
       setPreviewGate("bronze_fixed");
       setPreviewQuote(null);
+      setPreviewQuoteRaw(null);
       setPreviewLoading(false);
       setPreviewState("idle");
       return;
@@ -777,7 +787,7 @@ export function App() {
         controller.abort();
       }, 6000);
       try {
-        const res = await fetch(`${API_BASE}/pricing/ctc`, {
+        const res = await fetch(`${API_BASE}/put/preview`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: controller.signal,
@@ -787,27 +797,45 @@ export function App() {
             spotPrice: spot,
             drawdownFloorPct: drawdownPct,
             positionSize: primary.sizeUnits,
+            fixedPriceUsdc: baseFeeUsd,
+            contractSize: 1,
             leverage: primary.leverage ?? 1,
-            side: primary.side
+            ivSnapshot: ivSnapshot.value,
+            side: primary.side,
+            coverageId: "preview",
+            targetDays: expiryDays,
+            allowPremiumPassThrough: FOXIFY_APPROVED
           })
         });
         if (!res.ok) throw new Error("preview_quote_failed");
         const data = await res.json();
         if (requestId !== previewRequestIdRef.current) return;
-        let feeUsdc = Number(data?.feeUsdc);
-        let markIv = Number(data?.ivHedge ?? data?.ivBase ?? 0);
-        if (!Number.isFinite(feeUsdc) || data?.status !== "ok") {
-          feeUsdc = baseFeeUsd;
-          markIv = Number.isFinite(markIv) ? markIv : null;
+        if (data?.status === "pending") {
+          setPreviewGate("pending");
+          setPreviewState("loading");
+          setPreviewQuote(null);
+          setPreviewQuoteRaw(null);
+          if (previewRetryTimerRef.current) {
+            clearTimeout(previewRetryTimerRef.current);
+          }
+          previewRetryTimerRef.current = window.setTimeout(() => {
+            setPreviewTick((prev) => prev + 1);
+          }, 800);
+          return;
         }
+        const feeUsdc = Number(data?.feeUsdc);
+        const markIv = Number(data?.markIv ?? 0);
         if (!Number.isFinite(feeUsdc)) throw new Error("preview_quote_invalid");
         setPreviewQuote({
           feeRegime: data?.feeRegime ?? null,
           markIv: Number.isFinite(markIv) ? markIv : null,
           feeUsdc: Number.isFinite(feeUsdc) ? feeUsdc : null,
+          quoteId: data?.quoteId ?? null,
+          quoteExpiresAt: data?.quoteExpiresAt ?? null,
           status: data?.status ?? null,
           reason: data?.reason ?? (data?.status ? String(data.status) : null)
         });
+        setPreviewQuoteRaw(data && typeof data === "object" ? (data as Record<string, unknown>) : null);
         setPreviewState("ok");
       } catch (err) {
         if (requestId !== previewRequestIdRef.current) return;
@@ -908,7 +936,16 @@ export function App() {
         : spot * (1 + drawdownPct)
       : null;
 
-    let quote: any = null;
+    const previewExpiresAt = previewQuote?.quoteExpiresAt
+      ? new Date(previewQuote.quoteExpiresAt).getTime()
+      : null;
+    const previewFresh = previewExpiresAt ? previewExpiresAt > Date.now() : false;
+    const previewStatus = String((previewQuoteRaw as any)?.status ?? "ok");
+    const canUsePreviewQuote =
+      previewFresh &&
+      previewQuoteRaw &&
+      (previewStatus === "ok" || previewStatus === "pass_through" || previewStatus === "pass_through_capped");
+    let quote: any = canUsePreviewQuote ? previewQuoteRaw : null;
     let hedgeType: "option" | "perp" = "option";
     let hedgeInstrument = "";
     let hedgeSize = 0;
@@ -921,8 +958,11 @@ export function App() {
     let orderResponse: any = null;
     try {
       if (spot) {
+        if (canUsePreviewQuote) {
+          quote = previewQuoteRaw;
+        }
         const maxAttempts = 3;
-        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        for (let attempt = 0; attempt < maxAttempts && !canUsePreviewQuote; attempt += 1) {
           const quoteRes = await fetch(`${API_BASE}/put/quote`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1016,6 +1056,7 @@ export function App() {
                 amount,
                 side: plan?.side === "sell" ? "sell" : "buy",
                 type: "market",
+                quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
                 coverageId,
                 notionalUsdc,
                 hedgeType: "option",
@@ -1089,6 +1130,7 @@ export function App() {
                 amount: hedgeSize,
                 side: "buy",
                 type: "market",
+                quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
                 coverageId,
                 notionalUsdc,
                 hedgeType: "perp",
@@ -1134,6 +1176,7 @@ export function App() {
       totalFeeUsd: feeUsd,
       subsidyUsd,
       reason,
+      quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
       selectedIds,
       coverageId,
       portfolio: {
@@ -1147,6 +1190,7 @@ export function App() {
       hedge: {
         hedgeType,
         instrument: hedgeInstrument || null,
+        quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
           premiumUsdc: quote?.premiumUsdc ?? null,
           subsidyUsdc: subsidyUsd || null,
           reason,
