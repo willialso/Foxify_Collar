@@ -216,7 +216,8 @@ export function AuditDashboard({
   const coverageEntries = scopedEntries.filter((entry) => entry.event === "coverage_activated");
   const sumPremium = (list: AuditEntry[]) =>
     list.reduce((sum, entry) => {
-      const premium = extractField(entry, "premiumUsdc");
+      const premium =
+        extractField(entry, "executedPremiumUsdc") ?? extractField(entry, "premiumUsdc");
       return sum + (premium !== null && premium !== undefined ? Number(premium) : 0);
     }, 0);
   const perUserHedgeCost = sumPremium(hedgeOrders.filter((entry) => !isNetExposure(entry)));
@@ -365,7 +366,8 @@ export function AuditDashboard({
               <span>Strike</span>
               <span>Side</span>
               <span>Status</span>
-              <span>Premium</span>
+              <span>Fee In</span>
+              <span>Premium Out</span>
               <span>Hedge Size</span>
               <span>Hedge Type</span>
               <span>Notional</span>
@@ -384,12 +386,18 @@ export function AuditDashboard({
             const strikeValue = extractField(entry, "strike") ?? parsedInstrument?.strike ?? null;
             const side = String(extractField(entry, "side") || "—");
             const status = String(extractField(entry, "status") || "—");
-            const premium = extractField(entry, "premiumUsdc");
+            const premium =
+              extractField(entry, "executedPremiumUsdc") ?? extractField(entry, "premiumUsdc");
+            const feeIn =
+              extractField(entry, "totalFeeUsd") ??
+              extractField(entry, "feeUsd") ??
+              extractField(entry, "feeUsdc");
             const hedgeSize = extractField(entry, "hedgeSize") ?? extractField(entry, "amount");
             const hedgeType = extractField(entry, "hedgeType") || extractField(entry, "optionType");
             const notional = extractField(entry, "notionalUsdc");
             const hedgeSpend =
               extractField(entry, "hedgeMarginUsdc") ??
+              extractField(entry, "executedPremiumUsdc") ??
               extractField(entry, "premiumUsdc") ??
               extractField(entry, "hedgeNotionalUsdc");
             const floorPrice = extractField(entry, "floorPrice");
@@ -427,6 +435,9 @@ export function AuditDashboard({
                 </span>
                 <span>{side || "—"}</span>
                 <span>{status || "—"}</span>
+                <span title={feeIn !== null && feeIn !== undefined ? `$${feeIn}` : "—"}>
+                  {feeIn !== null && feeIn !== undefined ? `$${formatSmall(Number(feeIn))}` : "—"}
+                </span>
                 <span title={premium !== null && premium !== undefined ? `$${premium}` : "—"}>
                   {premium !== null && premium !== undefined ? `$${formatSmall(Number(premium))}` : "—"}
                 </span>

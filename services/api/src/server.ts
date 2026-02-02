@@ -2524,16 +2524,8 @@ app.post("/put/preview", async (req) => {
   if (cached && isQuoteCacheFresh(cached)) {
     return { ...cached.response, cached: true, stale: false };
   }
-  if (cached && isQuoteCacheStale(cached)) {
-    startQuoteCompute(body, cacheKey);
-    return { ...cached.response, cached: true, stale: true };
-  }
-  if (cached && isQuoteCacheUsable(cached)) {
-    startQuoteCompute(body, cacheKey);
-    return { ...cached.response, cached: true, stale: true };
-  }
-  startQuoteCompute(body, cacheKey);
-  return { status: "pending", cached: false, stale: false };
+  const response = await startQuoteCompute(body, cacheKey);
+  return { ...response, cached: Boolean(cached), stale: false };
 });
 
 app.post("/put/quote", async (req) => {
@@ -3006,7 +2998,6 @@ app.post("/put/quote", async (req) => {
       optionType
     });
     let feeUsdc = feeBase.feeUsdc;
-    const baseFeeUsdc = feeUsdc;
     const feeRegime = feeBase.feeRegime;
     const feeLeverage = feeBase.feeLeverage;
     const feeIv = feeBase.feeIv;
@@ -3023,6 +3014,7 @@ app.post("/put/quote", async (req) => {
       feeUsdc = ctcSafety.feeUsdc;
       feeReason = "ctc_safety";
     }
+    const baseFeeUsdc = feeUsdc;
     const premiumTotal = bestCandidate.premiumTotal;
     const allInPremium = bestCandidate.allInPremium;
     const markupPct = resolvePremiumMarkupPct(tierName, leverage);
@@ -3033,6 +3025,25 @@ app.post("/put/quote", async (req) => {
       tierName === "Pro (Gold)" ||
       tierName === "Pro (Platinum)";
     const allowPartialCoverage = tierName === "Pro (Bronze)" && body.allowPartialCoverage === true;
+    const passThroughEnabled = riskControls.enable_premium_pass_through !== false;
+    const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
+    const userOptedIn = body.allowPremiumPassThrough !== false;
+    const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
+    const passThroughCapInfo = applyPassThroughCap(baseFeeUsdc, allInPremium, leverage, tierName);
+    const passThroughCapped = passThroughCapInfo.maxFee
+      ? passThroughFee.gt(passThroughCapInfo.maxFee)
+      : false;
+    if (!premiumFloor.breached) {
+      if (passThroughFee.gt(baseFeeUsdc)) {
+        feeUsdc = passThroughFee;
+        feeReason = "premium_markup";
+      } else {
+        feeUsdc = baseFeeUsdc;
+        if (feeReason !== "ctc_safety") {
+          feeReason = "base_fee";
+        }
+      }
+    }
     let subsidyNeeded = allInPremium.minus(feeUsdc);
     let subsidyCheck = canApplySubsidy(
       tierName,
@@ -3040,14 +3051,6 @@ app.post("/put/quote", async (req) => {
       subsidyNeeded.toNumber(),
       feeIv.scaled
     );
-    const passThroughEnabled = riskControls.enable_premium_pass_through !== false;
-    const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
-    const userOptedIn = body.allowPremiumPassThrough !== false;
-    const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
-    const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
-    const passThroughCapped = passThroughCapInfo.maxFee
-      ? passThroughFee.gt(passThroughCapInfo.maxFee)
-      : false;
     await audit("pass_through_gate", {
       passThroughEnabled,
       requiresUserOptIn,
@@ -3160,12 +3163,14 @@ app.post("/put/quote", async (req) => {
             type: "pass_through",
             baseFee: baseFeeUsdc.toFixed(2),
             hedgePremium: allInPremium.toFixed(2),
-            totalFee: allInPremium.toFixed(2),
+            totalFee: passThroughFee.toFixed(2),
+            markupPct: markupPct.mul(100).toFixed(2),
+            markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
             ratio,
             threshold,
             explanation:
               `Market volatility requires premium ${premiumFloor.ratio.toFixed(2)}× base fee. ` +
-              `Charging actual hedge cost of $${allInPremium.toFixed(2)} for full protection.`
+              `Charging hedge premium plus markup for full protection.`
           },
           warning: shouldNotify
             ? {
@@ -3692,7 +3697,7 @@ app.post("/put/quote", async (req) => {
     }
 
     if (canPassThrough && allInPremium.gt(feeUsdc)) {
-      const passThroughCapInfoLate = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
+      const passThroughCapInfoLate = applyPassThroughCap(baseFeeUsdc, allInPremium, leverage, tierName);
       if (!passThroughCapInfoLate.capped) {
         const optionSymbol = optionType === "put" ? "P" : "C";
         const optionInstrument = buildVenueInstrumentName(
@@ -3715,7 +3720,7 @@ app.post("/put/quote", async (req) => {
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
           subsidyUsdc: "0.00",
-          feeUsdc: allInPremium.toFixed(2),
+          feeUsdc: passThroughFee.toFixed(2),
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
@@ -3723,7 +3728,7 @@ app.post("/put/quote", async (req) => {
             ? passThroughCapInfoLate.capMultiplier.toFixed(4)
             : null,
           passThroughCapped: false,
-        reason: "pass_through",
+          reason: "pass_through",
           liquidityOverride: liquidityOverrideUsed,
           replication: fallbackReplication,
           survivalCheck,
@@ -3877,7 +3882,6 @@ app.post("/put/quote", async (req) => {
 
   const notionalUsdc = positionSize.mul(new Decimal(body.spotPrice)).mul(new Decimal(leverage)).toNumber();
   let feeUsdc = feeBase.feeUsdc;
-  const baseFeeUsdc = feeUsdc;
   const feeRegime = feeBase.feeRegime;
   const feeLeverage = feeBase.feeLeverage;
   const ctcSafety = calculateCtcSafetyFee({
@@ -3893,6 +3897,7 @@ app.post("/put/quote", async (req) => {
     feeUsdc = ctcSafety.feeUsdc;
     feeReason = "ctc_safety";
   }
+  const baseFeeUsdc = feeUsdc;
   const allInPremium = quote.allInPremium;
   const markupPct = resolvePremiumMarkupPct(tierName, leverage);
   const passThroughFee = allInPremium.mul(new Decimal(1).add(markupPct));
@@ -3906,10 +3911,21 @@ app.post("/put/quote", async (req) => {
   const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
   const userOptedIn = body.allowPremiumPassThrough !== false;
   const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
-  const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
+  const passThroughCapInfo = applyPassThroughCap(baseFeeUsdc, allInPremium, leverage, tierName);
   const passThroughCapped = passThroughCapInfo.maxFee
     ? passThroughFee.gt(passThroughCapInfo.maxFee)
     : false;
+  if (!premiumFloor.breached) {
+    if (passThroughFee.gt(baseFeeUsdc)) {
+      feeUsdc = passThroughFee;
+      feeReason = "premium_markup";
+    } else {
+      feeUsdc = baseFeeUsdc;
+      if (feeReason !== "ctc_safety") {
+        feeReason = "base_fee";
+      }
+    }
+  }
   await audit("pass_through_gate", {
     passThroughEnabled,
     requiresUserOptIn,
@@ -4915,7 +4931,8 @@ app.post("/put/auto-renew", async (req) => {
     effectiveFeeUsdc = renewSafety.feeUsdc;
     renewReason = "ctc_safety";
   }
-  const renewPremiumFloor = premiumFloorBreached(effectiveAllInPremium, effectiveFeeUsdc);
+  const renewBaseFeeUsdc = effectiveFeeUsdc;
+  const renewPremiumFloor = premiumFloorBreached(effectiveAllInPremium, renewBaseFeeUsdc);
   const renewMarkupPct = resolvePremiumMarkupPct(tierName, renewLeverage);
   const renewPassThroughFee = effectiveAllInPremium.mul(new Decimal(1).add(renewMarkupPct));
   const renewPassThroughEnabled = riskControls.enable_premium_pass_through !== false;
@@ -4923,6 +4940,17 @@ app.post("/put/auto-renew", async (req) => {
   const renewUserOptedIn = body.allowPremiumPassThrough !== false;
   const renewCanPassThrough =
     renewPassThroughEnabled && (!renewRequiresUserOptIn || renewUserOptedIn);
+  if (!renewPremiumFloor.breached) {
+    if (renewPassThroughFee.gt(renewBaseFeeUsdc)) {
+      effectiveFeeUsdc = renewPassThroughFee;
+      renewReason = "premium_markup";
+    } else {
+      effectiveFeeUsdc = renewBaseFeeUsdc;
+      if (renewReason !== "ctc_safety") {
+        renewReason = "base_fee";
+      }
+    }
+  }
   let subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
   let subsidyCheck = canApplySubsidy(
     tierName,
@@ -4931,7 +4959,7 @@ app.post("/put/auto-renew", async (req) => {
     effectiveIv
   );
   const renewPassThroughCap = applyPassThroughCap(
-    effectiveFeeUsdc,
+    renewBaseFeeUsdc,
     effectiveAllInPremium,
     renewLeverage,
     tierName
@@ -5017,7 +5045,7 @@ app.post("/put/auto-renew", async (req) => {
         subsidyUsdc = subsidyNeeded;
       } else if (renewCanPassThrough && effectiveAllInPremium.gt(effectiveFeeUsdc)) {
         const lateCap = applyPassThroughCap(
-          effectiveFeeUsdc,
+          renewBaseFeeUsdc,
           effectiveAllInPremium,
           renewLeverage,
           tierName

@@ -928,6 +928,9 @@ export function App() {
     let hedgeSize = 0;
     let bufferTargetPct = 0.05;
     let feeUsd = totalFeeUsd;
+    let markupUsd: number | null = null;
+    let premiumOutUsd: number | null = null;
+    let executedPremiumUsd: number | null = null;
     let subsidyUsd = 0;
     let reason = "flat_fee";
     let regimeLabel: string | null = null;
@@ -999,6 +1002,17 @@ export function App() {
           subsidyUsd = quote.subsidyUsdc ? Number(quote.subsidyUsdc) : 0;
           reason = quote.reason || "flat_fee";
           regimeLabel = formatFeeRegime(quote.feeRegime);
+          const markupCandidate = quote?.premiumMarkupUsdc;
+          const markupValue = markupCandidate !== null && markupCandidate !== undefined
+            ? Number(markupCandidate)
+            : null;
+          markupUsd = Number.isFinite(markupValue ?? NaN) ? (markupValue as number) : null;
+          const premiumCandidate =
+            quote?.rollEstimatedPremiumUsdc ?? quote?.premiumUsdc ?? null;
+          const premiumValue = premiumCandidate !== null && premiumCandidate !== undefined
+            ? Number(premiumCandidate)
+            : null;
+          premiumOutUsd = Number.isFinite(premiumValue ?? NaN) ? (premiumValue as number) : null;
 
           hedgeInstrument = quote.instrument;
           hedgeSize = Number(quote.hedgeSize || 0);
@@ -1122,6 +1136,19 @@ export function App() {
             orderResponse = await fallbackRes.json();
           }
         }
+        if (quote && premiumOutUsd === null && markupUsd === null) {
+          const markupCandidate = quote?.premiumMarkupUsdc;
+          const markupValue = markupCandidate !== null && markupCandidate !== undefined
+            ? Number(markupCandidate)
+            : null;
+          markupUsd = Number.isFinite(markupValue ?? NaN) ? (markupValue as number) : null;
+          const premiumCandidate =
+            quote?.rollEstimatedPremiumUsdc ?? quote?.premiumUsdc ?? null;
+          const premiumValue = premiumCandidate !== null && premiumCandidate !== undefined
+            ? Number(premiumCandidate)
+            : null;
+          premiumOutUsd = Number.isFinite(premiumValue ?? NaN) ? (premiumValue as number) : null;
+        }
       }
     } catch {
       orderResponse = null;
@@ -1142,6 +1169,32 @@ export function App() {
     if (orderResponse?.filledAmount && Number.isFinite(Number(orderResponse.filledAmount))) {
       hedgeSize = Number(orderResponse.filledAmount);
     }
+    if (orderResponse) {
+      const fillPriceRaw =
+        (orderResponse as any)?.result?.average_price ??
+        (orderResponse as any)?.result?.price ??
+        (orderResponse as any)?.fillPrice ??
+        (orderResponse as any)?.price ??
+        null;
+      const filledAmountRaw =
+        (orderResponse as any)?.filledAmount ??
+        (orderResponse as any)?.result?.filled_amount ??
+        (orderResponse as any)?.amount ??
+        null;
+      const fillPrice = Number(fillPriceRaw);
+      const filledAmount = Number(filledAmountRaw);
+      if (Number.isFinite(fillPrice) && Number.isFinite(filledAmount) && filledAmount > 0) {
+        const isBybit = hedgeInstrument.endsWith("-USDT");
+        const premium = isBybit
+          ? fillPrice * filledAmount
+          : spot
+            ? fillPrice * filledAmount * spot
+            : null;
+        if (premium !== null && Number.isFinite(premium)) {
+          executedPremiumUsd = premium;
+        }
+      }
+    }
 
     const selectedPortfolioPositions =
       portfolio?.positions.filter((position) => selectedIds.includes(position.id)) ?? [];
@@ -1149,7 +1202,9 @@ export function App() {
       ts: start.toISOString(),
       tier: level.name,
       autoRenew,
-      feeUsd: perAssetFeeUsd,
+      feeUsd,
+      baseFeeUsd,
+      markupUsd,
       totalFeeUsd: feeUsd,
       subsidyUsd,
       reason,
@@ -1168,9 +1223,11 @@ export function App() {
         hedgeType,
         instrument: hedgeInstrument || null,
         quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
-          premiumUsdc: quote?.premiumUsdc ?? null,
-          subsidyUsdc: subsidyUsd || null,
-          reason,
+        premiumUsdc: executedPremiumUsd ?? premiumOutUsd ?? null,
+        quotedPremiumUsdc: premiumOutUsd ?? null,
+        executedPremiumUsdc: executedPremiumUsd ?? null,
+        subsidyUsdc: subsidyUsd || null,
+        reason,
         hedgeSize: hedgeSize || null,
         optionType: quote?.optionType ?? null,
         strike: quote?.strike ?? null,
