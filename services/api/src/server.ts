@@ -2384,21 +2384,18 @@ app.post("/pricing/ctc", async (req) => {
     }
   }
 
-  let feeUsdc = ctcSafety.feeUsdc;
-  let feeReason = "ctc_safety";
-  if (!feeUsdc || feeUsdc.lte(0)) {
-    const fallbackFee = await calculateFeeBase({
-      tierName,
-      baseFeeUsdc: new Decimal(50),
-      targetDays,
-      leverage: leverageCheck.value,
-      asset,
-      ivCandidate: ctcSafety.hedgeIv ?? 0.6,
-      optionType
-    });
-    feeUsdc = fallbackFee.feeUsdc;
-    feeReason = "regime_fallback";
-  }
+  const baseFeeUsdc = applyMinFee(tierName, new Decimal(body.fixedPriceUsdc ?? 0));
+  const markupPct = resolvePremiumMarkupPct(tierName, leverageCheck.value);
+  const size = positionSize;
+  const premiumUsdcDecimal =
+    bestInstrument && Number.isFinite(bestInstrument.markPrice || 0)
+      ? new Decimal(bestInstrument.markPrice || 0).mul(spotPrice).mul(size)
+      : null;
+  const passThroughFee = premiumUsdcDecimal
+    ? premiumUsdcDecimal.mul(new Decimal(1).add(markupPct))
+    : null;
+  const feeUsdc = passThroughFee ? Decimal.max(baseFeeUsdc, passThroughFee) : baseFeeUsdc;
+  const feeReason = passThroughFee && passThroughFee.gt(baseFeeUsdc) ? "premium_markup" : "base_fee";
 
   console.log("CTC Quote Debug:", {
     optionType,
@@ -2410,19 +2407,20 @@ app.post("/pricing/ctc", async (req) => {
     bestInstrument: bestInstrument?.instrument || null
   });
 
-  const size = Number(body.positionSize || 1);
-  const premiumUsdc =
-    bestInstrument && Number.isFinite(bestInstrument.markPrice || 0)
-      ? new Decimal(bestInstrument.markPrice || 0)
-          .mul(spotPrice)
-          .mul(new Decimal(size))
-          .toFixed(2)
+  const premiumUsdc = premiumUsdcDecimal ? premiumUsdcDecimal.toFixed(2) : null;
+  const premiumMarkupUsdc =
+    passThroughFee && premiumUsdcDecimal
+      ? passThroughFee.minus(premiumUsdcDecimal).toFixed(2)
       : null;
+  const hedgeSize = size.toNumber();
   const expiryTag = bestInstrument?.instrument?.split("-")?.[1] || null;
 
   return {
     status: "ok",
     feeUsdc: feeUsdc ? feeUsdc.toFixed(2) : "0.00",
+    baseFeeUsdc: baseFeeUsdc.toFixed(2),
+    premiumMarkupPct: markupPct.mul(100).toFixed(2),
+    premiumMarkupUsdc,
     reason: feeReason,
     ivBase: ctcSafety.baseIv,
     ivHedge: ctcSafety.hedgeIv,
@@ -2434,7 +2432,7 @@ app.post("/pricing/ctc", async (req) => {
     hedge: bestInstrument
       ? {
           instrument: bestInstrument.instrument,
-          size,
+          size: hedgeSize,
           premiumUsdc,
           expiryTag,
           daysToExpiry: bestInstrument.tenorDays,
