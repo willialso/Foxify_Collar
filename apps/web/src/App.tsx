@@ -1831,11 +1831,11 @@ export function App() {
                   ))}
                 </select>
               </div>
-              <div className="row">
+              <div className="row row-align">
                 <span>Funding</span>
                 <strong>${level ? formatUsd(Number(level.funding_usdc)) : "—"}</strong>
               </div>
-              <div className="row">
+              <div className="row row-align">
                 <span>Remaining</span>
                 <strong>${formatUsd(Math.max(0, remainingMargin))}</strong>
               </div>
@@ -1872,19 +1872,20 @@ export function App() {
                     </div>
                     <div className="position-actions">
                       {isProtected && <span className="pill pill-inline">Protected</span>}
-                      <button
-                        className="btn"
-                        onClick={() => {
-                          setPortfolio((prev) => ({
-                            tierName: prev?.tierName || "",
-                            positions: prev?.positions.filter((item) => item.id !== p.id) || []
-                          }));
-                          setSelectedIds((prev) => (prev.includes(p.id) ? [] : prev));
-                        }}
-                        disabled={isProtected}
-                      >
-                        Remove
-                      </button>
+                      {!isProtected && (
+                        <button
+                          className="btn"
+                          onClick={() => {
+                            setPortfolio((prev) => ({
+                              tierName: prev?.tierName || "",
+                              positions: prev?.positions.filter((item) => item.id !== p.id) || []
+                            }));
+                            setSelectedIds((prev) => (prev.includes(p.id) ? [] : prev));
+                          }}
+                        >
+                          Remove
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
