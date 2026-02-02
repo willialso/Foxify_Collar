@@ -943,34 +943,40 @@ export function App() {
           quote = previewQuoteRaw;
         }
         const maxAttempts = 3;
-        for (let attempt = 0; attempt < maxAttempts && !canUsePreviewQuote; attempt += 1) {
-          const quoteRes = await fetch(`${API_BASE}/put/quote`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              tierName: level.name,
-              asset: primaryAsset,
-              spotPrice: spot,
-              drawdownFloorPct: drawdownPct,
-              fixedPriceUsdc: totalFeeUsd,
-              positionSize,
-              contractSize: 1,
-              leverage: primary?.leverage ?? 1,
-              ivSnapshot: ivSnapshot.value,
-              side: netSide,
-              coverageId,
-              targetDays: expiryDays,
-              allowPremiumPassThrough: true
-            })
-          });
-          quote = await quoteRes.json();
+        let cacheBust = false;
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+          if (attempt === 0 && canUsePreviewQuote && !cacheBust) {
+            quote = previewQuoteRaw;
+          } else {
+            const quoteRes = await fetch(`${API_BASE}/put/quote`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                tierName: level.name,
+                asset: primaryAsset,
+                spotPrice: spot,
+                drawdownFloorPct: drawdownPct,
+                fixedPriceUsdc: totalFeeUsd,
+                positionSize,
+                contractSize: 1,
+                leverage: primary?.leverage ?? 1,
+                ivSnapshot: ivSnapshot.value,
+                side: netSide,
+                coverageId,
+                targetDays: expiryDays,
+                allowPremiumPassThrough: true,
+                _cacheBust: cacheBust
+              })
+            });
+            quote = await quoteRes.json();
+          }
 
           if (quote?.status === "pass_through" || quote?.status === "pass_through_capped") {
             const pricing = quote?.pricing;
             const message =
               quote.status === "pass_through"
-                ? `High volatility: Premium is ${pricing?.ratio || "N/A"}× base fee. You'll be charged $${quote.feeUsdc} for full protection.`
-                : `Premium exceeds tier cap. Fee capped at $${quote.feeUsdc}. Platform subsidizing $${quote.subsidyUsdc || "0"} for full protection.`;
+                ? `High volatility: Premium is ${pricing?.ratio || "N/A"}× base premium floor. You'll be charged $${quote.feeUsdc} for full protection.`
+                : `Premium exceeds tier cap. Premium capped at $${quote.feeUsdc}. Platform subsidizing $${quote.subsidyUsdc || "0"} for full protection.`;
             setLastExecution(message);
           }
 
@@ -987,7 +993,7 @@ export function App() {
             const ratio = quote?.warning?.ratio ?? "";
             const explanation =
               quote?.pricing?.explanation ||
-              `Premium exceeds fee floor${ratio ? ` (ratio ${ratio}).` : "."} Pass-through required.`;
+              `Premium exceeds premium floor${ratio ? ` (ratio ${ratio}).` : "."} Pass-through required.`;
             setLastExecution(explanation);
             setIsActivating(false);
             return;
@@ -1095,6 +1101,17 @@ export function App() {
           }
 
           orderResponse = lastResponse;
+          const orderReason = String(orderResponse?.reason || "");
+          const shouldRequote =
+            orderResponse?.status === "rejected" &&
+            (orderReason === "quote_drift" ||
+              orderReason === "quote_expired" ||
+              orderReason === "quote_unknown");
+          if (shouldRequote && attempt < maxAttempts - 1) {
+            cacheBust = true;
+            orderResponse = null;
+            continue;
+          }
           const reasonText = String(orderResponse?.reason || "");
           const retryable =
             orderResponse?.status === "paper_rejected" &&
@@ -1486,7 +1503,7 @@ export function App() {
         <div className="subtitle">
           {showAudit
             ? "Audit data is for internal review only and will not be visible to traders in live mode."
-            : "Guaranteed Drawdown Protection. One-Click. Flat Fee."}
+            : "Guaranteed Drawdown Protection. One-Click. Premium."}
         </div>
 
         {!showAudit && (
@@ -1595,7 +1612,7 @@ export function App() {
                   />
                 </div>
                 <div className="row row-align">
-                  <span>Fee</span>
+                  <span>Premium</span>
                   <div className="row-inline row-inline-fee">
                     {pricingStatusLabel && (
                       <span className="vol-status">{pricingStatusLabel}</span>

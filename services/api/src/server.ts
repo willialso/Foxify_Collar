@@ -178,9 +178,31 @@ type QuoteLock = {
   issuedAt: number;
   expiresAt: number;
   tierName: string;
+  instruments: string[];
 };
 const quoteLocks = new Map<string, QuoteLock>();
 const cacheStats = { hits: 0, misses: 0, avgHitTime: 0, avgMissTime: 0 };
+const hedgeActionCooldownByCoverage = new Map<string, number>();
+const netExposureCooldownByTier = new Map<string, number>();
+
+const extractQuoteInstruments = (response: Record<string, unknown>): string[] => {
+  const instruments = new Set<string>();
+  const responseAny = response as any;
+  const direct = responseAny.instrument ?? responseAny?.hedge?.instrument;
+  if (typeof direct === "string" && direct.length > 0) {
+    instruments.add(direct);
+  }
+  const executionPlan = responseAny.executionPlan;
+  if (Array.isArray(executionPlan)) {
+    for (const plan of executionPlan) {
+      const instrument = plan?.instrument;
+      if (typeof instrument === "string" && instrument.length > 0) {
+        instruments.add(instrument);
+      }
+    }
+  }
+  return Array.from(instruments);
+};
 
 function buildQuoteCacheKey(body: {
   tierName?: string;
@@ -727,6 +749,9 @@ function applyPassThroughCap(
 }
 
 function resolvePremiumMarkupPct(tierName: string, leverage?: number): Decimal {
+  if (tierName === "Pro (Bronze)") {
+    return new Decimal(0);
+  }
   const tierMarkup = riskControls.premium_markup_pct_by_tier?.[tierName] ?? 0;
   const leverageMarkup = findLeverageMultiplier(leverage, riskControls.leverage_markup_pct_by_x);
   const leveragePct = Number.isFinite(leverageMarkup) ? leverageMarkup : 0;
@@ -2118,6 +2143,24 @@ app.post("/deribit/order", async (req) => {
     if (Date.now() > lock.expiresAt) {
       return { status: "rejected", reason: "quote_expired" };
     }
+    const requestedInstrument = String(body.instrument || "");
+    const isPerp =
+      body.hedgeType === "perp" || requestedInstrument.toUpperCase().includes("PERPETUAL");
+    if (!isPerp && lock.instruments.length > 0) {
+      const normalized = requestedInstrument.replace(/-USDT$/, "");
+      const matches =
+        lock.instruments.includes(requestedInstrument) ||
+        lock.instruments.includes(normalized) ||
+        lock.instruments.includes(`${normalized}-USDT`);
+      if (!matches) {
+        return {
+          status: "rejected",
+          reason: "quote_drift",
+          drift: "instrument",
+          expectedInstruments: lock.instruments
+        };
+      }
+    }
     const requestedFee = new Decimal(body.feeUsdc);
     if (requestedFee.isFinite() && requestedFee.gt(0)) {
       const tolerance = resolveDriftTolerance(lock.tierName);
@@ -2554,12 +2597,14 @@ app.post("/put/quote", async (req) => {
     responseAny.quoteIssuedAt = new Date(issuedAt).toISOString();
     responseAny.quoteExpiresAt = new Date(expiresAt).toISOString();
     const feeRaw = Number(responseAny.feeUsdc ?? 0);
+    const instruments = extractQuoteInstruments(responseAny);
     if (Number.isFinite(feeRaw) && feeRaw > 0) {
       quoteLocks.set(quoteId, {
         feeUsdc: new Decimal(feeRaw),
         issuedAt,
         expiresAt,
-        tierName: String(body.tierName || "Unknown")
+        tierName: String(body.tierName || "Unknown"),
+        instruments
       });
     }
     return responseAny as Record<string, unknown>;
@@ -5346,6 +5391,19 @@ app.post("/loop/tick", async (req) => {
     hedgeType: inferredHedgeType
   });
 
+  const hedgeCooldownMs = riskControls.hedge_action_cooldown_ms ?? 60000;
+  const minHedgeNotional = riskControls.min_hedge_notional_usdc ?? 0;
+  const coverageKey = body.coverageId || body.accountId || "unknown";
+  const lastHedgeAt = hedgeActionCooldownByCoverage.get(coverageKey) ?? 0;
+  const withinCooldown =
+    hedgeCooldownMs > 0 && Date.now() - lastHedgeAt < hedgeCooldownMs;
+  const notionalUsdc = Number(body.notionalUsdc ?? 0);
+  const belowNotional =
+    Number.isFinite(notionalUsdc) &&
+    minHedgeNotional > 0 &&
+    notionalUsdc > 0 &&
+    notionalUsdc < minHedgeNotional;
+
   let renewalResult: unknown = { status: "skipped" };
   if (decision.renew) {
     renewalResult = await runAutoRenewJob(
@@ -5368,6 +5426,15 @@ app.post("/loop/tick", async (req) => {
   }
 
   if (decision.hedgeAction === "increase") {
+    if (withinCooldown || belowNotional) {
+      await audit("hedge_action_skipped", {
+        action: "increase",
+        reason: withinCooldown ? "cooldown" : "min_notional",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null,
+        cooldownMs: hedgeCooldownMs
+      });
+    } else {
     await audit("hedge_action", {
       action: "increase",
       reason: decision.reason,
@@ -5403,6 +5470,8 @@ app.post("/loop/tick", async (req) => {
       hedgeType: inferredHedgeType,
       positionSide: inferredPositionSide
     });
+    hedgeActionCooldownByCoverage.set(coverageKey, Date.now());
+    }
   }
 
   if (baseExposures.length > 0) {
@@ -5422,7 +5491,28 @@ app.post("/loop/tick", async (req) => {
     const tierName = body.tierName || "Unknown";
     const state = getRiskState(tierName);
     const liquidity = liquiditySummary();
-    for (const plan of plans) {
+    const netCooldownMs = riskControls.net_exposure_cooldown_ms ?? 60000;
+    const netMinNotional = riskControls.net_exposure_min_notional_usdc ?? 0;
+    const netKey = `${tierName}-net-exposure`;
+    const lastNetAt = netExposureCooldownByTier.get(netKey) ?? 0;
+    const netWithinCooldown =
+      netCooldownMs > 0 && Date.now() - lastNetAt < netCooldownMs;
+    if (netWithinCooldown) {
+      await audit("hedge_action_skipped", {
+        action: "net_exposure",
+        reason: "cooldown",
+        tierName,
+        cooldownMs: netCooldownMs
+      });
+    } else {
+      let netExecuted = false;
+      for (const plan of plans) {
+      if (
+        netMinNotional > 0 &&
+        plan.targetNotional.abs().lt(new Decimal(netMinNotional))
+      ) {
+        continue;
+      }
       const spotOverride = body.spotByAsset?.[plan.asset];
       let spotPrice = Number(spotOverride || 0);
       if (!spotPrice) {
@@ -5713,6 +5803,7 @@ app.post("/loop/tick", async (req) => {
           const status = String(payload?.status || "");
           if (status === "paper_filled" || status === "filled" || status === "ok") {
             optionChosen = candidate;
+            netExecuted = true;
             break;
           }
           const reason = String(payload?.reason || "");
@@ -5764,6 +5855,7 @@ app.post("/loop/tick", async (req) => {
             floorPrice: strikeTarget.toNumber()
           }
         });
+        netExecuted = true;
         continue;
       }
 
@@ -5808,7 +5900,12 @@ app.post("/loop/tick", async (req) => {
         coverageIds,
         venue: routedPlan.venue
       });
+      netExecuted = true;
     }
+    if (netExecuted) {
+      netExposureCooldownByTier.set(netKey, Date.now());
+    }
+  }
   }
 
   if (body.alertWebhookUrl) {

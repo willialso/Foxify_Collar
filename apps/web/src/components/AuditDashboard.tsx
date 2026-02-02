@@ -280,11 +280,11 @@ export function AuditDashboard({
             <div className="audit-metrics-divider" />
 
             <div className="audit-metric">
-              <span className="audit-metric-label">Revenue Collected</span>
+              <span className="audit-metric-label">Premium Collected</span>
               <span className="audit-metric-value audit-metric-value-positive">
                 ${(stats.revenue || 0).toFixed(2)}
               </span>
-              <span className="audit-metric-sub">fees charged</span>
+              <span className="audit-metric-sub">premiums charged</span>
             </div>
 
             <div className="audit-metric">
@@ -366,7 +366,7 @@ export function AuditDashboard({
               <span>Strike</span>
               <span>Side</span>
               <span>Status</span>
-              <span>Fee In</span>
+              <span>Premium In</span>
               <span>Premium Out</span>
               <span>Hedge Size</span>
               <span>Hedge Type</span>
@@ -593,7 +593,7 @@ export function AuditDashboard({
                   <div className="glossary-term">
                     <dt>Premium</dt>
                     <dd>
-                      Fee paid by user to purchase protection. Calculated based on amount, duration,
+                      Premium paid by user to purchase protection. Calculated based on amount, duration,
                       volatility, and market conditions.
                     </dd>
                   </div>
@@ -710,7 +710,7 @@ export function AuditDashboard({
                   <div className="glossary-term">
                     <dt>liquidity_update</dt>
                     <dd>
-                      Liquidity accounting update after fees/hedges. Includes deltas and totals.
+                      Liquidity accounting update after premiums/hedges. Includes deltas and totals.
                     </dd>
                   </div>
                   <div className="glossary-term">
