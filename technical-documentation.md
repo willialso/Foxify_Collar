@@ -8,7 +8,7 @@ Core value proposition: **fixed fee protection** aligned to funded drawdown floo
 Target users: funded traders and internal operators (exec and ops views), with a UI intended for embedding inside a larger Foxify dashboard.
 
 Recent operational changes (demo readiness):
-- Bronze tier supports **put protection only** (call protection disabled).
+- Bronze tier supports **put and call protection** with fixed fee unless premium floor is breached.
 - Quote caching now applies to **all response types** (including `premium_floor` and capped responses).
 - Quote cache TTL extended to **5 minutes** (env-configurable) for demo performance.
 
@@ -326,7 +326,7 @@ Validation:
 - Spread/slippage thresholds from `risk_controls.json`
 Response: quote payload with premium, strike, buffer target, and scoring.
 Behavior notes:
-- Bronze tier rejects **call** protection with `status: "error"` and `error: "option_type_not_supported"`.
+- Bronze tier supports **call and put** protection with fixed fee unless premium floor is breached.
 - Responses are cached for **all status types**; cache key uses **fuzzy buckets** (spot rounded to $500, drawdown rounded to 5%, days rounded to whole days) in `buildQuoteCacheKey`.
 - Cache hit/miss logging includes a live hit-rate (`[Cache] HIT/MISS - Hit rate ...`).
 - Dual-venue pricing uses a **hybrid fast path**: Bybit wins the race when it responds first; Deribit comparison is logged asynchronously via `hybrid_comparison`.
@@ -555,7 +555,7 @@ Current behavior:
 ### 9.1 Logging
 - Audit log: `logs/audit.log` (JSONL)
 - Console logs via `console.log` and `app.log.error` in `server.ts`
-Recent audit events include `bronze_call_not_supported`, `leverage_validation_failed`, and `put_quote`.
+Recent audit events include `leverage_validation_failed`, `premium_pass_through`, and `put_quote`.
 
 ### 9.2 Metrics
 ⚠️ NOT IMPLEMENTED — no metrics backend or exporters.

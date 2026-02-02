@@ -10,6 +10,10 @@ export interface RiskControlsConfig {
   initial_liquidity_usdc?: number;
   reinvest_pct?: number;
   reserve_pct?: number;
+  hedge_action_cooldown_ms?: number;
+  min_hedge_notional_usdc?: number;
+  net_exposure_min_notional_usdc?: number;
+  net_exposure_cooldown_ms?: number;
   max_spread_pct?: number;
   max_slippage_pct?: number;
   max_spread_pct_by_days?: Record<string, number>;
@@ -108,6 +112,10 @@ const DEFAULTS: RiskControlsConfig = {
   initial_liquidity_usdc: 20000,
   reinvest_pct: 0.5,
   reserve_pct: 0.3,
+  hedge_action_cooldown_ms: 60000,
+  min_hedge_notional_usdc: 250,
+  net_exposure_min_notional_usdc: 500,
+  net_exposure_cooldown_ms: 120000,
   max_spread_pct: 0.05,
   max_slippage_pct: 0.01,
   max_spread_pct_by_days: {},

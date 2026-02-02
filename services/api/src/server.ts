@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { appendFile, readdir, rm, writeFile, readFile } from "node:fs/promises";
+import { appendFile, readdir, rm, writeFile, readFile, mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import Decimal from "decimal.js";
 import {
@@ -93,6 +93,8 @@ const LOOP_INTERVAL_MS = Number(process.env.LOOP_INTERVAL_MS || "600000");
 const MTM_INTERVAL_MS = Number(process.env.MTM_INTERVAL_MS || "300000");
 const APP_MODE = process.env.APP_MODE || "demo";
 const AUDIT_SEED = process.env.AUDIT_SEED !== "false";
+const API_PORT = Number(process.env.PORT || process.env.API_PORT || "4100");
+const API_HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_PATH = process.env.ACCOUNTS_CONFIG_PATH || "../../../configs/live_accounts.json";
 const AUDIT_LOG_PATH = new URL("../../../logs/audit.log", import.meta.url);
 const LOGS_DIR = new URL("../../../logs/", import.meta.url);
@@ -101,6 +103,13 @@ const VENUE_CONFIG_PATH = new URL("../config.json", import.meta.url);
 const COVERAGE_FILE_PATH = new URL("../../../logs/coverages.json", import.meta.url);
 const HEDGE_LEDGER_PATH = new URL("../../../logs/hedge-ledger.json", import.meta.url);
 const QUOTE_CACHE_TTL_MS = Number(process.env.QUOTE_CACHE_TTL_MS || "300000");
+async function ensureLogsDir(): Promise<void> {
+  try {
+    await mkdir(LOGS_DIR, { recursive: true });
+  } catch (error) {
+    console.error("Failed to ensure logs directory:", error);
+  }
+}
 const QUOTE_CACHE_STALE_MS = Number(process.env.QUOTE_CACHE_STALE_MS || "20000");
 const QUOTE_CACHE_HARD_MS = Number(process.env.QUOTE_CACHE_HARD_MS || "120000");
 
@@ -171,9 +180,31 @@ type QuoteLock = {
   issuedAt: number;
   expiresAt: number;
   tierName: string;
+  instruments: string[];
 };
 const quoteLocks = new Map<string, QuoteLock>();
 const cacheStats = { hits: 0, misses: 0, avgHitTime: 0, avgMissTime: 0 };
+const hedgeActionCooldownByCoverage = new Map<string, number>();
+const netExposureCooldownByTier = new Map<string, number>();
+
+const extractQuoteInstruments = (response: Record<string, unknown>): string[] => {
+  const instruments = new Set<string>();
+  const responseAny = response as any;
+  const direct = responseAny.instrument ?? responseAny?.hedge?.instrument;
+  if (typeof direct === "string" && direct.length > 0) {
+    instruments.add(direct);
+  }
+  const executionPlan = responseAny.executionPlan;
+  if (Array.isArray(executionPlan)) {
+    for (const plan of executionPlan) {
+      const instrument = plan?.instrument;
+      if (typeof instrument === "string" && instrument.length > 0) {
+        instruments.add(instrument);
+      }
+    }
+  }
+  return Array.from(instruments);
+};
 
 function buildQuoteCacheKey(body: {
   tierName?: string;
@@ -720,6 +751,9 @@ function applyPassThroughCap(
 }
 
 function resolvePremiumMarkupPct(tierName: string, leverage?: number): Decimal {
+  if (tierName === "Pro (Bronze)") {
+    return new Decimal(0);
+  }
   const tierMarkup = riskControls.premium_markup_pct_by_tier?.[tierName] ?? 0;
   const leverageMarkup = findLeverageMultiplier(leverage, riskControls.leverage_markup_pct_by_x);
   const leveragePct = Number.isFinite(leverageMarkup) ? leverageMarkup : 0;
@@ -738,7 +772,10 @@ function applyBronzeFixedFee(
   feeUsdc: Decimal,
   optionType?: "put" | "call"
 ): { fee: Decimal; applied: boolean } {
-  return { fee: feeUsdc, applied: false };
+  if (tierName !== "Pro (Bronze)") {
+    return { fee: feeUsdc, applied: false };
+  }
+  return { fee: feeUsdc, applied: true };
 }
 
 function applyIvFeeUplift(tierName: string, feeUsdc: Decimal, iv?: number): Decimal {
@@ -789,6 +826,15 @@ async function calculateFeeBase(params: {
   feeIv: NormalizedIv;
 }> {
   const feeIv = await resolveFeeIv(params.asset, params.ivCandidate);
+  if (params.tierName === "Pro (Bronze)") {
+    const fixedFee = applyMinFee(params.tierName, params.baseFeeUsdc);
+    return {
+      feeUsdc: fixedFee,
+      feeRegime: { regime: null, multiplier: null },
+      feeLeverage: { multiplier: new Decimal(1) },
+      feeIv
+    };
+  }
   let feeUsdc = applyMinFee(params.tierName, params.baseFeeUsdc);
   feeUsdc = applyDurationFee(feeUsdc, params.targetDays);
   const ctcEnabled = riskControls.ctc_enabled ?? false;
@@ -2099,6 +2145,24 @@ app.post("/deribit/order", async (req) => {
     if (Date.now() > lock.expiresAt) {
       return { status: "rejected", reason: "quote_expired" };
     }
+    const requestedInstrument = String(body.instrument || "");
+    const isPerp =
+      body.hedgeType === "perp" || requestedInstrument.toUpperCase().includes("PERPETUAL");
+    if (!isPerp && lock.instruments.length > 0) {
+      const normalized = requestedInstrument.replace(/-USDT$/, "");
+      const matches =
+        lock.instruments.includes(requestedInstrument) ||
+        lock.instruments.includes(normalized) ||
+        lock.instruments.includes(`${normalized}-USDT`);
+      if (!matches) {
+        return {
+          status: "rejected",
+          reason: "quote_drift",
+          drift: "instrument",
+          expectedInstruments: lock.instruments
+        };
+      }
+    }
     const requestedFee = new Decimal(body.feeUsdc);
     if (requestedFee.isFinite() && requestedFee.gt(0)) {
       const tolerance = resolveDriftTolerance(lock.tierName);
@@ -2372,21 +2436,18 @@ app.post("/pricing/ctc", async (req) => {
     }
   }
 
-  let feeUsdc = ctcSafety.feeUsdc;
-  let feeReason = "ctc_safety";
-  if (!feeUsdc || feeUsdc.lte(0)) {
-    const fallbackFee = await calculateFeeBase({
-      tierName,
-      baseFeeUsdc: new Decimal(50),
-      targetDays,
-      leverage: leverageCheck.value,
-      asset,
-      ivCandidate: ctcSafety.hedgeIv ?? 0.6,
-      optionType
-    });
-    feeUsdc = fallbackFee.feeUsdc;
-    feeReason = "regime_fallback";
-  }
+  const baseFeeUsdc = applyMinFee(tierName, new Decimal(body.fixedPriceUsdc ?? 0));
+  const markupPct = resolvePremiumMarkupPct(tierName, leverageCheck.value);
+  const size = positionSize;
+  const premiumUsdcDecimal =
+    bestInstrument && Number.isFinite(bestInstrument.markPrice || 0)
+      ? new Decimal(bestInstrument.markPrice || 0).mul(spotPrice).mul(size)
+      : null;
+  const passThroughFee = premiumUsdcDecimal
+    ? premiumUsdcDecimal.mul(new Decimal(1).add(markupPct))
+    : null;
+  const feeUsdc = passThroughFee ? Decimal.max(baseFeeUsdc, passThroughFee) : baseFeeUsdc;
+  const feeReason = passThroughFee && passThroughFee.gt(baseFeeUsdc) ? "premium_markup" : "base_fee";
 
   console.log("CTC Quote Debug:", {
     optionType,
@@ -2398,19 +2459,20 @@ app.post("/pricing/ctc", async (req) => {
     bestInstrument: bestInstrument?.instrument || null
   });
 
-  const size = Number(body.positionSize || 1);
-  const premiumUsdc =
-    bestInstrument && Number.isFinite(bestInstrument.markPrice || 0)
-      ? new Decimal(bestInstrument.markPrice || 0)
-          .mul(spotPrice)
-          .mul(new Decimal(size))
-          .toFixed(2)
+  const premiumUsdc = premiumUsdcDecimal ? premiumUsdcDecimal.toFixed(2) : null;
+  const premiumMarkupUsdc =
+    passThroughFee && premiumUsdcDecimal
+      ? passThroughFee.minus(premiumUsdcDecimal).toFixed(2)
       : null;
+  const hedgeSize = size.toNumber();
   const expiryTag = bestInstrument?.instrument?.split("-")?.[1] || null;
 
   return {
     status: "ok",
     feeUsdc: feeUsdc ? feeUsdc.toFixed(2) : "0.00",
+    baseFeeUsdc: baseFeeUsdc.toFixed(2),
+    premiumMarkupPct: markupPct.mul(100).toFixed(2),
+    premiumMarkupUsdc,
     reason: feeReason,
     ivBase: ctcSafety.baseIv,
     ivHedge: ctcSafety.hedgeIv,
@@ -2422,7 +2484,7 @@ app.post("/pricing/ctc", async (req) => {
     hedge: bestInstrument
       ? {
           instrument: bestInstrument.instrument,
-          size,
+          size: hedgeSize,
           premiumUsdc,
           expiryTag,
           daysToExpiry: bestInstrument.tenorDays,
@@ -2489,6 +2551,8 @@ type PutQuoteRequest = {
   accountId?: string;
   allowPremiumPassThrough?: boolean;
   allowPartialCoverage?: boolean;
+  _cacheBust?: boolean;
+  _fastPreview?: boolean;
 };
 
 function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Record<string, unknown>> {
@@ -2509,21 +2573,15 @@ function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Rec
 
 app.post("/put/preview", async (req) => {
   const body = req.body as PutQuoteRequest;
+  body._fastPreview = true;
+  body._cacheBust = true;
   const cacheKey = buildQuoteCacheKey(body);
   const cached = getQuoteCache(cacheKey);
-  if (cached && isQuoteCacheFresh(cached)) {
+  if (!body._cacheBust && cached && isQuoteCacheFresh(cached)) {
     return { ...cached.response, cached: true, stale: false };
   }
-  if (cached && isQuoteCacheStale(cached)) {
-    startQuoteCompute(body, cacheKey);
-    return { ...cached.response, cached: true, stale: true };
-  }
-  if (cached && isQuoteCacheUsable(cached)) {
-    startQuoteCompute(body, cacheKey);
-    return { ...cached.response, cached: true, stale: true };
-  }
-  startQuoteCompute(body, cacheKey);
-  return { status: "pending", cached: false, stale: false };
+  const response = await startQuoteCompute(body, cacheKey);
+  return { ...response, cached: Boolean(cached), stale: false };
 });
 
 app.post("/put/quote", async (req) => {
@@ -2545,19 +2603,21 @@ app.post("/put/quote", async (req) => {
     responseAny.quoteIssuedAt = new Date(issuedAt).toISOString();
     responseAny.quoteExpiresAt = new Date(expiresAt).toISOString();
     const feeRaw = Number(responseAny.feeUsdc ?? 0);
+    const instruments = extractQuoteInstruments(responseAny);
     if (Number.isFinite(feeRaw) && feeRaw > 0) {
       quoteLocks.set(quoteId, {
         feeUsdc: new Decimal(feeRaw),
         issuedAt,
         expiresAt,
-        tierName: String(body.tierName || "Unknown")
+        tierName: String(body.tierName || "Unknown"),
+        instruments
       });
     }
     return responseAny as Record<string, unknown>;
   };
   if (cached && isQuoteCacheFresh(cached)) {
-    // Temporarily bypass cache for Bronze call testing or explicit cache busting
-    if (body._cacheBust || (body.tierName === "Pro (Bronze)" && body.side === "short")) {
+    // Bypass cache only for explicit cache busting.
+    if (body._cacheBust) {
       await audit("debug_cache_bypass", {
         tierName: body.tierName,
         side: body.side,
@@ -2742,31 +2802,6 @@ app.post("/put/quote", async (req) => {
       ? spotPrice.mul(new Decimal(1).minus(drawdownFloorPct))
       : spotPrice.mul(new Decimal(1).plus(drawdownFloorPct));
   const tierName = body.tierName || "Unknown";
-  if (tierName === "Pro (Bronze)" && optionType === "call") {
-    await audit("bronze_call_not_supported", {
-      tierName,
-      side: body.side,
-      optionType,
-      requestedLeverage: leverage
-    });
-    return cacheAndReturn({
-      status: "error",
-      error: "option_type_not_supported",
-      message:
-        "Bronze tier supports put protection (long positions) only. Call protection (short positions) not available.",
-      details: {
-        tierName,
-        requestedOptionType: optionType,
-        supportedTypes: ["put"],
-        reason: "Bronze tier optimized for long position protection due to cost dynamics"
-      },
-      suggestions: [
-        "Bronze tier: Use put protection for long positions (up to 10× leverage)",
-        "Short position protection not available at Bronze tier",
-        "Reduce position size or use unprotected shorts if comfortable with risk"
-      ]
-    });
-  }
   const tierLeverageLimits = riskControls.max_leverage_by_tier?.[tierName];
   if (tierLeverageLimits && optionType === "put") {
     const maxLeverageForOption = tierLeverageLimits[optionType];
@@ -2807,6 +2842,7 @@ app.post("/put/quote", async (req) => {
     maxFallbackDays,
     Math.max(1, Math.round(body.targetDays ?? expiryTargetDays ?? defaultTargetDays))
   );
+  const fastPreview = body._fastPreview === true;
   const expirySearchOrder = body.expiryTag
     ? [{ expiryTag: body.expiryTag, targetDays: expiryTargetDays ?? targetDays }]
     : venueConfig.mode === "bybit_only"
@@ -2822,6 +2858,7 @@ app.post("/put/quote", async (req) => {
           maxPreferredDays,
           maxFallbackDays
         );
+  const effectiveExpiryOrder = fastPreview ? expirySearchOrder.slice(0, 1) : expirySearchOrder;
   let chosenExecutionPlans:
     | Array<{ venue: string; instrument: string; side: "buy" | "sell"; size: Decimal; price: Decimal }>
     | null = null;
@@ -2850,14 +2887,16 @@ app.post("/put/quote", async (req) => {
   const liquidityOverrideEnabled = riskControls.liquidity_override_enabled ?? false;
   let liquidityOverrideUsed = false;
 
-  for (const overridePass of [false, true]) {
+  const overridePasses = fastPreview ? [false] : [false, true];
+  let fastPreviewHit = false;
+  for (const overridePass of overridePasses) {
     if (overridePass && !liquidityOverrideEnabled) break;
     bestCandidate = null;
     bestSnapshots = null;
     chosenExecutionPlans = null;
     chosenSnapshots = null;
 
-    for (const entry of expirySearchOrder) {
+    for (const entry of effectiveExpiryOrder) {
       const expiryTag = entry.expiryTag;
       const days = entry.targetDays;
       if (!expiryTag) continue;
@@ -2874,7 +2913,7 @@ app.post("/put/quote", async (req) => {
               expiryTag,
               optionType,
               targetStrike,
-              40
+              fastPreview ? 6 : 40
             )
           : selectStrikeCandidates(
               results,
@@ -2882,7 +2921,7 @@ app.post("/put/quote", async (req) => {
               optionType,
               spotPrice,
               drawdownFloorPct,
-              40
+              fastPreview ? 6 : 40
             );
       const { maxSpreadPct, maxSlippagePct } = resolveLiquidityThresholds(
         days,
@@ -2936,7 +2975,7 @@ app.post("/put/quote", async (req) => {
         const premiumTotal = premiumPerUnit.mul(requiredSize);
         const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
         const allInPremium = premiumTotal.mul(new Decimal(rollMultiplier));
-        if (!bestCandidate || allInPremium.lt(bestCandidate.allInPremium)) {
+        if (!bestCandidate || (!fastPreview && allInPremium.lt(bestCandidate.allInPremium))) {
           bestCandidate = {
             expiryTag,
             targetDays: days,
@@ -2954,8 +2993,14 @@ app.post("/put/quote", async (req) => {
           chosenSnapshots = snapshotsByStrike;
         }
         plansByStrike.set(new Decimal(inst.strike).toFixed(0), agg.plans);
+        if (fastPreview && bestCandidate) {
+          fastPreviewHit = true;
+          break;
+        }
       }
+      if (fastPreviewHit) break;
     }
+    if (fastPreviewHit) break;
 
     if (bestCandidate) {
       liquidityOverrideUsed = overridePass;
@@ -3021,7 +3066,6 @@ app.post("/put/quote", async (req) => {
       optionType
     });
     let feeUsdc = feeBase.feeUsdc;
-    const baseFeeUsdc = feeUsdc;
     const feeRegime = feeBase.feeRegime;
     const feeLeverage = feeBase.feeLeverage;
     const feeIv = feeBase.feeIv;
@@ -3034,10 +3078,11 @@ app.post("/put/quote", async (req) => {
       optionType
     });
     let feeReason = "flat_fee";
-    if (ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
+    if (tierName !== "Pro (Bronze)" && ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
       feeUsdc = ctcSafety.feeUsdc;
       feeReason = "ctc_safety";
     }
+    const baseFeeUsdc = feeUsdc;
     const premiumTotal = bestCandidate.premiumTotal;
     const allInPremium = bestCandidate.allInPremium;
     const markupPct = resolvePremiumMarkupPct(tierName, leverage);
@@ -3048,6 +3093,25 @@ app.post("/put/quote", async (req) => {
       tierName === "Pro (Gold)" ||
       tierName === "Pro (Platinum)";
     const allowPartialCoverage = tierName === "Pro (Bronze)" && body.allowPartialCoverage === true;
+    const passThroughEnabled = riskControls.enable_premium_pass_through !== false;
+    const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
+    const userOptedIn = body.allowPremiumPassThrough !== false;
+    const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
+    const passThroughCapInfo = applyPassThroughCap(baseFeeUsdc, allInPremium, leverage, tierName);
+    const passThroughCapped = passThroughCapInfo.maxFee
+      ? passThroughFee.gt(passThroughCapInfo.maxFee)
+      : false;
+    if (!premiumFloor.breached) {
+      if (passThroughFee.gt(baseFeeUsdc)) {
+        feeUsdc = passThroughFee;
+        feeReason = "premium_markup";
+      } else {
+        feeUsdc = baseFeeUsdc;
+        if (feeReason !== "ctc_safety") {
+          feeReason = "base_fee";
+        }
+      }
+    }
     let subsidyNeeded = allInPremium.minus(feeUsdc);
     let subsidyCheck = canApplySubsidy(
       tierName,
@@ -3055,14 +3119,6 @@ app.post("/put/quote", async (req) => {
       subsidyNeeded.toNumber(),
       feeIv.scaled
     );
-    const passThroughEnabled = riskControls.enable_premium_pass_through !== false;
-    const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
-    const userOptedIn = body.allowPremiumPassThrough !== false;
-    const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
-    const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
-    const passThroughCapped = passThroughCapInfo.maxFee
-      ? passThroughFee.gt(passThroughCapInfo.maxFee)
-      : false;
     await audit("pass_through_gate", {
       passThroughEnabled,
       requiresUserOptIn,
@@ -3175,12 +3231,14 @@ app.post("/put/quote", async (req) => {
             type: "pass_through",
             baseFee: baseFeeUsdc.toFixed(2),
             hedgePremium: allInPremium.toFixed(2),
-            totalFee: allInPremium.toFixed(2),
+            totalFee: passThroughFee.toFixed(2),
+            markupPct: markupPct.mul(100).toFixed(2),
+            markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
             ratio,
             threshold,
             explanation:
               `Market volatility requires premium ${premiumFloor.ratio.toFixed(2)}× base fee. ` +
-              `Charging actual hedge cost of $${allInPremium.toFixed(2)} for full protection.`
+              `Charging hedge premium plus markup for full protection.`
           },
           warning: shouldNotify
             ? {
@@ -3224,8 +3282,7 @@ app.post("/put/quote", async (req) => {
             premium: allInPremium.toFixed(2),
             cap: cappedFee.toFixed(2)
           });
-          // Bronze tier: calls (short positions) not supported
-          // Only puts (long positions) available at Bronze tier
+          // Bronze tier does not receive capped pass-through subsidy.
           const feasibility = null;
           await audit("debug_feasibility_search_result", {
             found: feasibility?.found ?? false,
@@ -3537,8 +3594,7 @@ app.post("/put/quote", async (req) => {
         premium: allInPremium.toFixed(2),
         cap: passThroughCapInfo.maxFee ? passThroughCapInfo.maxFee.toFixed(2) : null
       });
-      // Bronze tier: calls (short positions) not supported
-      // Only puts (long positions) available at Bronze tier
+      // Bronze tier does not receive capped pass-through subsidy.
       const feasibility = null;
       await audit("debug_feasibility_search_result", {
         found: feasibility?.found ?? false,
@@ -3709,7 +3765,7 @@ app.post("/put/quote", async (req) => {
     }
 
     if (canPassThrough && allInPremium.gt(feeUsdc)) {
-      const passThroughCapInfoLate = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
+      const passThroughCapInfoLate = applyPassThroughCap(baseFeeUsdc, allInPremium, leverage, tierName);
       if (!passThroughCapInfoLate.capped) {
         const optionSymbol = optionType === "put" ? "P" : "C";
         const optionInstrument = buildVenueInstrumentName(
@@ -3732,7 +3788,7 @@ app.post("/put/quote", async (req) => {
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
           subsidyUsdc: "0.00",
-          feeUsdc: allInPremium.toFixed(2),
+          feeUsdc: passThroughFee.toFixed(2),
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
@@ -3740,7 +3796,7 @@ app.post("/put/quote", async (req) => {
             ? passThroughCapInfoLate.capMultiplier.toFixed(4)
             : null,
           passThroughCapped: false,
-        reason: "pass_through",
+          reason: "pass_through",
           liquidityOverride: liquidityOverrideUsed,
           replication: fallbackReplication,
           survivalCheck,
@@ -3894,7 +3950,6 @@ app.post("/put/quote", async (req) => {
 
   const notionalUsdc = positionSize.mul(new Decimal(body.spotPrice)).mul(new Decimal(leverage)).toNumber();
   let feeUsdc = feeBase.feeUsdc;
-  const baseFeeUsdc = feeUsdc;
   const feeRegime = feeBase.feeRegime;
   const feeLeverage = feeBase.feeLeverage;
   const ctcSafety = calculateCtcSafetyFee({
@@ -3906,10 +3961,11 @@ app.post("/put/quote", async (req) => {
     optionType
   });
   let feeReason = "flat_fee";
-  if (ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
+  if (tierName !== "Pro (Bronze)" && ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
     feeUsdc = ctcSafety.feeUsdc;
     feeReason = "ctc_safety";
   }
+  const baseFeeUsdc = feeUsdc;
   const allInPremium = quote.allInPremium;
   const markupPct = resolvePremiumMarkupPct(tierName, leverage);
   const passThroughFee = allInPremium.mul(new Decimal(1).add(markupPct));
@@ -3923,10 +3979,21 @@ app.post("/put/quote", async (req) => {
   const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
   const userOptedIn = body.allowPremiumPassThrough !== false;
   const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
-  const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
+  const passThroughCapInfo = applyPassThroughCap(baseFeeUsdc, allInPremium, leverage, tierName);
   const passThroughCapped = passThroughCapInfo.maxFee
     ? passThroughFee.gt(passThroughCapInfo.maxFee)
     : false;
+  if (!premiumFloor.breached) {
+    if (passThroughFee.gt(baseFeeUsdc)) {
+      feeUsdc = passThroughFee;
+      feeReason = "premium_markup";
+    } else {
+      feeUsdc = baseFeeUsdc;
+      if (feeReason !== "ctc_safety") {
+        feeReason = "base_fee";
+      }
+    }
+  }
   await audit("pass_through_gate", {
     passThroughEnabled,
     requiresUserOptIn,
@@ -4932,7 +4999,8 @@ app.post("/put/auto-renew", async (req) => {
     effectiveFeeUsdc = renewSafety.feeUsdc;
     renewReason = "ctc_safety";
   }
-  const renewPremiumFloor = premiumFloorBreached(effectiveAllInPremium, effectiveFeeUsdc);
+  const renewBaseFeeUsdc = effectiveFeeUsdc;
+  const renewPremiumFloor = premiumFloorBreached(effectiveAllInPremium, renewBaseFeeUsdc);
   const renewMarkupPct = resolvePremiumMarkupPct(tierName, renewLeverage);
   const renewPassThroughFee = effectiveAllInPremium.mul(new Decimal(1).add(renewMarkupPct));
   const renewPassThroughEnabled = riskControls.enable_premium_pass_through !== false;
@@ -4940,6 +5008,17 @@ app.post("/put/auto-renew", async (req) => {
   const renewUserOptedIn = body.allowPremiumPassThrough !== false;
   const renewCanPassThrough =
     renewPassThroughEnabled && (!renewRequiresUserOptIn || renewUserOptedIn);
+  if (!renewPremiumFloor.breached) {
+    if (renewPassThroughFee.gt(renewBaseFeeUsdc)) {
+      effectiveFeeUsdc = renewPassThroughFee;
+      renewReason = "premium_markup";
+    } else {
+      effectiveFeeUsdc = renewBaseFeeUsdc;
+      if (renewReason !== "ctc_safety") {
+        renewReason = "base_fee";
+      }
+    }
+  }
   let subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
   let subsidyCheck = canApplySubsidy(
     tierName,
@@ -4948,7 +5027,7 @@ app.post("/put/auto-renew", async (req) => {
     effectiveIv
   );
   const renewPassThroughCap = applyPassThroughCap(
-    effectiveFeeUsdc,
+    renewBaseFeeUsdc,
     effectiveAllInPremium,
     renewLeverage,
     tierName
@@ -5034,7 +5113,7 @@ app.post("/put/auto-renew", async (req) => {
         subsidyUsdc = subsidyNeeded;
       } else if (renewCanPassThrough && effectiveAllInPremium.gt(effectiveFeeUsdc)) {
         const lateCap = applyPassThroughCap(
-          effectiveFeeUsdc,
+          renewBaseFeeUsdc,
           effectiveAllInPremium,
           renewLeverage,
           tierName
@@ -5328,6 +5407,19 @@ app.post("/loop/tick", async (req) => {
     hedgeType: inferredHedgeType
   });
 
+  const hedgeCooldownMs = riskControls.hedge_action_cooldown_ms ?? 60000;
+  const minHedgeNotional = riskControls.min_hedge_notional_usdc ?? 0;
+  const coverageKey = body.coverageId || body.accountId || "unknown";
+  const lastHedgeAt = hedgeActionCooldownByCoverage.get(coverageKey) ?? 0;
+  const withinCooldown =
+    hedgeCooldownMs > 0 && Date.now() - lastHedgeAt < hedgeCooldownMs;
+  const notionalUsdc = Number(body.notionalUsdc ?? 0);
+  const belowNotional =
+    Number.isFinite(notionalUsdc) &&
+    minHedgeNotional > 0 &&
+    notionalUsdc > 0 &&
+    notionalUsdc < minHedgeNotional;
+
   let renewalResult: unknown = { status: "skipped" };
   if (decision.renew) {
     renewalResult = await runAutoRenewJob(
@@ -5350,6 +5442,15 @@ app.post("/loop/tick", async (req) => {
   }
 
   if (decision.hedgeAction === "increase") {
+    if (withinCooldown || belowNotional) {
+      await audit("hedge_action_skipped", {
+        action: "increase",
+        reason: withinCooldown ? "cooldown" : "min_notional",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null,
+        cooldownMs: hedgeCooldownMs
+      });
+    } else {
     await audit("hedge_action", {
       action: "increase",
       reason: decision.reason,
@@ -5385,6 +5486,8 @@ app.post("/loop/tick", async (req) => {
       hedgeType: inferredHedgeType,
       positionSide: inferredPositionSide
     });
+    hedgeActionCooldownByCoverage.set(coverageKey, Date.now());
+    }
   }
 
   if (baseExposures.length > 0) {
@@ -5404,7 +5507,28 @@ app.post("/loop/tick", async (req) => {
     const tierName = body.tierName || "Unknown";
     const state = getRiskState(tierName);
     const liquidity = liquiditySummary();
-    for (const plan of plans) {
+    const netCooldownMs = riskControls.net_exposure_cooldown_ms ?? 60000;
+    const netMinNotional = riskControls.net_exposure_min_notional_usdc ?? 0;
+    const netKey = `${tierName}-net-exposure`;
+    const lastNetAt = netExposureCooldownByTier.get(netKey) ?? 0;
+    const netWithinCooldown =
+      netCooldownMs > 0 && Date.now() - lastNetAt < netCooldownMs;
+    if (netWithinCooldown) {
+      await audit("hedge_action_skipped", {
+        action: "net_exposure",
+        reason: "cooldown",
+        tierName,
+        cooldownMs: netCooldownMs
+      });
+    } else {
+      let netExecuted = false;
+      for (const plan of plans) {
+      if (
+        netMinNotional > 0 &&
+        plan.targetNotional.abs().lt(new Decimal(netMinNotional))
+      ) {
+        continue;
+      }
       const spotOverride = body.spotByAsset?.[plan.asset];
       let spotPrice = Number(spotOverride || 0);
       if (!spotPrice) {
@@ -5695,6 +5819,7 @@ app.post("/loop/tick", async (req) => {
           const status = String(payload?.status || "");
           if (status === "paper_filled" || status === "filled" || status === "ok") {
             optionChosen = candidate;
+            netExecuted = true;
             break;
           }
           const reason = String(payload?.reason || "");
@@ -5746,6 +5871,7 @@ app.post("/loop/tick", async (req) => {
             floorPrice: strikeTarget.toNumber()
           }
         });
+        netExecuted = true;
         continue;
       }
 
@@ -5790,7 +5916,12 @@ app.post("/loop/tick", async (req) => {
         coverageIds,
         venue: routedPlan.venue
       });
+      netExecuted = true;
     }
+    if (netExecuted) {
+      netExposureCooldownByTier.set(netKey, Date.now());
+    }
+  }
   }
 
   if (body.alertWebhookUrl) {
@@ -6015,16 +6146,38 @@ app.post("/hedge/roll", async (req) => {
   };
 });
 
-app.listen({ port: 4100, host: "0.0.0.0" }).catch((err) => {
-  app.log.error(err);
-  process.exit(1);
-});
+const startServer = async () => {
+  try {
+    console.log("[API] Starting server...");
+    await app.listen({ port: API_PORT, host: API_HOST });
+    console.log(`[API] Listening on http://${API_HOST}:${API_PORT}`);
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+};
 
-await seedAuditIfEmpty();
+const bootstrapState = async () => {
+  await ensureLogsDir();
+  try {
+    await seedAuditIfEmpty();
+  } catch (error) {
+    console.error("Failed to seed audit log:", error);
+  }
+  try {
+    await loadCoverages();
+  } catch (error) {
+    console.error("Failed to load coverages:", error);
+  }
+  try {
+    await loadHedgeLedger();
+  } catch (error) {
+    console.error("Failed to load hedge ledger:", error);
+  }
+};
 
-// Load persisted state
-await loadCoverages();
-await loadHedgeLedger();
+await startServer();
+void bootstrapState();
 
 // Optional lightweight interval runner (enabled when LOOP_INTERVAL_MS > 0)
 if (LOOP_INTERVAL_MS > 0) {

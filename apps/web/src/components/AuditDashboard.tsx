@@ -216,7 +216,8 @@ export function AuditDashboard({
   const coverageEntries = scopedEntries.filter((entry) => entry.event === "coverage_activated");
   const sumPremium = (list: AuditEntry[]) =>
     list.reduce((sum, entry) => {
-      const premium = extractField(entry, "premiumUsdc");
+      const premium =
+        extractField(entry, "executedPremiumUsdc") ?? extractField(entry, "premiumUsdc");
       return sum + (premium !== null && premium !== undefined ? Number(premium) : 0);
     }, 0);
   const perUserHedgeCost = sumPremium(hedgeOrders.filter((entry) => !isNetExposure(entry)));
@@ -279,11 +280,11 @@ export function AuditDashboard({
             <div className="audit-metrics-divider" />
 
             <div className="audit-metric">
-              <span className="audit-metric-label">Revenue Collected</span>
+              <span className="audit-metric-label">Premium Collected</span>
               <span className="audit-metric-value audit-metric-value-positive">
                 ${(stats.revenue || 0).toFixed(2)}
               </span>
-              <span className="audit-metric-sub">fees charged</span>
+              <span className="audit-metric-sub">premiums charged</span>
             </div>
 
             <div className="audit-metric">
@@ -365,7 +366,8 @@ export function AuditDashboard({
               <span>Strike</span>
               <span>Side</span>
               <span>Status</span>
-              <span>Premium</span>
+              <span>Premium In</span>
+              <span>Premium Out</span>
               <span>Hedge Size</span>
               <span>Hedge Type</span>
               <span>Notional</span>
@@ -384,12 +386,18 @@ export function AuditDashboard({
             const strikeValue = extractField(entry, "strike") ?? parsedInstrument?.strike ?? null;
             const side = String(extractField(entry, "side") || "—");
             const status = String(extractField(entry, "status") || "—");
-            const premium = extractField(entry, "premiumUsdc");
+            const premium =
+              extractField(entry, "executedPremiumUsdc") ?? extractField(entry, "premiumUsdc");
+            const feeIn =
+              extractField(entry, "totalFeeUsd") ??
+              extractField(entry, "feeUsd") ??
+              extractField(entry, "feeUsdc");
             const hedgeSize = extractField(entry, "hedgeSize") ?? extractField(entry, "amount");
             const hedgeType = extractField(entry, "hedgeType") || extractField(entry, "optionType");
             const notional = extractField(entry, "notionalUsdc");
             const hedgeSpend =
               extractField(entry, "hedgeMarginUsdc") ??
+              extractField(entry, "executedPremiumUsdc") ??
               extractField(entry, "premiumUsdc") ??
               extractField(entry, "hedgeNotionalUsdc");
             const floorPrice = extractField(entry, "floorPrice");
@@ -423,10 +431,15 @@ export function AuditDashboard({
                 <span>{instrument}</span>
                 <span>{expiryTag || "—"}</span>
                 <span>
-                  {strikeNum !== null && Number.isFinite(strikeNum) ? strikeNum.toFixed(0) : "—"}
+                  {strikeNum !== null && Number.isFinite(strikeNum)
+                    ? strikeNum.toLocaleString(undefined, { maximumFractionDigits: 0 })
+                    : "—"}
                 </span>
                 <span>{side || "—"}</span>
                 <span>{status || "—"}</span>
+                <span title={feeIn !== null && feeIn !== undefined ? `$${feeIn}` : "—"}>
+                  {feeIn !== null && feeIn !== undefined ? `$${formatSmall(Number(feeIn))}` : "—"}
+                </span>
                 <span title={premium !== null && premium !== undefined ? `$${premium}` : "—"}>
                   {premium !== null && premium !== undefined ? `$${formatSmall(Number(premium))}` : "—"}
                 </span>
@@ -582,7 +595,7 @@ export function AuditDashboard({
                   <div className="glossary-term">
                     <dt>Premium</dt>
                     <dd>
-                      Fee paid by user to purchase protection. Calculated based on amount, duration,
+                      Premium paid by user to purchase protection. Calculated based on amount, duration,
                       volatility, and market conditions.
                     </dd>
                   </div>
@@ -699,7 +712,7 @@ export function AuditDashboard({
                   <div className="glossary-term">
                     <dt>liquidity_update</dt>
                     <dd>
-                      Liquidity accounting update after fees/hedges. Includes deltas and totals.
+                      Liquidity accounting update after premiums/hedges. Includes deltas and totals.
                     </dd>
                   </div>
                   <div className="glossary-term">
