@@ -109,6 +109,9 @@ const parseFundedLevels = (input: unknown): FundedLevel[] => {
     .filter((item): item is FundedLevel => Boolean(item));
 };
 
+const formatSpotPrice = (value: number) =>
+  value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
 const limitToSinglePosition = (input: Portfolio | null): Portfolio | null => {
   if (!input) return null;
   return { ...input, positions: input.positions.slice(0, 1) };
@@ -1345,8 +1348,6 @@ export function App() {
     value.toLocaleString(undefined, { maximumFractionDigits: 0 });
   const formatPrice = (value: number) =>
     value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const formatSpot = (value: number) =>
-    value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   const mtmEquity = riskSummary ? Number(riskSummary.equityUsdc) : portfolioStats.equityUsd;
   const mtmDistanceToFloor = mtmEquity - portfolioStats.floorUsd;
@@ -2049,7 +2050,7 @@ function PortfolioForm({
       </div>
       <div className="row">
         <span>Entry</span>
-        <strong>{spot ? `$${formatSpot(spot)}` : "—"}</strong>
+        <strong>{spot ? `$${formatSpotPrice(spot)}` : "—"}</strong>
       </div>
       {!existingPosition && (
         <button
