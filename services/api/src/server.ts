@@ -2549,6 +2549,8 @@ type PutQuoteRequest = {
   accountId?: string;
   allowPremiumPassThrough?: boolean;
   allowPartialCoverage?: boolean;
+  _cacheBust?: boolean;
+  _fastPreview?: boolean;
 };
 
 function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Record<string, unknown>> {
@@ -2569,9 +2571,11 @@ function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Rec
 
 app.post("/put/preview", async (req) => {
   const body = req.body as PutQuoteRequest;
+  body._fastPreview = true;
+  body._cacheBust = true;
   const cacheKey = buildQuoteCacheKey(body);
   const cached = getQuoteCache(cacheKey);
-  if (cached && isQuoteCacheFresh(cached)) {
+  if (!body._cacheBust && cached && isQuoteCacheFresh(cached)) {
     return { ...cached.response, cached: true, stale: false };
   }
   const response = await startQuoteCompute(body, cacheKey);
@@ -2836,6 +2840,7 @@ app.post("/put/quote", async (req) => {
     maxFallbackDays,
     Math.max(1, Math.round(body.targetDays ?? expiryTargetDays ?? defaultTargetDays))
   );
+  const fastPreview = body._fastPreview === true;
   const expirySearchOrder = body.expiryTag
     ? [{ expiryTag: body.expiryTag, targetDays: expiryTargetDays ?? targetDays }]
     : venueConfig.mode === "bybit_only"
@@ -2851,6 +2856,7 @@ app.post("/put/quote", async (req) => {
           maxPreferredDays,
           maxFallbackDays
         );
+  const effectiveExpiryOrder = fastPreview ? expirySearchOrder.slice(0, 1) : expirySearchOrder;
   let chosenExecutionPlans:
     | Array<{ venue: string; instrument: string; side: "buy" | "sell"; size: Decimal; price: Decimal }>
     | null = null;
@@ -2879,14 +2885,16 @@ app.post("/put/quote", async (req) => {
   const liquidityOverrideEnabled = riskControls.liquidity_override_enabled ?? false;
   let liquidityOverrideUsed = false;
 
-  for (const overridePass of [false, true]) {
+  const overridePasses = fastPreview ? [false] : [false, true];
+  let fastPreviewHit = false;
+  for (const overridePass of overridePasses) {
     if (overridePass && !liquidityOverrideEnabled) break;
     bestCandidate = null;
     bestSnapshots = null;
     chosenExecutionPlans = null;
     chosenSnapshots = null;
 
-    for (const entry of expirySearchOrder) {
+    for (const entry of effectiveExpiryOrder) {
       const expiryTag = entry.expiryTag;
       const days = entry.targetDays;
       if (!expiryTag) continue;
@@ -2903,7 +2911,7 @@ app.post("/put/quote", async (req) => {
               expiryTag,
               optionType,
               targetStrike,
-              40
+              fastPreview ? 6 : 40
             )
           : selectStrikeCandidates(
               results,
@@ -2911,7 +2919,7 @@ app.post("/put/quote", async (req) => {
               optionType,
               spotPrice,
               drawdownFloorPct,
-              40
+              fastPreview ? 6 : 40
             );
       const { maxSpreadPct, maxSlippagePct } = resolveLiquidityThresholds(
         days,
@@ -2965,7 +2973,7 @@ app.post("/put/quote", async (req) => {
         const premiumTotal = premiumPerUnit.mul(requiredSize);
         const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
         const allInPremium = premiumTotal.mul(new Decimal(rollMultiplier));
-        if (!bestCandidate || allInPremium.lt(bestCandidate.allInPremium)) {
+        if (!bestCandidate || (!fastPreview && allInPremium.lt(bestCandidate.allInPremium))) {
           bestCandidate = {
             expiryTag,
             targetDays: days,
@@ -2983,8 +2991,14 @@ app.post("/put/quote", async (req) => {
           chosenSnapshots = snapshotsByStrike;
         }
         plansByStrike.set(new Decimal(inst.strike).toFixed(0), agg.plans);
+        if (fastPreview && bestCandidate) {
+          fastPreviewHit = true;
+          break;
+        }
       }
+      if (fastPreviewHit) break;
     }
+    if (fastPreviewHit) break;
 
     if (bestCandidate) {
       liquidityOverrideUsed = overridePass;

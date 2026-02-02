@@ -128,6 +128,9 @@ export function App() {
   const [protectionStart, setProtectionStart] = useState<string | null>(null);
   const [protectionExpiry, setProtectionExpiry] = useState<string | null>(null);
   const [protectedIds, setProtectedIds] = useState<string[]>([]);
+  const [activeCoverages, setActiveCoverages] = useState<
+    Array<{ coverageId: string; expiryIso: string; positions?: PortfolioPosition[] }>
+  >([]);
   const [showAudit, setShowAudit] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [lastExecution, setLastExecution] = useState<string | null>(null);
@@ -309,13 +312,16 @@ export function App() {
           ? (coverageResponse.coverages as any[])
           : [];
 
+        setActiveCoverages(coverages);
         if (positions && coverages.length > 0) {
           const coverageMap = new Map<string, any>();
           for (const coverage of coverages) {
-            const pos = coverage?.positions?.[0];
-            if (!pos) continue;
-            const key = `${pos.asset}-${pos.side}-${pos.entryPrice}`;
-            coverageMap.set(key, coverage);
+            const coveragePositions = Array.isArray(coverage?.positions) ? coverage.positions : [];
+            for (const pos of coveragePositions) {
+              if (!pos) continue;
+              const key = `${pos.asset}-${pos.side}-${pos.entryPrice}`;
+              coverageMap.set(key, coverage);
+            }
           }
 
           const protectedIds = positions
@@ -328,15 +334,23 @@ export function App() {
           setProtectedIds(protectedIds);
           setProtectionActive(protectedIds.length > 0);
 
-          const firstCoverage = coverages[0];
-          if (firstCoverage?.expiryIso) {
-            setProtectionExpiry(firstCoverage.expiryIso);
+          const earliestExpiry = coverages
+            .map((coverage) => coverage?.expiryIso)
+            .filter((expiry): expiry is string => Boolean(expiry))
+            .sort((a, b) => Date.parse(a) - Date.parse(b))[0];
+          if (earliestExpiry) {
+            setProtectionExpiry(earliestExpiry);
           }
-          if (firstCoverage?.coverageId) {
-            setLastCoverageId(firstCoverage.coverageId);
+          if (coverages[0]?.coverageId) {
+            setLastCoverageId(coverages[0].coverageId);
           }
 
           console.log(`✓ Loaded ${coverages.length} active coverage(s)`);
+        } else {
+          setProtectedIds([]);
+          setProtectionActive(false);
+          setProtectionExpiry(null);
+          setLastCoverageId(null);
         }
       } catch (error) {
         console.error("Failed to fetch data:", error);
@@ -892,15 +906,14 @@ export function App() {
         ? new Date(protectionExpiry)
         : new Date(Date.now() + expiryDays * 24 * 60 * 60 * 1000);
     const coverageId = buildCoverageId(expiry.toISOString());
-    if (
-      protectionActive &&
-      lastCoverageId === coverageId &&
-      protectionExpiry &&
-      new Date(protectionExpiry).getTime() > Date.now()
-    ) {
+    const activeCoverage = activeCoverages.find((coverage) => coverage.coverageId === coverageId);
+    if (protectionActive && activeCoverage) {
+      const activeExpiryMs = Date.parse(activeCoverage.expiryIso || "");
+      if (Number.isFinite(activeExpiryMs) && activeExpiryMs > Date.now()) {
       setLastExecution("Protection already active for this window.");
       setIsActivating(false);
       return;
+      }
     }
     const primary = selectedPositions[0];
     const primaryAsset = primary?.asset ?? "BTC";
@@ -1265,8 +1278,24 @@ export function App() {
     setLastCoverageId(coverageId);
     setProtectionActive(true);
     setProtectionStart(payload.ts);
-    setProtectionExpiry(payload.expiryIso);
-    setProtectedIds(selectedIds);
+    setProtectionExpiry((prev) => {
+      if (!prev) return payload.expiryIso;
+      const prevMs = Date.parse(prev);
+      const nextMs = Date.parse(payload.expiryIso);
+      if (!Number.isFinite(prevMs)) return payload.expiryIso;
+      if (!Number.isFinite(nextMs)) return prev;
+      return nextMs < prevMs ? payload.expiryIso : prev;
+    });
+    setProtectedIds((prev) => Array.from(new Set([...prev, ...selectedIds])));
+    setActiveCoverages((prev) => {
+      const next = prev.filter((coverage) => coverage.coverageId !== coverageId);
+      next.push({
+        coverageId,
+        expiryIso: payload.expiryIso,
+        positions: selectedPortfolioPositions
+      });
+      return next;
+    });
     setFeeRegimeLabel(regimeLabel);
     setProtectionTierName(level.name);
     setProtectionLeverage(primary?.leverage ?? null);
@@ -1314,6 +1343,8 @@ export function App() {
 
   const formatUsd = (value: number) =>
     value.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  const formatPrice = (value: number) =>
+    value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   const mtmEquity = riskSummary ? Number(riskSummary.equityUsdc) : portfolioStats.equityUsd;
   const mtmDistanceToFloor = mtmEquity - portfolioStats.floorUsd;
@@ -1414,7 +1445,7 @@ export function App() {
     }, 500);
     return () => window.clearInterval(id);
   }, [isFetchingQuote]);
-  const fetchingLabel = `Fetching${".".repeat(fetchingDotCount)}`;
+  const fetchingDots = ".".repeat(fetchingDotCount);
   const displayFeeUsd = (() => {
     if (!hasSelection) return null;
     if (lockedQuote?.key === pricingKey) return lockedQuote.feeUsdc;
@@ -1430,11 +1461,7 @@ export function App() {
     previewError ||
     previewState === "idle";
   const pricingStatusLabel = null;
-  const feeDisplayLabel = displayFeeUsd
-    ? `$${formatUsd(displayFeeUsd)}`
-    : isFetchingQuote
-      ? fetchingLabel
-      : "—";
+  const feeDisplayLabel = displayFeeUsd ? `$${formatUsd(displayFeeUsd)}` : "-";
 
   return (
     <div className="shell">
@@ -1568,7 +1595,7 @@ export function App() {
                         </strong>
                         <div className="muted">
                           ${formatUsd(p.marginUsd)} • {p.leverage}x • Entry $
-                          {p.entryPrice.toFixed(2)}
+                          {formatPrice(p.entryPrice)}
                         </div>
                       </div>
                       <div className="position-actions">
@@ -1612,7 +1639,14 @@ export function App() {
                   />
                 </div>
                 <div className="row row-align">
-                  <span>Premium</span>
+                  <span>
+                    Premium
+                    {isFetchingQuote && (
+                      <span className="fetching-status">
+                        Fetching<span className="fetching-dots">{fetchingDots}</span>
+                      </span>
+                    )}
+                  </span>
                   <div className="row-inline row-inline-fee">
                     {pricingStatusLabel && (
                       <span className="vol-status">{pricingStatusLabel}</span>
@@ -1696,7 +1730,7 @@ export function App() {
                       ) : null}
                       <div className="muted">
                         ${formatUsd(p.marginUsd)} • {p.leverage}x • Entry $
-                        {p.entryPrice.toFixed(2)}
+                        {formatPrice(p.entryPrice)}
                       </div>
                     </div>
                     <div className="position-actions">
@@ -1817,7 +1851,7 @@ export function App() {
                       </strong>
                       <div className="muted">
                         ${formatUsd(p.marginUsd)} • {p.leverage}x • Entry $
-                        {p.entryPrice.toFixed(2)}
+                        {formatPrice(p.entryPrice)}
                       </div>
                     </div>
                     <div className="position-actions">
