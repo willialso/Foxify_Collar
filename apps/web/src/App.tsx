@@ -190,6 +190,7 @@ export function App() {
     hedgeSize: number;
     bufferTargetPct: number;
     expiryIso: string;
+    selectedVenue: string | null;
     renewPayload: Record<string, unknown>;
     notionalUsdc: number;
     hedgeType: "option" | "perp";
@@ -971,6 +972,7 @@ export function App() {
     let subsidyUsd = 0;
     let reason = "flat_fee";
     let regimeLabel: string | null = null;
+    let selectedVenue: string | null = null;
 
     let orderResponse: any = null;
     try {
@@ -1060,6 +1062,7 @@ export function App() {
           hedgeInstrument = quote.instrument;
           hedgeSize = Number(quote.hedgeSize || 0);
           bufferTargetPct = Number(quote.bufferTargetPct || 0.05);
+          selectedVenue = quote?.optionVenue ?? quote?.venueSelection?.selected ?? null;
 
           const plans =
             Array.isArray(quote?.executionPlan) && quote.executionPlan.length > 0
@@ -1068,7 +1071,8 @@ export function App() {
                   {
                     instrument: hedgeInstrument,
                     side: "buy",
-                    size: hedgeSize
+                    size: hedgeSize,
+                    venue: selectedVenue
                   }
                 ];
           let remainingSize = hedgeSize;
@@ -1082,6 +1086,7 @@ export function App() {
             const planSize = Number(plan?.size ?? remainingSize);
             const amount = Math.min(remainingSize, Number.isFinite(planSize) ? planSize : remainingSize);
             if (!Number.isFinite(amount) || amount <= 0) continue;
+            const planVenue = plan?.venue ?? selectedVenue ?? null;
             const orderRes = await fetch(`${API_BASE}/deribit/order`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -1090,6 +1095,7 @@ export function App() {
                 amount,
                 side: plan?.side === "sell" ? "sell" : "buy",
                 type: "market",
+                venue: planVenue ?? undefined,
                 quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
                 coverageId,
                 notionalUsdc,
@@ -1259,6 +1265,7 @@ export function App() {
       feeUsd,
       baseFeeUsd,
       markupUsd,
+      selectedVenue,
       totalFeeUsd: feeUsd,
       subsidyUsd,
       reason,
@@ -1276,6 +1283,7 @@ export function App() {
       hedge: {
         hedgeType,
         instrument: hedgeInstrument || null,
+        venue: selectedVenue,
         quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
         premiumUsdc: executedPremiumUsd ?? premiumOutUsd ?? null,
         quotedPremiumUsdc: premiumOutUsd ?? null,
@@ -1329,6 +1337,7 @@ export function App() {
         hedgeSize,
         bufferTargetPct,
         expiryIso: payload.expiryIso,
+        selectedVenue,
         renewPayload: {
           tierName: level.name,
           asset: primaryAsset,
@@ -1354,6 +1363,7 @@ export function App() {
         hedgeSize,
         bufferTargetPct,
         expiryIso: payload.expiryIso,
+        selectedVenue,
         renewPayload: {},
         notionalUsdc,
         hedgeType: "perp"
@@ -1413,8 +1423,10 @@ export function App() {
           renewWindowMinutes,
           renewPayload: hedgeContext.renewPayload,
           coverageId: hedgeContext.coverageId,
+          autoRenew,
           notionalUsdc: hedgeContext.notionalUsdc,
           hedgeType: hedgeContext.hedgeType,
+          selectedVenue: hedgeContext.selectedVenue,
           tierName: level?.name || "Unknown",
           exposures
         })

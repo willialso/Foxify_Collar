@@ -64,6 +64,9 @@ const CEO_AUDIT_EVENTS = [
   "liquidity_update",
   "hedge_order",
   "hedge_action",
+  "mtm_position",
+  "mtm_credit",
+  "demo_credit",
   "put_quote_failed",
   "put_renew_failed",
   "option_exec_failed",
@@ -102,6 +105,7 @@ const RISK_CONTROLS_PATH = new URL("../../../configs/risk_controls.json", import
 const VENUE_CONFIG_PATH = new URL("../config.json", import.meta.url);
 const COVERAGE_FILE_PATH = new URL("../../../logs/coverages.json", import.meta.url);
 const HEDGE_LEDGER_PATH = new URL("../../../logs/hedge-ledger.json", import.meta.url);
+const COVERAGE_LEDGER_PATH = new URL("../../../logs/coverage-ledger.json", import.meta.url);
 const QUOTE_CACHE_TTL_MS = Number(process.env.QUOTE_CACHE_TTL_MS || "300000");
 async function ensureLogsDir(): Promise<void> {
   try {
@@ -112,6 +116,11 @@ async function ensureLogsDir(): Promise<void> {
 }
 const QUOTE_CACHE_STALE_MS = Number(process.env.QUOTE_CACHE_STALE_MS || "20000");
 const QUOTE_CACHE_HARD_MS = Number(process.env.QUOTE_CACHE_HARD_MS || "120000");
+const MTM_BUFFER_THRESHOLD_USDC = new Decimal(process.env.MTM_BUFFER_THRESHOLD_USDC || "50");
+const MTM_BUFFER_THRESHOLD_PCT = new Decimal(process.env.MTM_BUFFER_THRESHOLD_PCT || "0.005");
+const MTM_COVERAGE_RATIO_THRESHOLD = new Decimal(
+  process.env.MTM_COVERAGE_RATIO_THRESHOLD || "0.05"
+);
 
 type VenueMode = "bybit_only" | "deribit_only" | "dual_venue";
 type VenueConfig = {
@@ -360,6 +369,90 @@ async function loadCoverages(): Promise<void> {
 }
 
 // ═══════════════════════════════════════════════════════════
+// COVERAGE LEDGER PERSISTENCE
+// ═══════════════════════════════════════════════════════════
+
+function serializeCoverageLedger(): CoverageLedgerEntry[] {
+  return Array.from(coverageLedger.values()).map((entry) => ({
+    ...entry,
+    positions: entry.positions ?? [],
+    updatedAt: entry.updatedAt || new Date().toISOString()
+  }));
+}
+
+async function saveCoverageLedger(): Promise<void> {
+  try {
+    const data = {
+      ledger: serializeCoverageLedger(),
+      timestamp: new Date().toISOString()
+    };
+    await writeFile(COVERAGE_LEDGER_PATH, JSON.stringify(data, null, 2), "utf-8");
+    console.log(`✓ Saved coverage ledger (${data.ledger.length} entries)`);
+  } catch (error) {
+    console.error("Failed to save coverage ledger:", error);
+  }
+}
+
+async function loadCoverageLedger(): Promise<void> {
+  try {
+    const { existsSync } = await import("node:fs");
+    if (!existsSync(COVERAGE_LEDGER_PATH)) {
+      console.log("No coverage ledger found (fresh start)");
+      return;
+    }
+    const raw = await (await import("node:fs/promises")).readFile(COVERAGE_LEDGER_PATH, "utf-8");
+    const data = JSON.parse(raw) as {
+      ledger?: CoverageLedgerEntry[];
+      timestamp?: string;
+    };
+    const entries = Array.isArray(data.ledger) ? data.ledger : [];
+    for (const entry of entries) {
+      if (!entry?.coverageId) continue;
+      coverageLedger.set(entry.coverageId, {
+        ...entry,
+        positions: entry.positions ?? [],
+        updatedAt: entry.updatedAt || new Date().toISOString()
+      });
+    }
+    console.log(`✓ Loaded coverage ledger: ${coverageLedger.size} entries`);
+  } catch (error) {
+    console.error("Failed to load coverage ledger:", error);
+  }
+}
+
+function upsertCoverageLedger(
+  update: Partial<CoverageLedgerEntry> & { coverageId: string }
+): CoverageLedgerEntry {
+  const existing = coverageLedger.get(update.coverageId);
+  const now = new Date().toISOString();
+  const next: CoverageLedgerEntry = {
+    coverageId: update.coverageId,
+    expiryIso: update.expiryIso || existing?.expiryIso || "",
+    positions: update.positions || existing?.positions || [],
+    accountId: update.accountId ?? existing?.accountId ?? null,
+    tier: update.tier ?? existing?.tier ?? null,
+    autoRenew: update.autoRenew ?? existing?.autoRenew ?? undefined,
+    selectedVenue: update.selectedVenue ?? existing?.selectedVenue ?? null,
+    hedgeInstrument: update.hedgeInstrument ?? existing?.hedgeInstrument ?? null,
+    hedgeSize: update.hedgeSize ?? existing?.hedgeSize ?? null,
+    hedgeType: update.hedgeType ?? existing?.hedgeType ?? null,
+    optionType: update.optionType ?? existing?.optionType ?? null,
+    strike: update.strike ?? existing?.strike ?? null,
+    notionalUsdc: update.notionalUsdc ?? existing?.notionalUsdc ?? null,
+    floorUsd: update.floorUsd ?? existing?.floorUsd ?? null,
+    equityUsd: update.equityUsd ?? existing?.equityUsd ?? null,
+    markSource: update.markSource ?? existing?.markSource ?? null,
+    mtmAttribution: update.mtmAttribution ?? existing?.mtmAttribution ?? null,
+    lastMtm: update.lastMtm ?? existing?.lastMtm ?? null,
+    expiredAt: update.expiredAt ?? existing?.expiredAt ?? undefined,
+    status: update.status ?? existing?.status ?? "active",
+    updatedAt: now
+  };
+  coverageLedger.set(update.coverageId, next);
+  return next;
+}
+
+// ═══════════════════════════════════════════════════════════
 // HEDGE LEDGER PERSISTENCE
 // ═══════════════════════════════════════════════════════════
 
@@ -470,6 +563,34 @@ type CoverageRecord = {
   positions: CoveragePosition[];
 };
 
+type CoverageLedgerEntry = {
+  coverageId: string;
+  expiryIso: string;
+  positions: CoveragePosition[];
+  accountId?: string | null;
+  tier?: string | null;
+  autoRenew?: boolean;
+  selectedVenue?: string | null;
+  hedgeInstrument?: string | null;
+  hedgeSize?: number | null;
+  hedgeType?: "option" | "perp" | null;
+  optionType?: "put" | "call" | null;
+  strike?: number | null;
+  notionalUsdc?: number | null;
+  floorUsd?: number | null;
+  equityUsd?: number | null;
+  markSource?: "bybit" | "deribit" | null;
+  mtmAttribution?: "position" | "net" | null;
+  lastMtm?: {
+    bufferUsdc?: string;
+    coverageRatio?: string;
+    ts?: string;
+  } | null;
+  expiredAt?: string;
+  status?: "active" | "expired";
+  updatedAt: string;
+};
+
 type QuoteBookSnapshot = {
   venue: string;
   instrument: string;
@@ -491,6 +612,7 @@ type PortfolioExposure = {
 };
 
 const activeCoverages = new Map<string, CoverageRecord>();
+const coverageLedger = new Map<string, CoverageLedgerEntry>();
 const portfolioSnapshots = new Map<string, { positions: PortfolioExposure[]; updatedAt: string }>();
 const hedgeLedger = new Map<string, { size: Decimal; avgCostUsdc: Decimal }>();
 let realizedHedgePnlUsdc = new Decimal(0);
@@ -501,6 +623,28 @@ function parseInstrumentAsset(instrument: string): string | null {
   const parts = instrument.split("-");
   if (parts.length >= 1) return parts[0] || null;
   return null;
+}
+
+function inferVenueFromInstrument(instrument?: string | null): "bybit" | "deribit" | null {
+  if (!instrument) return null;
+  if (instrument.endsWith("-USDT")) return "bybit";
+  return "deribit";
+}
+
+function parseOptionInstrument(
+  instrument?: string | null
+): { strike: number | null; optionType: "put" | "call" | null } {
+  if (!instrument) return { strike: null, optionType: null };
+  const parts = instrument.split("-");
+  if (parts.length < 4) return { strike: null, optionType: null };
+  const strikeValue = Number(parts[2]);
+  const rawType = parts[3]?.toUpperCase();
+  const optionType =
+    rawType === "P" ? "put" : rawType === "C" ? "call" : null;
+  return {
+    strike: Number.isFinite(strikeValue) ? strikeValue : null,
+    optionType
+  };
 }
 
 async function computeUnrealizedHedgeMetrics(): Promise<{
@@ -552,6 +696,257 @@ async function computeUnrealizedHedgeMetrics(): Promise<{
     unrealized = unrealized.add(pnl);
   }
   return { unrealizedHedgePnlUsdc: unrealized, hedgeNotionalUsdc: hedgeNotional };
+}
+
+async function fetchSpotPrice(asset: string): Promise<Decimal | null> {
+  try {
+    const index = await deribit.getIndexPrice(`${asset.toLowerCase()}_usd`);
+    const spot = Number((index as any)?.result?.index_price ?? 0);
+    if (!Number.isFinite(spot) || spot <= 0) return null;
+    return new Decimal(spot);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchDeribitOptionMarkUsdc(
+  instrument: string,
+  spotPrice: Decimal
+): Promise<Decimal | null> {
+  try {
+    const ticker = await deribit.getTicker(instrument);
+    const result = (ticker as any)?.result || {};
+    const markUsd = Number(result?.mark_price_usd ?? 0);
+    if (Number.isFinite(markUsd) && markUsd > 0) {
+      return new Decimal(markUsd);
+    }
+    const markBtc = Number(result?.mark_price ?? 0);
+    if (Number.isFinite(markBtc) && markBtc > 0) {
+      return new Decimal(markBtc).mul(spotPrice);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchBybitOptionMarkUsdc(instrument: string): Promise<Decimal | null> {
+  try {
+    const expiryTag = deriveExpiryTag(instrument);
+    const expiryDate = expiryTag ? parseExpiryTagToDate(expiryTag) : null;
+    const asset = parseInstrumentAsset(instrument);
+    const optionMeta = parseOptionInstrument(instrument);
+    if (!expiryDate || !asset || !optionMeta.optionType || !optionMeta.strike) return null;
+    const optionSymbol = optionMeta.optionType === "put" ? "P" : "C";
+    const book = await getBybitOrderbook(asset, optionMeta.strike, expiryDate, optionSymbol);
+    if (!book) return null;
+    const bid = Number(book.bid || 0);
+    const ask = Number(book.ask || 0);
+    if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
+      return new Decimal(bid).add(new Decimal(ask)).div(2);
+    }
+    if (Number.isFinite(ask) && ask > 0) return new Decimal(ask);
+    if (Number.isFinite(bid) && bid > 0) return new Decimal(bid);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchCoverageOptionMarkUsdc(
+  venue: string | null,
+  instrument: string,
+  spotPrice: Decimal
+): Promise<Decimal | null> {
+  if (venue === "bybit") {
+    return fetchBybitOptionMarkUsdc(instrument);
+  }
+  return fetchDeribitOptionMarkUsdc(instrument, spotPrice);
+}
+
+function shouldLogMtmUpdate(params: {
+  entry: CoverageLedgerEntry;
+  bufferUsdc: Decimal;
+  bufferPct: Decimal;
+  coverageRatio?: Decimal | null;
+  lastBufferPct?: Decimal | null;
+}): boolean {
+  const lastBuffer = params.entry.lastMtm?.bufferUsdc
+    ? new Decimal(params.entry.lastMtm.bufferUsdc)
+    : null;
+  const lastCoverage = params.entry.lastMtm?.coverageRatio
+    ? new Decimal(params.entry.lastMtm.coverageRatio)
+    : null;
+  if (!lastBuffer) return true;
+  const bufferDelta = params.bufferUsdc.minus(lastBuffer).abs();
+  if (bufferDelta.greaterThanOrEqualTo(MTM_BUFFER_THRESHOLD_USDC)) return true;
+  if (params.lastBufferPct) {
+    const pctDelta = params.bufferPct.minus(params.lastBufferPct).abs();
+    if (pctDelta.greaterThanOrEqualTo(MTM_BUFFER_THRESHOLD_PCT)) return true;
+  }
+  if (params.coverageRatio && lastCoverage) {
+    const ratioDelta = params.coverageRatio.minus(lastCoverage).abs();
+    if (ratioDelta.greaterThanOrEqualTo(MTM_COVERAGE_RATIO_THRESHOLD)) return true;
+  }
+  if (params.bufferUsdc.isNegative() && lastBuffer.greaterThanOrEqualTo(0)) return true;
+  return false;
+}
+
+async function markCoverageExpired(coverageId: string, expiryIso: string): Promise<void> {
+  const existing = coverageLedger.get(coverageId);
+  if (existing?.status === "expired") return;
+  const expiredAt = new Date().toISOString();
+  upsertCoverageLedger({
+    coverageId,
+    expiryIso,
+    status: "expired",
+    expiredAt
+  });
+  await saveCoverageLedger();
+  await audit("coverage_expired", {
+    coverageId,
+    expiryIso,
+    expiredAt,
+    selectedVenue: existing?.selectedVenue ?? null
+  });
+}
+
+async function computeCoverageMtmSnapshots(): Promise<void> {
+  const now = Date.now();
+  const spotCache = new Map<string, Decimal>();
+  for (const entry of coverageLedger.values()) {
+    if (!entry.positions || entry.positions.length === 0) continue;
+    const expiryMs = Date.parse(entry.expiryIso);
+    if (Number.isFinite(expiryMs) && expiryMs <= now) {
+      await markCoverageExpired(entry.coverageId, entry.expiryIso);
+      continue;
+    }
+    const asset = entry.positions[0].asset || "BTC";
+    if (!spotCache.has(asset)) {
+      const spot = await fetchSpotPrice(asset);
+      if (spot) spotCache.set(asset, spot);
+    }
+    const spotPrice = spotCache.get(asset);
+    if (!spotPrice) continue;
+    const totalNotional = entry.positions.reduce((acc, pos) => {
+      const notional = new Decimal(pos.marginUsd || 0).mul(new Decimal(pos.leverage || 1));
+      return acc.add(notional);
+    }, new Decimal(0));
+    const hedgeSize = entry.hedgeSize ? new Decimal(entry.hedgeSize) : new Decimal(0);
+    const hedgeVenue =
+      entry.markSource ?? entry.selectedVenue ?? inferVenueFromInstrument(entry.hedgeInstrument);
+    let hedgeMtmTotal = new Decimal(0);
+    if (
+      entry.hedgeType === "option" &&
+      entry.hedgeInstrument &&
+      hedgeSize.gt(0) &&
+      hedgeVenue
+    ) {
+      const mark = await fetchCoverageOptionMarkUsdc(
+        hedgeVenue,
+        entry.hedgeInstrument,
+        spotPrice
+      );
+      if (mark) hedgeMtmTotal = mark.mul(hedgeSize);
+    }
+    const drawdownFloorPct =
+      entry.equityUsd && entry.floorUsd && entry.equityUsd > 0
+        ? new Decimal(1).minus(new Decimal(entry.floorUsd).div(entry.equityUsd))
+        : new Decimal(0.2);
+    const survivalTolerance = new Decimal(riskControls.survival_tolerance_pct ?? 0.98);
+
+    for (const position of entry.positions) {
+      const margin = new Decimal(position.marginUsd || 0);
+      const leverage = new Decimal(position.leverage || 1);
+      const entryPrice = new Decimal(position.entryPrice || 0);
+      if (margin.lte(0) || leverage.lte(0) || entryPrice.lte(0)) continue;
+      const notional = margin.mul(leverage);
+      const sizeUnits = notional.div(entryPrice);
+      const pnl =
+        position.side === "short"
+          ? entryPrice.minus(spotPrice).mul(sizeUnits)
+          : spotPrice.minus(entryPrice).mul(sizeUnits);
+      const hedgeShare = totalNotional.gt(0) ? notional.div(totalNotional) : new Decimal(1);
+      const hedgeMtm = hedgeMtmTotal.mul(hedgeShare);
+      const equityUsdc = margin.add(pnl).add(hedgeMtm);
+      const drawdownLimitUsdc = margin.mul(new Decimal(1).minus(drawdownFloorPct));
+      const bufferUsdc = equityUsdc.minus(drawdownLimitUsdc);
+      const bufferPct = margin.gt(0) ? bufferUsdc.div(margin) : new Decimal(0);
+      const lastBuffer = entry.lastMtm?.bufferUsdc
+        ? new Decimal(entry.lastMtm.bufferUsdc)
+        : null;
+      const lastBufferPct =
+        entry.lastMtm?.bufferUsdc && margin.gt(0)
+          ? new Decimal(entry.lastMtm.bufferUsdc).div(margin)
+          : null;
+      const hedgedSize = hedgeSize.mul(hedgeShare);
+      const survivalCheck = buildSurvivalCheck({
+        spotPrice,
+        drawdownFloorPct,
+        optionType: entry.optionType ?? "put",
+        strike: entry.strike ? new Decimal(entry.strike) : null,
+        hedgeSize: hedgedSize,
+        requiredSize: sizeUnits,
+        tolerancePct: survivalTolerance
+      });
+      const coverageRatio = survivalCheck?.coverageRatio
+        ? new Decimal(survivalCheck.coverageRatio)
+        : null;
+      if (bufferUsdc.isNegative() && (!lastBuffer || lastBuffer.greaterThanOrEqualTo(0))) {
+        await audit("demo_credit", {
+          coverageId: entry.coverageId,
+          positionId: position.id,
+          creditUsdc: bufferUsdc.abs().toFixed(2),
+          bufferUsdc: bufferUsdc.toFixed(2),
+          equityUsdc: equityUsdc.toFixed(2),
+          hedgeInstrument: entry.hedgeInstrument ?? null,
+          hedgeVenue,
+          mtmAttribution: entry.mtmAttribution ?? "position"
+        });
+      }
+      const shouldLog = shouldLogMtmUpdate({
+        entry,
+        bufferUsdc,
+        bufferPct,
+        coverageRatio,
+        lastBufferPct
+      });
+      if (!shouldLog) continue;
+      await audit("mtm_position", {
+        coverageId: entry.coverageId,
+        positionId: position.id,
+        asset: position.asset,
+        side: position.side,
+        entryPrice: entryPrice.toFixed(2),
+        leverage: leverage.toFixed(2),
+        marginUsd: margin.toFixed(2),
+        spotPrice: spotPrice.toFixed(2),
+        positionPnlUsdc: pnl.toFixed(2),
+        hedgeMtmUsdc: hedgeMtm.toFixed(2),
+        equityUsdc: equityUsdc.toFixed(2),
+        drawdownLimitUsdc: drawdownLimitUsdc.toFixed(2),
+        drawdownBufferUsdc: bufferUsdc.toFixed(2),
+        drawdownBufferPct: bufferPct.mul(100).toFixed(2),
+        coverageRatio: coverageRatio ? coverageRatio.toFixed(4) : null,
+        hedgeInstrument: entry.hedgeInstrument ?? null,
+        hedgeVenue,
+        hedgeSize: hedgedSize.toFixed(6),
+        optionType: entry.optionType ?? null,
+        strike: entry.strike ?? null,
+        floorPrice: survivalCheck?.floorPrice ?? null,
+        mtmAttribution: entry.mtmAttribution ?? "position"
+      });
+      upsertCoverageLedger({
+        coverageId: entry.coverageId,
+        lastMtm: {
+          bufferUsdc: bufferUsdc.toFixed(2),
+          coverageRatio: coverageRatio ? coverageRatio.toFixed(4) : undefined,
+          ts: new Date().toISOString()
+        }
+      });
+      await saveCoverageLedger();
+    }
+  }
 }
 
 function calculateCoverageStatus(
@@ -1123,6 +1518,9 @@ app.get("/coverage/active", async (req) => {
       active.push(coverage);
     } else {
       activeCoverages.delete(key);
+      if (Number.isFinite(expiryMs)) {
+        await markCoverageExpired(key, coverage.expiryIso);
+      }
     }
   }
 
@@ -2274,6 +2672,10 @@ app.post("/deribit/order", async (req) => {
     inferredHedgeType === "perp" && hedgeNotionalUsdc && body.leverage
       ? hedgeNotionalUsdc / Number(body.leverage)
       : 0;
+  const optionMeta = parseOptionInstrument(instrument);
+  const resolvedOptionType =
+    (body as any).optionType ?? optionMeta.optionType ?? null;
+  const resolvedStrike = optionMeta.strike ?? null;
   const executed = status === "paper_filled" || status === "filled" || status === "ok";
   if (executed && fillPriceUsdc) {
     const sizeDelta = new Decimal(filledAmount).mul(body.side === "buy" ? 1 : -1);
@@ -2283,6 +2685,20 @@ app.post("/deribit/order", async (req) => {
       fillPriceUsdc
     });
     await saveHedgeLedger();
+  }
+  if (body.coverageId) {
+    upsertCoverageLedger({
+      coverageId: body.coverageId,
+      hedgeInstrument: instrument,
+      hedgeSize: Number.isFinite(filledAmount) ? filledAmount : body.amount,
+      hedgeType: inferredHedgeType === "option" ? "option" : "perp",
+      optionType: resolvedOptionType,
+      strike: resolvedStrike,
+      selectedVenue: venue,
+      markSource: venue === "bybit" || venue === "deribit" ? venue : null,
+      notionalUsdc: body.notionalUsdc ?? null
+    });
+    await saveCoverageLedger();
   }
   await audit("hedge_order", {
     instrument: body.instrument,
@@ -2303,6 +2719,7 @@ app.post("/deribit/order", async (req) => {
     floorPrice: body.floorPrice ?? null,
     hedgeNotionalUsdc,
     hedgeMarginUsdc,
+    venue,
     bestBid: (response as any)?.bestBid ?? null,
     bestAsk: (response as any)?.bestAsk ?? null,
     availableSize: (response as any)?.availableSize ?? null
@@ -4764,7 +5181,17 @@ app.post("/put/auto-renew", async (req) => {
     coverageId?: string;
     accountId?: string;
     allowPremiumPassThrough?: boolean;
+    autoRenew?: boolean;
   };
+
+  if (body.autoRenew === false) {
+    const response = { status: "disabled", reason: "auto_renew_off" };
+    await audit("put_renew_skipped", {
+      coverageId: body.coverageId ?? null,
+      reason: "auto_renew_off"
+    });
+    return response;
+  }
 
   if (body.expiryIso && body.renewWindowMinutes) {
     const expiry = new Date(body.expiryIso);
@@ -5176,12 +5603,15 @@ app.post("/put/auto-renew", async (req) => {
   }
 
   const optionSymbol = optionType === "put" ? "P" : "C";
-  const optionInstrument = buildVenueInstrumentName(
-    asset,
-    effectiveExpiryTag,
-    (effectiveStrike ?? new Decimal(0)).toFixed(0),
-    optionSymbol
-  );
+  const plannedInstrument = chosenExecutionPlans?.[0]?.instrument;
+  const optionInstrument =
+    plannedInstrument ??
+    buildVenueInstrumentName(
+      asset,
+      effectiveExpiryTag,
+      (effectiveStrike ?? new Decimal(0)).toFixed(0),
+      optionSymbol
+    );
 
   const desiredAmount = effectiveSize.mul(hedgeFactor);
   const cappedAmount = capHedgeSize(desiredAmount, effectiveAvailableSize ?? undefined);
@@ -5198,7 +5628,8 @@ app.post("/put/auto-renew", async (req) => {
   if (finalSurvivalCheck) {
     renewalSurvivalCheck = finalSurvivalCheck;
   }
-  const renewVenue = venueConfig.mode === "bybit_only" ? "bybit" : "deribit";
+  const renewVenue =
+    chosenExecutionPlans?.[0]?.venue ?? (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
   const renewInstrument =
     renewVenue === "bybit" && !optionInstrument.endsWith("-USDT")
       ? `${optionInstrument}-USDT`
@@ -5282,7 +5713,7 @@ app.post("/put/auto-renew", async (req) => {
     feeUsdc,
     subsidyUsdc: subsidyUsdc.toFixed(2),
     reason: renewReason,
-    venue: "deribit"
+    venue: renewVenue
   });
   if (renewStatus === "paper_filled" || renewStatus === "filled" || renewStatus === "ok") {
     const accounting = applyRiskAccounting(
@@ -5305,9 +5736,29 @@ app.post("/put/auto-renew", async (req) => {
       recordSubsidy(tierName, body.accountId || null, subsidyUsdc.toNumber());
     }
   }
+  const renewExecuted =
+    renewStatus === "paper_filled" || renewStatus === "filled" || renewStatus === "ok";
+  const expiryDate = effectiveExpiryTag ? parseExpiryTagToDate(effectiveExpiryTag) : null;
+  const renewalExpiryIso = expiryDate ? expiryDate.toISOString() : body.expiryIso || "";
+  if (body.coverageId && renewExecuted) {
+    upsertCoverageLedger({
+      coverageId: body.coverageId,
+      expiryIso: renewalExpiryIso,
+      hedgeInstrument: renewInstrument,
+      hedgeSize: cappedAmount.toNumber(),
+      hedgeType: "option",
+      optionType,
+      strike: effectiveStrike ? Number(effectiveStrike.toFixed(0)) : null,
+      selectedVenue: renewVenue,
+      markSource: renewVenue === "bybit" || renewVenue === "deribit" ? renewVenue : null,
+      autoRenew: true,
+      status: "active"
+    });
+    await saveCoverageLedger();
+  }
   await audit("coverage_renewed", {
     tier: tierName,
-    expiryIso: body.expiryIso,
+    expiryIso: renewalExpiryIso || body.expiryIso,
     instrument: optionInstrument,
     coverageId: body.coverageId || null
   });
@@ -5356,6 +5807,8 @@ app.post("/loop/tick", async (req) => {
     notionalUsdc?: number;
     hedgeType?: string;
     tierName?: string;
+    selectedVenue?: string;
+    autoRenew?: boolean;
     assets?: string[];
     spotByAsset?: Record<string, number>;
     exposures?: Array<{
@@ -5389,12 +5842,19 @@ app.post("/loop/tick", async (req) => {
   };
 
   const coverage = body.coverageId ? activeCoverages.get(body.coverageId) : null;
+  if (body.coverageId && typeof body.autoRenew === "boolean") {
+    const existing = coverageLedger.get(body.coverageId);
+    if (!existing || existing.autoRenew !== body.autoRenew) {
+      upsertCoverageLedger({ coverageId: body.coverageId, autoRenew: body.autoRenew });
+      await saveCoverageLedger();
+    }
+  }
   const inferredPositionSide =
     body.positionSide || (coverage?.positions?.[0]?.side as "long" | "short" | undefined) || "long";
   const inferredOptionType = body.optionType || (inferredPositionSide === "short" ? "call" : "put");
   const inferredHedgeType = body.hedgeType || "option";
 
-  const decision = evaluateRollingHedge({
+  let decision = evaluateRollingHedge({
     bufferPct: new Decimal(riskPayload.drawdownBufferPct).div(100),
     hedgeState: {
       bufferTargetPct: new Decimal(body.bufferTargetPct),
@@ -5406,6 +5866,22 @@ app.post("/loop/tick", async (req) => {
     currentOptionType: inferredOptionType,
     hedgeType: inferredHedgeType
   });
+  const ledgerAutoRenew = body.coverageId
+    ? coverageLedger.get(body.coverageId)?.autoRenew
+    : undefined;
+  const autoRenewEnabled =
+    body.autoRenew !== undefined ? body.autoRenew : ledgerAutoRenew ?? true;
+  if (!autoRenewEnabled && decision.renew) {
+    await audit("put_renew_skipped", {
+      coverageId: body.coverageId ?? null,
+      reason: "auto_renew_off"
+    });
+    decision = {
+      ...decision,
+      renew: false,
+      reason: "auto_renew_off"
+    };
+  }
 
   const hedgeCooldownMs = riskControls.hedge_action_cooldown_ms ?? 60000;
   const minHedgeNotional = riskControls.min_hedge_notional_usdc ?? 0;
@@ -5420,7 +5896,7 @@ app.post("/loop/tick", async (req) => {
     notionalUsdc > 0 &&
     notionalUsdc < minHedgeNotional;
 
-  let renewalResult: unknown = { status: "skipped" };
+  let renewalResult: unknown = { status: autoRenewEnabled ? "skipped" : "disabled" };
   if (decision.renew) {
     renewalResult = await runAutoRenewJob(
       {
@@ -5462,7 +5938,17 @@ app.post("/loop/tick", async (req) => {
       positionSide: inferredPositionSide,
       recommendedSide: decision.recommendedSide
     });
-    const hedgeVenue = venueConfig.mode === "bybit_only" ? "bybit" : "deribit";
+    const selectedVenue =
+      typeof body.selectedVenue === "string" ? body.selectedVenue : null;
+    const ledgerVenue = body.coverageId
+      ? coverageLedger.get(body.coverageId)?.selectedVenue
+      : null;
+    const inferredVenue = inferVenueFromInstrument(body.hedgeInstrument);
+    const hedgeVenue =
+      selectedVenue ||
+      ledgerVenue ||
+      inferredVenue ||
+      (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
     const hedgeInstrument =
       hedgeVenue === "bybit" &&
       typeof body.hedgeInstrument === "string" &&
@@ -5974,6 +6460,22 @@ app.post("/audit/export", async (req) => {
   const positions = Array.isArray((body as any).portfolio?.positions)
     ? ((body as any).portfolio.positions as CoveragePosition[])
     : [];
+  const hedge = ((body as any).hedge as Record<string, unknown> | undefined) ?? {};
+  const hedgeInstrument = typeof hedge.instrument === "string" ? hedge.instrument : null;
+  const hedgeVenue =
+    typeof (body as any).selectedVenue === "string"
+      ? String((body as any).selectedVenue)
+      : typeof hedge.venue === "string"
+        ? String(hedge.venue)
+        : inferVenueFromInstrument(hedgeInstrument);
+  const hedgeSize =
+    hedge.hedgeSize !== undefined && hedge.hedgeSize !== null ? Number(hedge.hedgeSize) : null;
+  const hedgeType =
+    typeof hedge.hedgeType === "string" ? (hedge.hedgeType as "option" | "perp") : null;
+  const optionType =
+    typeof hedge.optionType === "string" ? (hedge.optionType as "put" | "call") : null;
+  const strikeValue =
+    hedge.strike !== undefined && hedge.strike !== null ? Number(hedge.strike) : null;
   if (coverageIdValue && expiryValue && positions.length > 0) {
     activeCoverages.set(coverageIdValue, {
       coverageId: coverageIdValue,
@@ -5981,6 +6483,29 @@ app.post("/audit/export", async (req) => {
       positions
     });
     await saveCoverages();
+  }
+  if (coverageIdValue) {
+    const entry = upsertCoverageLedger({
+      coverageId: coverageIdValue,
+      expiryIso: expiryValue || "",
+      positions,
+      accountId: (body as any).accountId ?? null,
+      tier: tierName,
+      autoRenew: (body as any).autoRenew ?? undefined,
+      selectedVenue: hedgeVenue,
+      hedgeInstrument,
+      hedgeSize,
+      hedgeType,
+      optionType,
+      strike: Number.isFinite(strikeValue) ? strikeValue : null,
+      notionalUsdc: Number((body as any).notionalUsdc ?? 0) || null,
+      floorUsd: Number((body as any).floorUsd ?? 0) || null,
+      equityUsd: Number((body as any).equityUsd ?? 0) || null,
+      markSource: hedgeVenue === "bybit" || hedgeVenue === "deribit" ? hedgeVenue : null,
+      mtmAttribution: "position"
+    });
+    await saveCoverageLedger();
+    (body as any).selectedVenue = entry.selectedVenue ?? (body as any).selectedVenue ?? null;
   }
   if (feeUsd > 0) {
     const accounting = recordRevenue(tierName, feeUsd);
@@ -5994,15 +6519,82 @@ app.post("/audit/export", async (req) => {
       totals: liquiditySummary()
     });
   }
-  await audit("coverage_activated", body);
+  const coveragePayload = {
+    ...body,
+    selectedVenue: (body as any).selectedVenue ?? hedgeVenue ?? null,
+    hedge: {
+      ...hedge,
+      instrument: hedgeInstrument ?? hedge.instrument ?? null,
+      hedgeSize: hedgeSize ?? hedge.hedgeSize ?? null,
+      hedgeType: hedgeType ?? hedge.hedgeType ?? null,
+      optionType: optionType ?? hedge.optionType ?? null,
+      strike: Number.isFinite(strikeValue) ? strikeValue : hedge.strike ?? null,
+      venue: hedgeVenue ?? hedge.venue ?? null
+    }
+  };
+  const ledgerEntry = coverageIdValue ? coverageLedger.get(coverageIdValue) : null;
+  if (ledgerEntry) {
+    const issues: Array<{ field: string; expected: unknown; received: unknown }> = [];
+    if (
+      ledgerEntry.hedgeInstrument &&
+      hedgeInstrument &&
+      ledgerEntry.hedgeInstrument !== hedgeInstrument
+    ) {
+      issues.push({
+        field: "hedgeInstrument",
+        expected: ledgerEntry.hedgeInstrument,
+        received: hedgeInstrument
+      });
+    }
+    if (
+      ledgerEntry.selectedVenue &&
+      coveragePayload.selectedVenue &&
+      ledgerEntry.selectedVenue !== coveragePayload.selectedVenue
+    ) {
+      issues.push({
+        field: "selectedVenue",
+        expected: ledgerEntry.selectedVenue,
+        received: coveragePayload.selectedVenue
+      });
+    }
+    if (
+      ledgerEntry.hedgeSize !== null &&
+      ledgerEntry.hedgeSize !== undefined &&
+      hedgeSize !== null &&
+      hedgeSize !== undefined
+    ) {
+      const sizeDelta = Math.abs(ledgerEntry.hedgeSize - hedgeSize);
+      if (sizeDelta > 1e-6) {
+        issues.push({
+          field: "hedgeSize",
+          expected: ledgerEntry.hedgeSize,
+          received: hedgeSize
+        });
+      }
+    }
+    if (issues.length > 0) {
+      await audit("audit_validation_failed", {
+        coverageId: coverageIdValue,
+        issues,
+        selectedVenue: coveragePayload.selectedVenue ?? null
+      });
+    }
+  }
+  await audit("coverage_activated", coveragePayload);
   return { status: "ok", file: name };
 });
 
 app.post("/admin/reset", async () => {
   const cleared = await clearAuditLogs();
   activeCoverages.clear();
+  coverageLedger.clear();
   portfolioSnapshots.clear();
   resetRiskState();
+  try {
+    await rm(COVERAGE_LEDGER_PATH, { force: true });
+  } catch {
+    // ignore
+  }
   return {
     status: "ok",
     clearedFiles: cleared.cleared
@@ -6170,6 +6762,11 @@ const bootstrapState = async () => {
     console.error("Failed to load coverages:", error);
   }
   try {
+    await loadCoverageLedger();
+  } catch (error) {
+    console.error("Failed to load coverage ledger:", error);
+  }
+  try {
     await loadHedgeLedger();
   } catch (error) {
     console.error("Failed to load hedge ledger:", error);
@@ -6213,6 +6810,7 @@ if (MTM_INTERVAL_MS > 0) {
           )}&cashUsdc=${encodeURIComponent(account.initialBalanceUsdc)}`
         });
       }
+      await computeCoverageMtmSnapshots();
     } catch (err) {
       app.log.error(err);
     }
