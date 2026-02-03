@@ -123,8 +123,8 @@ export function AuditDashboard({
   // ═══════════════════════════════════════════════════════════
   // CEO AUDIT EVENTS FILTER
   // Must match CEO_AUDIT_EVENTS in services/api/src/server.ts
-  // Last synced: 2026-01-31
-  // Count: 13 events
+  // Last synced: 2026-02-03
+  // Count: 16 events
   // ═══════════════════════════════════════════════════════════
   const allowedEvents = new Set([
     "coverage_activated",
@@ -134,6 +134,9 @@ export function AuditDashboard({
     "liquidity_update",
     "hedge_order",
     "hedge_action",
+    "mtm_position",
+    "mtm_credit",
+    "demo_credit",
     "put_quote_failed",
     "put_renew_failed",
     "option_exec_failed",
@@ -371,6 +374,12 @@ export function AuditDashboard({
               <span>Notional</span>
               <span>Hedge Spend</span>
               <span>Projected Payout</span>
+              <span>MTM Equity</span>
+              <span>Position PnL</span>
+              <span>Hedge MTM</span>
+              <span>Buffer</span>
+              <span>Credit</span>
+              <span>Coverage %</span>
               <span>Liquidity Δ</span>
             </div>
             {limitedEntries.length === 0 && (
@@ -392,6 +401,12 @@ export function AuditDashboard({
               extractField(entry, "hedgeMarginUsdc") ??
               extractField(entry, "premiumUsdc") ??
               extractField(entry, "hedgeNotionalUsdc");
+            const mtmEquity = extractField(entry, "equityUsdc");
+            const positionPnl = extractField(entry, "positionPnlUsdc");
+            const hedgeMtm = extractField(entry, "hedgeMtmUsdc");
+            const bufferUsdc = extractField(entry, "drawdownBufferUsdc");
+            const creditUsdc = extractField(entry, "creditUsdc");
+            const coverageRatio = extractField(entry, "coverageRatio");
             const floorPrice = extractField(entry, "floorPrice");
             const optionType =
               String(extractField(entry, "optionType") || parsedInstrument?.optionType || "")
@@ -448,6 +463,36 @@ export function AuditDashboard({
                 </span>
                 <span title={projectedPayout !== null ? `$${projectedPayout}` : "—"}>
                   {projectedPayout !== null ? `$${formatSmall(projectedPayout)}` : "—"}
+                </span>
+                <span title={mtmEquity !== null && mtmEquity !== undefined ? `$${mtmEquity}` : "—"}>
+                  {mtmEquity !== null && mtmEquity !== undefined
+                    ? `$${formatSmall(Number(mtmEquity))}`
+                    : "—"}
+                </span>
+                <span title={positionPnl !== null && positionPnl !== undefined ? `$${positionPnl}` : "—"}>
+                  {positionPnl !== null && positionPnl !== undefined
+                    ? `$${formatSmall(Number(positionPnl))}`
+                    : "—"}
+                </span>
+                <span title={hedgeMtm !== null && hedgeMtm !== undefined ? `$${hedgeMtm}` : "—"}>
+                  {hedgeMtm !== null && hedgeMtm !== undefined
+                    ? `$${formatSmall(Number(hedgeMtm))}`
+                    : "—"}
+                </span>
+                <span title={bufferUsdc !== null && bufferUsdc !== undefined ? `$${bufferUsdc}` : "—"}>
+                  {bufferUsdc !== null && bufferUsdc !== undefined
+                    ? `$${formatSmall(Number(bufferUsdc))}`
+                    : "—"}
+                </span>
+                <span title={creditUsdc !== null && creditUsdc !== undefined ? `$${creditUsdc}` : "—"}>
+                  {creditUsdc !== null && creditUsdc !== undefined
+                    ? `$${formatSmall(Number(creditUsdc))}`
+                    : "—"}
+                </span>
+                <span title={coverageRatio !== null && coverageRatio !== undefined ? String(coverageRatio) : "—"}>
+                  {coverageRatio !== null && coverageRatio !== undefined
+                    ? `${(Number(coverageRatio) * 100).toFixed(2)}%`
+                    : "—"}
                 </span>
                 <span title={deltaValue !== null && deltaValue !== undefined ? String(deltaValue) : "—"}>
                   {deltaValue !== null && deltaValue !== undefined
@@ -705,6 +750,14 @@ export function AuditDashboard({
                   <div className="glossary-term">
                     <dt>mtm_credit</dt>
                     <dd>Equity update that includes hedge MTM contribution.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>mtm_position</dt>
+                    <dd>Per-position MTM snapshot with buffer and coverage ratio.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>demo_credit</dt>
+                    <dd>Simulated margin credit issued when buffer breaches floor.</dd>
                   </div>
                   <div className="glossary-term">
                     <dt>put_quote_failed</dt>

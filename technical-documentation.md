@@ -95,6 +95,7 @@ Lightweight interval runner inside `server.ts`:
 ⚠️ **NOT IMPLEMENTED** — file-based JSON persistence:
 - `logs/audit.log` (JSONL)
 - `logs/coverages.json` (active coverage records)
+- `logs/coverage-ledger.json` (coverage + venue + MTM attribution)
 - `logs/hedge-ledger.json` (hedge positions + realized PnL)
 
 No migrations, no RDBMS schemas, no connection pooling.
