@@ -57,6 +57,13 @@ export interface RiskControlsConfig {
   enable_premium_pass_through?: boolean;
   require_user_opt_in_for_pass_through?: boolean;
   pass_through_min_notification_ratio?: number;
+  intermittent_analytics_enabled?: boolean;
+  intermittent_selection_shadow_enabled?: boolean;
+  intermittent_selection_live_enabled?: boolean;
+  intermittent_profit_threshold_enabled?: boolean;
+  intermittent_profit_min_improvement_usdc?: number;
+  intermittent_profit_min_improvement_ratio?: number;
+  intermittent_profit_critical_buffer_pct?: number;
   coverage_override_tiers?: string[];
   duration_fee_per_day_pct?: number;
   duration_fee_max_pct?: number;
@@ -144,6 +151,13 @@ const DEFAULTS: RiskControlsConfig = {
   enable_premium_pass_through: true,
   require_user_opt_in_for_pass_through: false,
   pass_through_min_notification_ratio: 1.5,
+  intermittent_analytics_enabled: false,
+  intermittent_selection_shadow_enabled: false,
+  intermittent_selection_live_enabled: false,
+  intermittent_profit_threshold_enabled: false,
+  intermittent_profit_min_improvement_usdc: 0,
+  intermittent_profit_min_improvement_ratio: 0,
+  intermittent_profit_critical_buffer_pct: 0.02,
   coverage_override_tiers: ["Pro (Gold)", "Pro (Platinum)"],
   duration_fee_per_day_pct: 0.04,
   duration_fee_max_pct: 0.6,

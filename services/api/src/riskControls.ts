@@ -67,6 +67,13 @@ export interface RiskControlsConfig {
   enable_premium_pass_through?: boolean;
   require_user_opt_in_for_pass_through?: boolean;
   pass_through_min_notification_ratio?: number;
+  intermittent_analytics_enabled?: boolean;
+  intermittent_selection_shadow_enabled?: boolean;
+  intermittent_selection_live_enabled?: boolean;
+  intermittent_profit_threshold_enabled?: boolean;
+  intermittent_profit_min_improvement_usdc?: number;
+  intermittent_profit_min_improvement_ratio?: number;
+  intermittent_profit_critical_buffer_pct?: number;
   premium_markup_pct_by_tier?: Record<string, number>;
   leverage_markup_pct_by_x?: Record<string, number>;
   drift_tolerance_pct_by_tier?: Record<string, number>;
@@ -167,6 +174,13 @@ const DEFAULTS: RiskControlsConfig = {
   enable_premium_pass_through: true,
   require_user_opt_in_for_pass_through: false,
   pass_through_min_notification_ratio: 1.5,
+  intermittent_analytics_enabled: false,
+  intermittent_selection_shadow_enabled: false,
+  intermittent_selection_live_enabled: false,
+  intermittent_profit_threshold_enabled: false,
+  intermittent_profit_min_improvement_usdc: 0,
+  intermittent_profit_min_improvement_ratio: 0,
+  intermittent_profit_critical_buffer_pct: 0.02,
   premium_markup_pct_by_tier: {},
   leverage_markup_pct_by_x: {},
   drift_tolerance_pct_by_tier: {},

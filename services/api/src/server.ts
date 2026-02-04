@@ -6250,8 +6250,9 @@ app.post("/loop/tick", async (req) => {
   const inferredOptionType = body.optionType || (inferredPositionSide === "short" ? "call" : "put");
   const inferredHedgeType = body.hedgeType || "option";
 
+  const bufferPct = new Decimal(riskPayload.drawdownBufferPct).div(100);
   let decision = evaluateRollingHedge({
-    bufferPct: new Decimal(riskPayload.drawdownBufferPct).div(100),
+    bufferPct,
     hedgeState: {
       bufferTargetPct: new Decimal(body.bufferTargetPct),
       hysteresisPct: new Decimal(body.hysteresisPct)
@@ -6292,6 +6293,16 @@ app.post("/loop/tick", async (req) => {
     notionalUsdc > 0 &&
     notionalUsdc < minHedgeNotional;
 
+  const intermittentConfig = {
+    analytics: riskControls.intermittent_analytics_enabled ?? false,
+    selectionShadow: riskControls.intermittent_selection_shadow_enabled ?? false,
+    selectionLive: riskControls.intermittent_selection_live_enabled ?? false,
+    profitThresholds: riskControls.intermittent_profit_threshold_enabled ?? false,
+    profitMinImprovementUsdc: riskControls.intermittent_profit_min_improvement_usdc ?? 0,
+    profitMinImprovementRatio: riskControls.intermittent_profit_min_improvement_ratio ?? 0,
+    profitCriticalBufferPct: riskControls.intermittent_profit_critical_buffer_pct ?? 0
+  };
+
   let renewalResult: unknown = { status: autoRenewEnabled ? "skipped" : "disabled" };
   if (decision.renew) {
     renewalResult = await runAutoRenewJob(
@@ -6330,23 +6341,227 @@ app.post("/loop/tick", async (req) => {
         cooldownMs: hedgeCooldownMs
       });
     } else {
-      await audit("hedge_action", {
-        action: "increase",
-        reason: decision.reason,
-        instrument: body.hedgeInstrument,
-        size: body.hedgeSize,
-        coverageId: body.coverageId || null,
-        notionalUsdc: body.notionalUsdc ?? null,
-        hedgeType: inferredHedgeType,
-        positionSide: inferredPositionSide,
-        recommendedSide: decision.recommendedSide
-      });
+      let executionInstrument = body.hedgeInstrument;
+      let executionSize = Number(body.hedgeSize ?? 0);
+      let selectionMode: "disabled" | "shadow" | "live" = "disabled";
+      let selectionError: string | null = null;
+      let candidateQuoteStatus: string | null = null;
+      let expectedImprovementUsdc: number | null = null;
+      let expectedCostUsdc: number | null = null;
+      let candidatePlan: {
+        instrument: string;
+        venue: string | null;
+        strike: number | null;
+        hedgeSize: number | null;
+        premiumPerUnitUsdc: number | null;
+        premiumTotalUsdc: number | null;
+        coverageRatio: number | null;
+      } | null = null;
+      let profitCheck = { allowed: true, reason: "disabled" };
+      const shouldComputeCandidate =
+        intermittentConfig.selectionShadow ||
+        intermittentConfig.selectionLive ||
+        intermittentConfig.profitThresholds ||
+        intermittentConfig.analytics;
+      if (shouldComputeCandidate) {
+        selectionMode = intermittentConfig.selectionLive
+          ? "live"
+          : intermittentConfig.selectionShadow
+            ? "shadow"
+            : "disabled";
+        const ledgerEntry = body.coverageId ? coverageLedger.get(body.coverageId) : null;
+        const position = ledgerEntry?.positions?.[0] ?? coverage?.positions?.[0] ?? null;
+        const tierName = ledgerEntry?.tier ?? body.tierName ?? "Unknown";
+        if (position) {
+          const positionSize =
+            position.entryPrice > 0
+              ? (position.marginUsd * position.leverage) / position.entryPrice
+              : 0;
+          const drawdownLimitUsdc = Number(body.drawdownLimitUsdc ?? 0);
+          const initialBalanceUsdc = Number(body.initialBalanceUsdc ?? 0);
+          const equityUsd = Number(ledgerEntry?.equityUsd ?? 0);
+          const floorUsd = Number(ledgerEntry?.floorUsd ?? 0);
+          let drawdownFloorPctValue: number | null = null;
+          if (equityUsd > 0 && floorUsd > 0) {
+            drawdownFloorPctValue = 1 - floorUsd / equityUsd;
+          } else if (initialBalanceUsdc > 0 && drawdownLimitUsdc > 0) {
+            drawdownFloorPctValue = 1 - drawdownLimitUsdc / initialBalanceUsdc;
+          }
+          if (
+            drawdownFloorPctValue !== null &&
+            Number.isFinite(drawdownFloorPctValue) &&
+            drawdownFloorPctValue > 0
+          ) {
+            const asset = position.asset || "BTC";
+            let spotPriceNumber = Number(body.spotByAsset?.[asset] ?? 0);
+            if (!spotPriceNumber) {
+              const spot = await fetchSpotPrice(asset);
+              spotPriceNumber = spot ? spot.toNumber() : 0;
+            }
+            if (spotPriceNumber > 0 && positionSize > 0) {
+              const targetDays = (() => {
+                const expiryMs = Date.parse(body.expiryIso);
+                if (Number.isFinite(expiryMs)) {
+                  const days = Math.ceil((expiryMs - Date.now()) / (24 * 60 * 60 * 1000));
+                  return Math.max(1, days);
+                }
+                return riskControls.default_target_days ?? 7;
+              })();
+              const quoteRes = await app.inject({
+                method: "POST",
+                url: "/put/quote",
+                payload: {
+                  tierName,
+                  asset,
+                  spotPrice: spotPriceNumber,
+                  drawdownFloorPct: drawdownFloorPctValue,
+                  positionSize,
+                  fixedPriceUsdc: 0,
+                  contractSize: 1,
+                  leverage: position.leverage,
+                  side: position.side,
+                  coverageId: body.coverageId ?? "intermittent",
+                  targetDays,
+                  allowPremiumPassThrough: true,
+                  _fastPreview: true
+                }
+              });
+              const quoteData = quoteRes.json() as Record<string, any>;
+              candidateQuoteStatus = String(quoteData?.status ?? "unknown");
+              if (
+                candidateQuoteStatus !== "no_quote" &&
+                candidateQuoteStatus !== "perp_fallback" &&
+                quoteData?.instrument
+              ) {
+                const candidateInstrument = String(quoteData.instrument);
+                const parsed = parseOptionInstrument(candidateInstrument);
+                const strikeValue =
+                  quoteData?.strike !== undefined && quoteData?.strike !== null
+                    ? Number(quoteData.strike)
+                    : parsed.strike;
+                candidatePlan = {
+                  instrument: candidateInstrument,
+                  venue: quoteData?.optionVenue ?? quoteData?.venueSelection?.selected ?? null,
+                  strike: Number.isFinite(strikeValue ?? NaN) ? (strikeValue as number) : null,
+                  hedgeSize:
+                    quoteData?.hedgeSize !== undefined && quoteData?.hedgeSize !== null
+                      ? Number(quoteData.hedgeSize)
+                      : null,
+                  premiumPerUnitUsdc:
+                    quoteData?.premiumPerUnitUsdc !== undefined && quoteData?.premiumPerUnitUsdc !== null
+                      ? Number(quoteData.premiumPerUnitUsdc)
+                      : null,
+                  premiumTotalUsdc:
+                    quoteData?.rollEstimatedPremiumUsdc ??
+                    quoteData?.premiumUsdc ??
+                    null,
+                  coverageRatio:
+                    quoteData?.survivalCheck?.coverageRatio !== undefined
+                      ? Number(quoteData.survivalCheck.coverageRatio)
+                      : null
+                };
+                if (candidatePlan.strike !== null) {
+                  const intrinsic = computeIntrinsicAtFloor({
+                    spotPrice: new Decimal(spotPriceNumber),
+                    drawdownFloorPct: new Decimal(drawdownFloorPctValue),
+                    optionType: inferredOptionType,
+                    strike: new Decimal(candidatePlan.strike)
+                  });
+                  expectedImprovementUsdc = intrinsic.mul(new Decimal(executionSize)).toNumber();
+                }
+                if (candidatePlan.premiumPerUnitUsdc && candidatePlan.premiumPerUnitUsdc > 0) {
+                  expectedCostUsdc = candidatePlan.premiumPerUnitUsdc * executionSize;
+                } else if (
+                  candidatePlan.premiumTotalUsdc &&
+                  candidatePlan.hedgeSize &&
+                  candidatePlan.hedgeSize > 0
+                ) {
+                  expectedCostUsdc =
+                    Number(candidatePlan.premiumTotalUsdc) *
+                    (executionSize / candidatePlan.hedgeSize);
+                }
+              }
+            } else {
+              selectionError = "spot_or_size_unavailable";
+            }
+          } else {
+            selectionError = "drawdown_floor_unavailable";
+          }
+        } else {
+          selectionError = "position_unavailable";
+        }
+      }
+      if (intermittentConfig.profitThresholds) {
+        const critical = new Decimal(intermittentConfig.profitCriticalBufferPct || 0);
+        if (critical.gt(0) && bufferPct.lte(critical)) {
+          profitCheck = { allowed: true, reason: "critical_buffer" };
+        } else if (expectedImprovementUsdc === null || expectedCostUsdc === null) {
+          profitCheck = { allowed: true, reason: "insufficient_data" };
+        } else {
+          const improvement = new Decimal(expectedImprovementUsdc);
+          const cost = new Decimal(expectedCostUsdc);
+          const minImprovement = new Decimal(intermittentConfig.profitMinImprovementUsdc || 0);
+          const minRatio = new Decimal(intermittentConfig.profitMinImprovementRatio || 0);
+          if (minImprovement.gt(0) && improvement.lt(minImprovement)) {
+            profitCheck = { allowed: false, reason: "min_improvement" };
+          } else if (minRatio.gt(0) && improvement.lt(cost.mul(minRatio))) {
+            profitCheck = { allowed: false, reason: "improvement_ratio" };
+          } else {
+            profitCheck = { allowed: true, reason: "ok" };
+          }
+        }
+      }
+      if (intermittentConfig.analytics) {
+        await audit("intermittent_hedge_eval", {
+          coverageId: body.coverageId || null,
+          bufferPct: bufferPct.toFixed(4),
+          bufferTargetPct: body.bufferTargetPct,
+          hysteresisPct: body.hysteresisPct,
+          decision: decision.hedgeAction,
+          reason: decision.reason,
+          selectionMode,
+          selectionError,
+          quoteStatus: candidateQuoteStatus,
+          candidatePlan,
+          expectedImprovementUsdc: expectedImprovementUsdc ?? null,
+          expectedCostUsdc: expectedCostUsdc ?? null,
+          profitCheck: intermittentConfig.profitThresholds ? profitCheck : { allowed: true, reason: "disabled" }
+        });
+      }
+      if (intermittentConfig.selectionLive && candidatePlan?.instrument) {
+        executionInstrument = candidatePlan.instrument;
+      }
+      if (intermittentConfig.profitThresholds && !profitCheck.allowed) {
+        await audit("hedge_action_skipped", {
+          action: "increase",
+          reason: `profit_threshold_${profitCheck.reason}`,
+          coverageId: body.coverageId || null,
+          notionalUsdc: body.notionalUsdc ?? null,
+          expectedImprovementUsdc: expectedImprovementUsdc ?? null,
+          expectedCostUsdc: expectedCostUsdc ?? null
+        });
+      } else {
+        await audit("hedge_action", {
+          action: "increase",
+          reason: decision.reason,
+          instrument: executionInstrument,
+          size: executionSize,
+          coverageId: body.coverageId || null,
+          notionalUsdc: body.notionalUsdc ?? null,
+          hedgeType: inferredHedgeType,
+          positionSide: inferredPositionSide,
+          recommendedSide: decision.recommendedSide
+        });
       const selectedVenue =
-        typeof body.selectedVenue === "string" ? body.selectedVenue : null;
+        intermittentConfig.selectionLive && candidatePlan?.venue
+          ? candidatePlan.venue
+          : typeof body.selectedVenue === "string"
+            ? body.selectedVenue
+            : null;
       const ledgerVenue = body.coverageId
         ? coverageLedger.get(body.coverageId)?.selectedVenue
         : null;
-      const inferredVenue = inferVenueFromInstrument(body.hedgeInstrument);
+      const inferredVenue = inferVenueFromInstrument(executionInstrument);
       const hedgeVenue =
         selectedVenue ||
         ledgerVenue ||
@@ -6354,18 +6569,18 @@ app.post("/loop/tick", async (req) => {
         (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
       const hedgeInstrument =
         hedgeVenue === "bybit" &&
-        typeof body.hedgeInstrument === "string" &&
-        !body.hedgeInstrument.endsWith("-USDT")
-          ? `${body.hedgeInstrument}-USDT`
-          : body.hedgeInstrument;
+        typeof executionInstrument === "string" &&
+        !executionInstrument.endsWith("-USDT")
+          ? `${executionInstrument}-USDT`
+          : executionInstrument;
       const orderResult = await executionRegistry.placeOrder(hedgeVenue, {
         instrument: hedgeInstrument,
-        amount: body.hedgeSize,
+        amount: executionSize,
         side: decision.recommendedSide,
         type: "market",
         spotPrice: body.spotPrice
       });
-      let executedSize = Number(body.hedgeSize ?? 0);
+      let executedSize = Number(executionSize ?? 0);
       if (orderResult && typeof orderResult === "object") {
         const filled =
           (orderResult as any).filledAmount ??
@@ -6410,9 +6625,9 @@ app.post("/loop/tick", async (req) => {
         await saveCoverageLedger();
       }
       await audit("hedge_order", {
-        instrument: body.hedgeInstrument,
+        instrument: executionInstrument,
         side: decision.recommendedSide,
-        amount: executedSize || body.hedgeSize,
+        amount: executedSize || executionSize,
         type: "market",
         coverageId: body.coverageId || null,
         notionalUsdc: body.notionalUsdc ?? null,
@@ -6420,6 +6635,7 @@ app.post("/loop/tick", async (req) => {
         positionSide: inferredPositionSide
       });
       hedgeActionCooldownByCoverage.set(coverageKey, Date.now());
+      }
     }
   }
 

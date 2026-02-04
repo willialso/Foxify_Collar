@@ -104,6 +104,13 @@
   "enable_premium_pass_through": true,
   "require_user_opt_in_for_pass_through": false,
   "pass_through_min_notification_ratio": 1.5,
+  "intermittent_analytics_enabled": false,
+  "intermittent_selection_shadow_enabled": false,
+  "intermittent_selection_live_enabled": false,
+  "intermittent_profit_threshold_enabled": false,
+  "intermittent_profit_min_improvement_usdc": 0,
+  "intermittent_profit_min_improvement_ratio": 0,
+  "intermittent_profit_critical_buffer_pct": 0.02,
   "fee_iv_regime_thresholds": {
     "low": 0.5,
     "high": 0.8
