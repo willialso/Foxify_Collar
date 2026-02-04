@@ -6214,6 +6214,7 @@ app.post("/loop/tick", async (req) => {
       size: number;
       leverage: number;
     }>;
+    skipNetExposure?: boolean;
     positionSide?: "long" | "short";
     optionType?: "put" | "call";
   };
@@ -6639,7 +6640,8 @@ app.post("/loop/tick", async (req) => {
     }
   }
 
-  if (baseExposures.length > 0) {
+  const skipNetExposure = APP_MODE === "demo" && body.skipNetExposure === true;
+  if (!skipNetExposure && baseExposures.length > 0) {
     const exposures = baseExposures.filter((pos) => pos.asset === "BTC");
     const coverageIds = ["platform-risk"];
     const netExposure = calculateNetExposure(

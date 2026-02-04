@@ -188,6 +188,7 @@ curl -s "${API_BASE}/loop/tick" \
     \"notionalUsdc\":2500,
     \"hedgeType\":\"option\",
     \"tierName\":\"Pro (Bronze)\",
+    \"skipNetExposure\":true,
     \"exposures\":${exposures_payload}
   }" | jq
 echo
