@@ -136,7 +136,10 @@ export function App() {
   >([]);
   const [showAudit, setShowAudit] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
-  const [lastExecution, setLastExecution] = useState<string | null>(null);
+  const [pricingNotice, setPricingNotice] = useState<string | null>(null);
+  const [activationNotice, setActivationNotice] = useState<string | null>(null);
+  const pricingNoticeTimerRef = useRef<number | null>(null);
+  const activationNoticeTimerRef = useRef<number | null>(null);
   const [lastCoverageId, setLastCoverageId] = useState<string | null>(null);
   const [portfolioError, setPortfolioError] = useState<string | null>(null);
   const [isActivating, setIsActivating] = useState(false);
@@ -215,6 +218,57 @@ export function App() {
     media.addListener(handle);
     return () => media.removeListener(handle);
   }, []);
+
+  const clearPricingNotice = () => {
+    if (pricingNoticeTimerRef.current) {
+      clearTimeout(pricingNoticeTimerRef.current);
+      pricingNoticeTimerRef.current = null;
+    }
+    setPricingNotice(null);
+  };
+
+  const clearActivationNotice = () => {
+    if (activationNoticeTimerRef.current) {
+      clearTimeout(activationNoticeTimerRef.current);
+      activationNoticeTimerRef.current = null;
+    }
+    setActivationNotice(null);
+  };
+
+  const setPricingNoticeTimed = (message: string, ttlMs = 8000) => {
+    if (pricingNoticeTimerRef.current) {
+      clearTimeout(pricingNoticeTimerRef.current);
+    }
+    setPricingNotice(message);
+    pricingNoticeTimerRef.current = window.setTimeout(() => {
+      setPricingNotice(null);
+      pricingNoticeTimerRef.current = null;
+    }, ttlMs);
+  };
+
+  const setActivationNoticeTimed = (message: string, ttlMs = 8000) => {
+    if (activationNoticeTimerRef.current) {
+      clearTimeout(activationNoticeTimerRef.current);
+    }
+    setActivationNotice(message);
+    activationNoticeTimerRef.current = window.setTimeout(() => {
+      setActivationNotice(null);
+      activationNoticeTimerRef.current = null;
+    }, ttlMs);
+  };
+
+  useEffect(() => {
+    clearPricingNotice();
+    clearActivationNotice();
+  }, [selectedIds, expiryDays, drawdownPct, level?.name, portfolioOpen, showAudit, autoRenew]);
+
+  useEffect(
+    () => () => {
+      clearPricingNotice();
+      clearActivationNotice();
+    },
+    []
+  );
 
   useEffect(() => {
     if (isMobile && showAudit) {
@@ -917,10 +971,24 @@ export function App() {
     }
   }, [pricingKey, previewQuote, previewState, lockedQuote]);
 
+  const hasAvailablePremium = () => {
+    if (!selectedIds.length) return false;
+    if (lockedQuote?.key === pricingKey) {
+      return Boolean(lockedQuote.feeUsdc && lockedQuote.feeUsdc > 0);
+    }
+    return Boolean(
+      previewState === "ok" && previewQuote?.feeUsdc && previewQuote.feeUsdc > 0
+    );
+  };
+
   const handleExecute = async () => {
     if (!level || !portfolio || selectedIds.length === 0) return;
     if (selectedIds.length > 1) {
-      setLastExecution("Select a single position for protection.");
+      setActivationNoticeTimed("Select a single position for protection.");
+      return;
+    }
+    if (!hasAvailablePremium()) {
+      setActivationNoticeTimed("Waiting for premium quote. Please try again.");
       return;
     }
     setIsActivating(true);
@@ -934,7 +1002,7 @@ export function App() {
     if (protectionActive && activeCoverage) {
       const activeExpiryMs = Date.parse(activeCoverage.expiryIso || "");
       if (Number.isFinite(activeExpiryMs) && activeExpiryMs > Date.now()) {
-      setLastExecution("Protection already active for this window.");
+      setActivationNoticeTimed("Protection already active for this window.");
       setIsActivating(false);
       return;
       }
@@ -1015,11 +1083,11 @@ export function App() {
               quote.status === "pass_through"
                 ? `High volatility: Premium is ${pricing?.ratio || "N/A"}× base premium floor. You'll be charged $${quote.feeUsdc} for full protection.`
                 : `Premium exceeds tier cap. Premium capped at $${quote.feeUsdc}. Platform subsidizing $${quote.subsidyUsdc || "0"} for full protection.`;
-            setLastExecution(message);
+            setPricingNoticeTimed(message);
           }
 
           if (quote?.status === "partial") {
-            setLastExecution(
+            setPricingNoticeTimed(
               `Partial coverage is not supported for ${level.name}. ` +
                 "Upgrade tier or adjust leverage/duration for full protection."
             );
@@ -1032,7 +1100,7 @@ export function App() {
             const explanation =
               quote?.pricing?.explanation ||
               `Premium exceeds premium floor${ratio ? ` (ratio ${ratio}).` : "."} Pass-through required.`;
-            setLastExecution(explanation);
+            setPricingNoticeTimed(explanation);
             setIsActivating(false);
             return;
           }
@@ -1220,7 +1288,7 @@ export function App() {
     ) {
       const status = orderResponse?.status ? String(orderResponse.status) : "unknown";
       const reason = orderResponse?.reason ? String(orderResponse.reason) : "no_response";
-      setLastExecution(
+      setActivationNoticeTimed(
         `No executable liquidity available. Protection not activated. (${status}: ${reason})`
       );
       setIsActivating(false);
@@ -1306,7 +1374,7 @@ export function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     }).catch(() => null);
-    setLastExecution(`Saved: ${payload.ts}`);
+    setActivationNoticeTimed("Protection activated.");
     setLastCoverageId(coverageId);
     setProtectionActive(true);
     setProtectionStart(payload.ts);
@@ -1498,6 +1566,7 @@ export function App() {
     previewState === "idle";
   const pricingStatusLabel = null;
   const feeDisplayLabel = displayFeeUsd ? `$${formatUsd(displayFeeUsd)}` : "-";
+  const canActivate = hasAvailablePremium() && !isActivating;
 
   return (
     <div className="shell">
@@ -1697,12 +1766,13 @@ export function App() {
                 </div>
               </div>
               {selectedIds.length > 0 && (
-                <button className="cta" onClick={handleExecute} disabled={isActivating}>
+                <button className="cta" onClick={handleExecute} disabled={!canActivate}>
                   {isActivating && <span className="spinner" aria-hidden="true" />}
                   {isActivating ? "Activating..." : "Activate Protection"}
                 </button>
               )}
-              {lastExecution && <div className="disclaimer">{lastExecution}</div>}
+              {activationNotice && <div className="disclaimer">{activationNotice}</div>}
+              {pricingNotice && <div className="disclaimer">{pricingNotice}</div>}
             </div>
           </>
         )}
