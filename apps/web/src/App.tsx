@@ -991,6 +991,7 @@ export function App() {
       setActivationNoticeTimed("Waiting for premium quote. Please try again.");
       return;
     }
+    clearPricingNotice();
     setIsActivating(true);
     const start = new Date();
     const expiry =
@@ -1075,15 +1076,6 @@ export function App() {
               })
             });
             quote = await quoteRes.json();
-          }
-
-          if (quote?.status === "pass_through" || quote?.status === "pass_through_capped") {
-            const pricing = quote?.pricing;
-            const message =
-              quote.status === "pass_through"
-                ? `High volatility: Premium is ${pricing?.ratio || "N/A"}× base premium floor. You'll be charged $${quote.feeUsdc} for full protection.`
-                : `Premium exceeds tier cap. Premium capped at $${quote.feeUsdc}. Platform subsidizing $${quote.subsidyUsdc || "0"} for full protection.`;
-            setPricingNoticeTimed(message);
           }
 
           if (quote?.status === "partial") {
@@ -1635,7 +1627,7 @@ export function App() {
         <div className="subtitle">
           {showAudit
             ? "Audit data is for internal review only and will not be visible to traders in live mode."
-            : "Guaranteed Drawdown Protection. One-Click. Premium."}
+            : "Guaranteed Drawdown Protection. One-Click."}
         </div>
 
         {!showAudit && (
@@ -1651,7 +1643,7 @@ export function App() {
 
             <div className="stats stats-buffer">
               <div className="stat">
-                <div className="label">Position PnL</div>
+                <div className="label">Position</div>
                 <div className="value">
                   {portfolio
                     ? `${portfolioStats.totalPnl >= 0 ? "+" : "-"}$${formatUsd(
@@ -1738,7 +1730,7 @@ export function App() {
                   <strong>{expiryDays} days</strong>
                 </div>
                 <div className="row row-align">
-                  <span>Auto-renew</span>
+                  <span>Auto-Renew</span>
                   <input
                     type="checkbox"
                     checked={autoRenew}
@@ -1747,7 +1739,6 @@ export function App() {
                 </div>
                 <div className="row row-align">
                   <span>
-                    Premium
                     {isFetchingQuote && (
                       <span className="fetching-status">
                         <em>
@@ -1772,7 +1763,9 @@ export function App() {
                 </button>
               )}
               {activationNotice && <div className="disclaimer">{activationNotice}</div>}
-              {pricingNotice && <div className="disclaimer">{pricingNotice}</div>}
+              {!isActivating && pricingNotice && (
+                <div className="disclaimer">{pricingNotice}</div>
+              )}
             </div>
           </>
         )}
@@ -1787,7 +1780,7 @@ export function App() {
         {protectionActive && !showAudit && (
           <>
             <div className="section">
-              <h4>Protection Active</h4>
+              <h4>Protection</h4>
               {mtmBufferLow && (
                 <div className="disclaimer danger">
                   Drawdown buffer is low ({mtmBufferPct?.toFixed(2)}%). Hedge actions may trigger soon.
@@ -1799,17 +1792,17 @@ export function App() {
                   <strong>{shortTierLabel()}</strong>
                 </div>
                 <div className="row">
-                  <span>Time left</span>
+                  <span>Time Remaining</span>
                   <strong>{formatTimer(protectionExpiry)}</strong>
                 </div>
                 <div className="row">
-                  <span>Distance to floor</span>
+                  <span>Distance to Floor</span>
                   <strong>
                     ${formatUsd(Math.max(0, mtmDistanceToFloor))}
                   </strong>
                 </div>
                 <div className="row">
-                  <span>Auto-renew</span>
+                  <span>Auto-Renew</span>
                   <strong>{autoRenew ? "On" : "Off"}</strong>
                 </div>
                 {feeRegimeLabel &&
@@ -1944,6 +1937,8 @@ export function App() {
                   };
                   setPortfolio(nextPortfolio);
                   await syncPositions(nextPortfolio);
+                  setToast("Position Added");
+                  setTimeout(() => setToast(null), 2000);
                 }}
               />
               <div className="positions">
