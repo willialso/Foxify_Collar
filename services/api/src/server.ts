@@ -444,6 +444,7 @@ function upsertCoverageLedger(
     markSource: update.markSource ?? existing?.markSource ?? null,
     mtmAttribution: update.mtmAttribution ?? existing?.mtmAttribution ?? null,
     lastMtm: update.lastMtm ?? existing?.lastMtm ?? null,
+    creditUsdc: update.creditUsdc ?? existing?.creditUsdc ?? undefined,
     expiredAt: update.expiredAt ?? existing?.expiredAt ?? undefined,
     status: update.status ?? existing?.status ?? "active",
     updatedAt: now
@@ -586,6 +587,7 @@ type CoverageLedgerEntry = {
     coverageRatio?: string;
     ts?: string;
   } | null;
+  creditUsdc?: number;
   expiredAt?: string;
   status?: "active" | "expired";
   updatedAt: string;
@@ -792,6 +794,16 @@ function shouldLogMtmUpdate(params: {
   return false;
 }
 
+function sumCoverageCredits(): Decimal {
+  let total = new Decimal(0);
+  for (const entry of coverageLedger.values()) {
+    if (entry.creditUsdc && entry.creditUsdc > 0) {
+      total = total.add(new Decimal(entry.creditUsdc));
+    }
+  }
+  return total;
+}
+
 async function markCoverageExpired(coverageId: string, expiryIso: string): Promise<void> {
   const existing = coverageLedger.get(coverageId);
   if (existing?.status === "expired") return;
@@ -868,10 +880,12 @@ async function computeCoverageMtmSnapshots(): Promise<void> {
           : spotPrice.minus(entryPrice).mul(sizeUnits);
       const hedgeShare = totalNotional.gt(0) ? notional.div(totalNotional) : new Decimal(1);
       const hedgeMtm = hedgeMtmTotal.mul(hedgeShare);
-      const equityUsdc = margin.add(pnl).add(hedgeMtm);
+      const existingCreditTotal = new Decimal(entry.creditUsdc ?? 0);
+      const creditShare = existingCreditTotal.mul(hedgeShare);
+      let equityUsdc = margin.add(pnl).add(hedgeMtm).add(creditShare);
       const drawdownLimitUsdc = margin.mul(new Decimal(1).minus(drawdownFloorPct));
-      const bufferUsdc = equityUsdc.minus(drawdownLimitUsdc);
-      const bufferPct = margin.gt(0) ? bufferUsdc.div(margin) : new Decimal(0);
+      let bufferUsdc = equityUsdc.minus(drawdownLimitUsdc);
+      let bufferPct = margin.gt(0) ? bufferUsdc.div(margin) : new Decimal(0);
       const lastBuffer = entry.lastMtm?.bufferUsdc
         ? new Decimal(entry.lastMtm.bufferUsdc)
         : null;
@@ -892,17 +906,29 @@ async function computeCoverageMtmSnapshots(): Promise<void> {
       const coverageRatio = survivalCheck?.coverageRatio
         ? new Decimal(survivalCheck.coverageRatio)
         : null;
-      if (bufferUsdc.isNegative() && (!lastBuffer || lastBuffer.greaterThanOrEqualTo(0))) {
+      let creditApplied = new Decimal(0);
+      if (bufferUsdc.isNegative()) {
+        creditApplied = bufferUsdc.abs();
+        const nextCreditTotal = existingCreditTotal.add(creditApplied);
+        equityUsdc = equityUsdc.add(creditApplied);
+        bufferUsdc = bufferUsdc.add(creditApplied);
+        bufferPct = margin.gt(0) ? bufferUsdc.div(margin) : new Decimal(0);
         await audit("demo_credit", {
           coverageId: entry.coverageId,
           positionId: position.id,
-          creditUsdc: bufferUsdc.abs().toFixed(2),
-          bufferUsdc: bufferUsdc.toFixed(2),
-          equityUsdc: equityUsdc.toFixed(2),
+          creditUsdc: creditApplied.toFixed(2),
+          totalCreditUsdc: nextCreditTotal.toFixed(2),
+          bufferUsdc: bufferUsdc.sub(creditApplied).toFixed(2),
+          equityUsdc: equityUsdc.sub(creditApplied).toFixed(2),
           hedgeInstrument: entry.hedgeInstrument ?? null,
           hedgeVenue,
           mtmAttribution: entry.mtmAttribution ?? "position"
         });
+        upsertCoverageLedger({
+          coverageId: entry.coverageId,
+          creditUsdc: nextCreditTotal.toNumber()
+        });
+        await saveCoverageLedger();
       }
       const shouldLog = shouldLogMtmUpdate({
         entry,
@@ -927,6 +953,7 @@ async function computeCoverageMtmSnapshots(): Promise<void> {
         drawdownLimitUsdc: drawdownLimitUsdc.toFixed(2),
         drawdownBufferUsdc: bufferUsdc.toFixed(2),
         drawdownBufferPct: bufferPct.mul(100).toFixed(2),
+        creditUsdc: creditShare.add(creditApplied).toFixed(2),
         coverageRatio: coverageRatio ? coverageRatio.toFixed(4) : null,
         hedgeInstrument: entry.hedgeInstrument ?? null,
         hedgeVenue,
@@ -998,15 +1025,18 @@ function buildSurvivalCheck(params: {
 } | null {
   if (!params.strike || !params.hedgeSize || !params.requiredSize) return null;
   if (params.hedgeSize.lte(0) || params.requiredSize.lte(0)) return null;
-  const floorPrice =
-    params.optionType === "put"
-      ? params.spotPrice.mul(new Decimal(1).minus(params.drawdownFloorPct))
-      : params.spotPrice.mul(new Decimal(1).plus(params.drawdownFloorPct));
+  const floorPrice = computeFloorPrice(
+    params.spotPrice,
+    params.drawdownFloorPct,
+    params.optionType
+  );
   const requiredCredit = params.spotPrice.sub(floorPrice).abs().mul(params.requiredSize);
-  const intrinsic =
-    params.optionType === "put"
-      ? Decimal.max(new Decimal(0), params.strike.sub(floorPrice))
-      : Decimal.max(new Decimal(0), floorPrice.sub(params.strike));
+  const intrinsic = computeIntrinsicAtFloor({
+    spotPrice: params.spotPrice,
+    drawdownFloorPct: params.drawdownFloorPct,
+    optionType: params.optionType,
+    strike: params.strike
+  });
   const hedgeCredit = intrinsic.mul(params.hedgeSize);
   const coverageRatio = requiredCredit.gt(0) ? hedgeCredit.div(requiredCredit) : new Decimal(1);
   return {
@@ -1018,6 +1048,32 @@ function buildSurvivalCheck(params: {
   };
 }
 
+function computeFloorPrice(
+  spotPrice: Decimal,
+  drawdownFloorPct: Decimal,
+  optionType: "put" | "call"
+): Decimal {
+  return optionType === "put"
+    ? spotPrice.mul(new Decimal(1).minus(drawdownFloorPct))
+    : spotPrice.mul(new Decimal(1).plus(drawdownFloorPct));
+}
+
+function computeIntrinsicAtFloor(params: {
+  spotPrice: Decimal;
+  drawdownFloorPct: Decimal;
+  optionType: "put" | "call";
+  strike: Decimal;
+}): Decimal {
+  const floorPrice = computeFloorPrice(
+    params.spotPrice,
+    params.drawdownFloorPct,
+    params.optionType
+  );
+  return params.optionType === "put"
+    ? Decimal.max(new Decimal(0), params.strike.sub(floorPrice))
+    : Decimal.max(new Decimal(0), floorPrice.sub(params.strike));
+}
+
 function requiredHedgeSizeForFullCoverage(params: {
   spotPrice: Decimal;
   drawdownFloorPct: Decimal;
@@ -1025,15 +1081,18 @@ function requiredHedgeSizeForFullCoverage(params: {
   strike: Decimal;
   requiredSize: Decimal;
 }): Decimal | null {
-  const floorPrice =
-    params.optionType === "put"
-      ? params.spotPrice.mul(new Decimal(1).minus(params.drawdownFloorPct))
-      : params.spotPrice.mul(new Decimal(1).plus(params.drawdownFloorPct));
+  const floorPrice = computeFloorPrice(
+    params.spotPrice,
+    params.drawdownFloorPct,
+    params.optionType
+  );
   const requiredCredit = params.spotPrice.sub(floorPrice).abs().mul(params.requiredSize);
-  const intrinsic =
-    params.optionType === "put"
-      ? params.strike.sub(floorPrice)
-      : floorPrice.sub(params.strike);
+  const intrinsic = computeIntrinsicAtFloor({
+    spotPrice: params.spotPrice,
+    drawdownFloorPct: params.drawdownFloorPct,
+    optionType: params.optionType,
+    strike: params.strike
+  });
   if (intrinsic.lte(0)) return null;
   return requiredCredit.div(intrinsic);
 }
@@ -1712,9 +1771,10 @@ app.get("/risk/summary", async (req) => {
     }
   }
 
+  const creditUsdc = sumCoverageCredits();
   const summary = computeRiskSummary(
     {
-      cashUsdc: new Decimal(query.cashUsdc || "10000"),
+      cashUsdc: new Decimal(query.cashUsdc || "10000").add(creditUsdc),
       positionPnlUsdc: positionPnl,
       hedgeMtmUsdc: hedgeMtm,
       drawdownLimitUsdc: new Decimal(query.drawdownLimitUsdc || "9000")
@@ -1726,7 +1786,8 @@ app.get("/risk/summary", async (req) => {
     equityUsdc: summary.equityUsdc.toFixed(2),
     drawdownLimitUsdc: summary.drawdownLimitUsdc.toFixed(2),
     drawdownBufferUsdc: summary.drawdownBufferUsdc.toFixed(2),
-    drawdownBufferPct: summary.drawdownBufferPct.mul(100).toFixed(2)
+    drawdownBufferPct: summary.drawdownBufferPct.mul(100).toFixed(2),
+    creditUsdc: creditUsdc.toFixed(2)
   };
   lastMtmSnapshot = {
     equityUsdc: summary.equityUsdc,
@@ -3361,6 +3422,15 @@ app.post("/put/quote", async (req) => {
     allInPremium: Decimal;
     hedgeSize: Decimal;
   } | null = null;
+  let bestPlanLegs:
+    | Array<{
+        strike: string;
+        size: string;
+        premiumPerUnit: string;
+        premiumTotal: string;
+        expiryTag: string;
+      }>
+    | null = null;
   let bestSnapshots: QuoteBookSnapshot[] | null = null;
   const rejected = {
     missingBook: 0,
@@ -3418,25 +3488,48 @@ app.post("/put/quote", async (req) => {
         useBodySlippage
       );
 
+      const floorPrice = computeFloorPrice(spotPrice, drawdownFloorPct, optionType);
+      let remainingCredit = spotPrice.sub(floorPrice).abs().mul(requiredSize);
+      const planExecutionPlans: Array<{
+        venue: string;
+        instrument: string;
+        side: "buy" | "sell";
+        size: Decimal;
+        price: Decimal;
+      }> = [];
+      const planLegs: Array<{
+        strike: string;
+        size: string;
+        premiumPerUnit: string;
+        premiumTotal: string;
+        expiryTag: string;
+      }> = [];
+      const planSnapshots: Array<{ strike: string; books: QuoteBookSnapshot[] }> = [];
+      let planPremium = new Decimal(0);
+      let planSize = new Decimal(0);
+      let firstLegIv: number | null = null;
+      let firstLegSpread: Decimal | null = null;
+
       for (const inst of strikeCandidates) {
+        if (remainingCredit.lte(0)) break;
         let quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
         if (!quotes.length) {
           rejected.missingBook += 1;
           continue;
         }
         const strike = new Decimal(inst.strike);
-        const coverageSize = requiredHedgeSizeForFullCoverage({
+        const intrinsic = computeIntrinsicAtFloor({
           spotPrice,
           drawdownFloorPct,
           optionType,
-          strike,
-          requiredSize
+          strike
         });
-        if (!coverageSize) {
+        if (intrinsic.lte(0)) {
           rejected.sizeTooSmall += 1;
           continue;
         }
-        const targetSize = Decimal.max(minSize, coverageSize);
+        const sizeNeeded = remainingCredit.div(intrinsic);
+        const targetSize = Decimal.max(minSize, sizeNeeded);
         let agg = aggregateOptionQuotes(quotes, "buy", targetSize);
         if (
           venueConfig.mode === "bybit_only" &&
@@ -3457,7 +3550,7 @@ app.post("/put/quote", async (req) => {
           rejected.spreadTooWide += 1;
           continue;
         }
-        if (!agg.avgPrice || agg.filledSize.lte(0) || agg.filledSize.lt(targetSize)) {
+        if (!agg.avgPrice || agg.filledSize.lte(0)) {
           rejected.sizeTooSmall += 1;
           continue;
         }
@@ -3466,6 +3559,30 @@ app.post("/put/quote", async (req) => {
           rejected.slippageTooHigh += 1;
           continue;
         }
+        const availableSize = agg.totalAskSize;
+        const sizeToTake = Decimal.min(targetSize, availableSize);
+        if (sizeToTake.lte(0)) {
+          rejected.sizeTooSmall += 1;
+          continue;
+        }
+        const sizedAgg = aggregateOptionQuotes(quotes, "buy", sizeToTake);
+        if (!sizedAgg.avgPrice || sizedAgg.filledSize.lte(0) || sizedAgg.filledSize.lt(sizeToTake)) {
+          rejected.sizeTooSmall += 1;
+          continue;
+        }
+        const legPremiumTotal = sizedAgg.avgPrice.mul(sizeToTake);
+        planPremium = planPremium.add(legPremiumTotal);
+        planSize = planSize.add(sizeToTake);
+        remainingCredit = remainingCredit.sub(intrinsic.mul(sizeToTake));
+        planExecutionPlans.push(...sizedAgg.plans);
+        planLegs.push({
+          strike: strike.toFixed(0),
+          size: sizeToTake.toFixed(6),
+          premiumPerUnit: sizedAgg.avgPrice.toFixed(6),
+          premiumTotal: legPremiumTotal.toFixed(2),
+          expiryTag
+        });
+
         const snapshots = quotes.map((quote) => ({
           venue: quote.venue,
           instrument: quote.instrument,
@@ -3478,35 +3595,43 @@ app.post("/put/quote", async (req) => {
           markPriceUsd: serializeDecimal(quote.book.markPriceUsd, 6)
         }));
         snapshotsByStrike.set(strike.toFixed(0), snapshots);
+        planSnapshots.push({ strike: strike.toFixed(0), books: snapshots });
 
-        const ticker = await deribit.getTicker(inst.instrument_name);
-        const iv = Number((ticker as any)?.result?.mark_iv ?? 0);
-        const premiumPerUnit = agg.avgPrice;
-        const premiumTotal = premiumPerUnit.mul(targetSize);
-        const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
-        const allInPremium = premiumTotal.mul(new Decimal(rollMultiplier));
-        if (!bestCandidate || (!fastPreview && allInPremium.lt(bestCandidate.allInPremium))) {
-          bestCandidate = {
-            expiryTag,
-            targetDays: days,
-            premiumPerUnit,
-            premiumTotal,
-            availableSize: agg.totalAskSize,
-            strike,
-            iv,
-            spreadPct: agg.spread,
-            rollMultiplier,
-            allInPremium,
-            hedgeSize: targetSize
-          };
-          bestSnapshots = snapshots;
-          chosenExecutionPlans = agg.plans;
-          chosenSnapshots = snapshotsByStrike;
+        if (firstLegIv === null) {
+          const ticker = await deribit.getTicker(inst.instrument_name);
+          firstLegIv = Number((ticker as any)?.result?.mark_iv ?? 0);
         }
-        plansByStrike.set(strike.toFixed(0), agg.plans);
-        if (fastPreview && bestCandidate) {
-          fastPreviewHit = true;
-          break;
+        if (firstLegSpread === null) {
+          firstLegSpread = sizedAgg.spread;
+        }
+
+        if (remainingCredit.lte(0)) {
+          const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
+          const allInPremium = planPremium.mul(new Decimal(rollMultiplier));
+          if (!bestCandidate || (!fastPreview && allInPremium.lt(bestCandidate.allInPremium))) {
+            const avgPremiumPerUnit = planSize.gt(0) ? planPremium.div(planSize) : new Decimal(0);
+            bestCandidate = {
+              expiryTag,
+              targetDays: days,
+              premiumPerUnit: avgPremiumPerUnit,
+              premiumTotal: planPremium,
+              availableSize: planSize,
+              strike,
+              iv: firstLegIv ?? 0,
+              spreadPct: firstLegSpread ?? sizedAgg.spread,
+              rollMultiplier,
+              allInPremium,
+              hedgeSize: planSize
+            };
+            bestSnapshots = planSnapshots[0]?.books ?? snapshots;
+            chosenExecutionPlans = planExecutionPlans;
+            chosenSnapshots = snapshotsByStrike;
+            bestPlanLegs = planLegs;
+          }
+          if (fastPreview && bestCandidate) {
+            fastPreviewHit = true;
+            break;
+          }
         }
       }
       if (fastPreviewHit) break;
@@ -3533,9 +3658,6 @@ app.post("/put/quote", async (req) => {
   }
 
   const quote = bestCandidate;
-  if (quote?.hedgeSize) {
-    hedgeSizeForRenew = quote.hedgeSize;
-  }
   if (quote?.hedgeSize) {
     hedgeSizeForQuote = quote.hedgeSize;
   }
