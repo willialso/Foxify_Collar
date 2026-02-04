@@ -52,7 +52,16 @@ Triggered when protection is activated.
   "assets": ["BTC"],
   "notionalUsdc": 25000,
   "floorUsdc": 2000,
-  "expiryIso": "2026-01-29T02:45:10.123Z"
+  "expiryIso": "2026-01-29T02:45:10.123Z",
+  "coverageLegs": [
+    {
+      "instrument": "BTC-29JAN26-82000-P",
+      "size": 0.5,
+      "venue": "deribit",
+      "optionType": "put",
+      "strike": 82000
+    }
+  ]
 }
 ```
 

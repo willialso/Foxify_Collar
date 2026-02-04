@@ -6314,7 +6314,14 @@ app.post("/loop/tick", async (req) => {
   }
 
   if (decision.hedgeAction === "increase") {
-    if (withinCooldown || belowNotional) {
+    if (inferredHedgeType !== "option") {
+      await audit("hedge_action_skipped", {
+        action: "increase",
+        reason: "options_only",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null
+      });
+    } else if (withinCooldown || belowNotional) {
       await audit("hedge_action_skipped", {
         action: "increase",
         reason: withinCooldown ? "cooldown" : "min_notional",
@@ -6323,52 +6330,96 @@ app.post("/loop/tick", async (req) => {
         cooldownMs: hedgeCooldownMs
       });
     } else {
-    await audit("hedge_action", {
-      action: "increase",
-      reason: decision.reason,
-      instrument: body.hedgeInstrument,
-      size: body.hedgeSize,
-      coverageId: body.coverageId || null,
-      notionalUsdc: body.notionalUsdc ?? null,
-      hedgeType: inferredHedgeType,
-      positionSide: inferredPositionSide,
-      recommendedSide: decision.recommendedSide
-    });
-    const selectedVenue =
-      typeof body.selectedVenue === "string" ? body.selectedVenue : null;
-    const ledgerVenue = body.coverageId
-      ? coverageLedger.get(body.coverageId)?.selectedVenue
-      : null;
-    const inferredVenue = inferVenueFromInstrument(body.hedgeInstrument);
-    const hedgeVenue =
-      selectedVenue ||
-      ledgerVenue ||
-      inferredVenue ||
-      (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
-    const hedgeInstrument =
-      hedgeVenue === "bybit" &&
-      typeof body.hedgeInstrument === "string" &&
-      !body.hedgeInstrument.endsWith("-USDT")
-        ? `${body.hedgeInstrument}-USDT`
-        : body.hedgeInstrument;
-    await executionRegistry.placeOrder(hedgeVenue, {
-      instrument: hedgeInstrument,
-      amount: body.hedgeSize,
-      side: decision.recommendedSide,
-      type: "market",
-      spotPrice: body.spotPrice
-    });
-    await audit("hedge_order", {
-      instrument: body.hedgeInstrument,
-      side: decision.recommendedSide,
-      amount: body.hedgeSize,
-      type: "market",
-      coverageId: body.coverageId || null,
-      notionalUsdc: body.notionalUsdc ?? null,
-      hedgeType: inferredHedgeType,
-      positionSide: inferredPositionSide
-    });
-    hedgeActionCooldownByCoverage.set(coverageKey, Date.now());
+      await audit("hedge_action", {
+        action: "increase",
+        reason: decision.reason,
+        instrument: body.hedgeInstrument,
+        size: body.hedgeSize,
+        coverageId: body.coverageId || null,
+        notionalUsdc: body.notionalUsdc ?? null,
+        hedgeType: inferredHedgeType,
+        positionSide: inferredPositionSide,
+        recommendedSide: decision.recommendedSide
+      });
+      const selectedVenue =
+        typeof body.selectedVenue === "string" ? body.selectedVenue : null;
+      const ledgerVenue = body.coverageId
+        ? coverageLedger.get(body.coverageId)?.selectedVenue
+        : null;
+      const inferredVenue = inferVenueFromInstrument(body.hedgeInstrument);
+      const hedgeVenue =
+        selectedVenue ||
+        ledgerVenue ||
+        inferredVenue ||
+        (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
+      const hedgeInstrument =
+        hedgeVenue === "bybit" &&
+        typeof body.hedgeInstrument === "string" &&
+        !body.hedgeInstrument.endsWith("-USDT")
+          ? `${body.hedgeInstrument}-USDT`
+          : body.hedgeInstrument;
+      const orderResult = await executionRegistry.placeOrder(hedgeVenue, {
+        instrument: hedgeInstrument,
+        amount: body.hedgeSize,
+        side: decision.recommendedSide,
+        type: "market",
+        spotPrice: body.spotPrice
+      });
+      let executedSize = Number(body.hedgeSize ?? 0);
+      if (orderResult && typeof orderResult === "object") {
+        const filled =
+          (orderResult as any).filledAmount ??
+          (orderResult as any).result?.filledAmount ??
+          (orderResult as any).filled_amount;
+        if (Number.isFinite(filled)) {
+          executedSize = Number(filled);
+        }
+      }
+      if (body.coverageId && typeof hedgeInstrument === "string" && executedSize > 0) {
+        const existing = coverageLedger.get(body.coverageId);
+        let coverageLegs = existing?.coverageLegs;
+        if (
+          (!coverageLegs || coverageLegs.length === 0) &&
+          existing?.hedgeInstrument &&
+          existing?.hedgeSize
+        ) {
+          const seedParsed = parseOptionInstrument(existing.hedgeInstrument);
+          const seedVenue =
+            existing.selectedVenue ?? inferVenueFromInstrument(existing.hedgeInstrument);
+          coverageLegs = mergeCoverageLegs(coverageLegs, {
+            instrument: existing.hedgeInstrument,
+            size: Number(existing.hedgeSize ?? 0),
+            venue: seedVenue,
+            optionType: existing.optionType ?? seedParsed.optionType,
+            strike: existing.strike ?? seedParsed.strike
+          });
+        }
+        const parsed = parseOptionInstrument(hedgeInstrument);
+        const legVenue = hedgeVenue ?? inferVenueFromInstrument(hedgeInstrument);
+        coverageLegs = mergeCoverageLegs(coverageLegs, {
+          instrument: hedgeInstrument,
+          size: executedSize,
+          venue: legVenue,
+          optionType: parsed.optionType,
+          strike: parsed.strike
+        });
+        upsertCoverageLedger({
+          coverageId: body.coverageId,
+          coverageLegs
+        });
+        await saveCoverageLedger();
+      }
+      await audit("hedge_order", {
+        instrument: body.hedgeInstrument,
+        side: decision.recommendedSide,
+        amount: executedSize || body.hedgeSize,
+        type: "market",
+        coverageId: body.coverageId || null,
+        notionalUsdc: body.notionalUsdc ?? null,
+        hedgeType: inferredHedgeType,
+        positionSide: inferredPositionSide
+      });
+      hedgeActionCooldownByCoverage.set(coverageKey, Date.now());
     }
   }
 
