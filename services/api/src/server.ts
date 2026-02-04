@@ -828,6 +828,30 @@ function mergeCoverageLegs(
   return legs;
 }
 
+function buildCoverageLegsFromPlans(
+  plans: Array<{
+    venue: string;
+    instrument: string;
+    side: "buy" | "sell";
+    size: Decimal;
+    price: Decimal;
+  }>
+): CoverageLedgerEntry["coverageLegs"] {
+  let legs: CoverageLedgerEntry["coverageLegs"] = [];
+  for (const plan of plans) {
+    if (!plan.instrument || !plan.size) continue;
+    const parsed = parseOptionInstrument(plan.instrument);
+    legs = mergeCoverageLegs(legs, {
+      instrument: plan.instrument,
+      size: Number(plan.size.toFixed(6)),
+      venue: plan.venue,
+      optionType: parsed.optionType,
+      strike: parsed.strike
+    });
+  }
+  return legs;
+}
+
 function sumCoverageCredits(): Decimal {
   let total = new Decimal(0);
   for (const entry of coverageLedger.values()) {
@@ -3570,11 +3594,11 @@ app.post("/put/quote", async (req) => {
   } | null = null;
   let bestPlanLegs:
     | Array<{
-        strike: string;
-        size: string;
-        premiumPerUnit: string;
-        premiumTotal: string;
-        expiryTag: string;
+        instrument: string;
+        size: number;
+        venue?: string | null;
+        optionType?: "put" | "call" | null;
+        strike?: number | null;
       }>
     | null = null;
   let bestSnapshots: QuoteBookSnapshot[] | null = null;
@@ -3642,13 +3666,6 @@ app.post("/put/quote", async (req) => {
         side: "buy" | "sell";
         size: Decimal;
         price: Decimal;
-      }> = [];
-      const planLegs: Array<{
-        strike: string;
-        size: string;
-        premiumPerUnit: string;
-        premiumTotal: string;
-        expiryTag: string;
       }> = [];
       const planSnapshots: Array<{ strike: string; books: QuoteBookSnapshot[] }> = [];
       let planPremium = new Decimal(0);
@@ -3721,13 +3738,6 @@ app.post("/put/quote", async (req) => {
         planSize = planSize.add(sizeToTake);
         remainingCredit = remainingCredit.sub(intrinsic.mul(sizeToTake));
         planExecutionPlans.push(...sizedAgg.plans);
-        planLegs.push({
-          strike: strike.toFixed(0),
-          size: sizeToTake.toFixed(6),
-          premiumPerUnit: sizedAgg.avgPrice.toFixed(6),
-          premiumTotal: legPremiumTotal.toFixed(2),
-          expiryTag
-        });
 
         const snapshots = quotes.map((quote) => ({
           venue: quote.venue,
@@ -3772,7 +3782,7 @@ app.post("/put/quote", async (req) => {
             bestSnapshots = planSnapshots[0]?.books ?? snapshots;
             chosenExecutionPlans = planExecutionPlans;
             chosenSnapshots = snapshotsByStrike;
-            bestPlanLegs = planLegs;
+            bestPlanLegs = buildCoverageLegsFromPlans(planExecutionPlans);
           }
           if (fastPreview && bestCandidate) {
             fastPreviewHit = true;

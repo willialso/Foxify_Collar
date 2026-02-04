@@ -1272,6 +1272,7 @@ export function App() {
       quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
       selectedIds,
       coverageId,
+      coverageLegs: quote?.coverageLegs ?? (previewQuoteRaw as any)?.coverageLegs ?? null,
       portfolio: {
         tierName: level.name,
         positions: selectedPortfolioPositions
