@@ -1018,6 +1018,26 @@ function buildSurvivalCheck(params: {
   };
 }
 
+function requiredHedgeSizeForFullCoverage(params: {
+  spotPrice: Decimal;
+  drawdownFloorPct: Decimal;
+  optionType: "put" | "call";
+  strike: Decimal;
+  requiredSize: Decimal;
+}): Decimal | null {
+  const floorPrice =
+    params.optionType === "put"
+      ? params.spotPrice.mul(new Decimal(1).minus(params.drawdownFloorPct))
+      : params.spotPrice.mul(new Decimal(1).plus(params.drawdownFloorPct));
+  const requiredCredit = params.spotPrice.sub(floorPrice).abs().mul(params.requiredSize);
+  const intrinsic =
+    params.optionType === "put"
+      ? params.strike.sub(floorPrice)
+      : floorPrice.sub(params.strike);
+  if (intrinsic.lte(0)) return null;
+  return requiredCredit.div(intrinsic);
+}
+
 function buildReplicationMeta(params: {
   targetDays: number;
   maxPreferredDays: number;
@@ -2319,6 +2339,53 @@ async function getOptionVenueQuotes(
   throw new Error(`Unknown venue mode: ${venueConfig.mode}`);
 }
 
+async function fetchDeribitQuoteForInstrument(
+  instrument: string,
+  spotPrice: Decimal
+): Promise<
+  | {
+      venue: string;
+      instrument: string;
+      type: "option";
+      book: {
+        bid: Decimal | null;
+        ask: Decimal | null;
+        bidSize: Decimal;
+        askSize: Decimal;
+        spreadPct: Decimal;
+        timestampMs: number | null;
+        markPriceUsd?: Decimal | null;
+      };
+    }
+  | null
+> {
+  try {
+    const deribitOrderBook = (await deribit.getOrderBook(instrument) as any)?.result;
+    if (!deribitOrderBook) return null;
+    const { bid, ask } = bestBidAsk(deribitOrderBook);
+    const markPrice = deribitOrderBook.mark_price ?? null;
+    const bidUsd = bid ? new Decimal(bid).mul(spotPrice) : null;
+    const askUsd = ask ? new Decimal(ask).mul(spotPrice) : null;
+    const markUsd = markPrice ? new Decimal(markPrice).mul(spotPrice) : null;
+    return {
+      venue: "deribit",
+      instrument,
+      type: "option",
+      book: {
+        bid: bidUsd,
+        ask: askUsd,
+        bidSize: new Decimal(deribitOrderBook.bids?.[0]?.[1] || 0),
+        askSize: new Decimal(deribitOrderBook.asks?.[0]?.[1] || 0),
+        spreadPct: spreadPct(bid || 0, ask || 0),
+        timestampMs: deribitOrderBook.timestamp ?? null,
+        markPriceUsd: markUsd
+      }
+    };
+  } catch {
+    return null;
+  }
+}
+
 function aggregateOptionQuotes(
   quotes: Array<{
     venue: string;
@@ -3210,6 +3277,7 @@ app.post("/put/quote", async (req) => {
     ? hedgeSizeFromDelta(new Decimal(positionSize), new Decimal(body.optionDelta))
     : hedgeSizeFromNotional(positionSize, contractSize);
   const requiredSize = Decimal.max(minSize, hedgeSize);
+  let hedgeSizeForQuote = requiredSize;
 
   const optionType = body.side === "short" ? "call" : "put";
   const spotPrice = new Decimal(body.spotPrice);
@@ -3220,7 +3288,7 @@ app.post("/put/quote", async (req) => {
       : spotPrice.mul(new Decimal(1).plus(drawdownFloorPct));
   const tierName = body.tierName || "Unknown";
   const tierLeverageLimits = riskControls.max_leverage_by_tier?.[tierName];
-  if (tierLeverageLimits && optionType === "put") {
+  if (tierLeverageLimits) {
     const maxLeverageForOption = tierLeverageLimits[optionType];
     if (Number.isFinite(maxLeverageForOption) && leverage > maxLeverageForOption) {
       await audit("leverage_validation_failed", {
@@ -3291,6 +3359,7 @@ app.post("/put/quote", async (req) => {
     spreadPct: Decimal;
     rollMultiplier: number;
     allInPremium: Decimal;
+    hedgeSize: Decimal;
   } | null = null;
   let bestSnapshots: QuoteBookSnapshot[] | null = null;
   const rejected = {
@@ -3350,9 +3419,51 @@ app.post("/put/quote", async (req) => {
       );
 
       for (const inst of strikeCandidates) {
-        const quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+        let quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
         if (!quotes.length) {
           rejected.missingBook += 1;
+          continue;
+        }
+        const strike = new Decimal(inst.strike);
+        const coverageSize = requiredHedgeSizeForFullCoverage({
+          spotPrice,
+          drawdownFloorPct,
+          optionType,
+          strike,
+          requiredSize
+        });
+        if (!coverageSize) {
+          rejected.sizeTooSmall += 1;
+          continue;
+        }
+        const targetSize = Decimal.max(minSize, coverageSize);
+        let agg = aggregateOptionQuotes(quotes, "buy", targetSize);
+        if (
+          venueConfig.mode === "bybit_only" &&
+          agg.filledSize.lt(targetSize) &&
+          venueConfig.deribit_enabled
+        ) {
+          const deribitQuote = await fetchDeribitQuoteForInstrument(inst.instrument_name, spotPrice);
+          if (deribitQuote) {
+            quotes = [...quotes, deribitQuote];
+            agg = aggregateOptionQuotes(quotes, "buy", targetSize);
+          }
+        }
+        if (!agg.bestBid || !agg.bestAsk) {
+          rejected.noBidAsk += 1;
+          continue;
+        }
+        if (agg.spread.gt(maxSpreadPct)) {
+          rejected.spreadTooWide += 1;
+          continue;
+        }
+        if (!agg.avgPrice || agg.filledSize.lte(0) || agg.filledSize.lt(targetSize)) {
+          rejected.sizeTooSmall += 1;
+          continue;
+        }
+        const slippagePct = agg.avgPrice.minus(agg.bestAsk).div(agg.bestAsk);
+        if (slippagePct.gt(maxSlippagePct)) {
+          rejected.slippageTooHigh += 1;
           continue;
         }
         const snapshots = quotes.map((quote) => ({
@@ -3366,30 +3477,12 @@ app.post("/put/quote", async (req) => {
           timestampMs: quote.book.timestampMs ?? null,
           markPriceUsd: serializeDecimal(quote.book.markPriceUsd, 6)
         }));
-        snapshotsByStrike.set(new Decimal(inst.strike).toFixed(0), snapshots);
-        const agg = aggregateOptionQuotes(quotes, "buy", requiredSize);
-        if (!agg.bestBid || !agg.bestAsk) {
-          rejected.noBidAsk += 1;
-          continue;
-        }
-        if (agg.spread.gt(maxSpreadPct)) {
-          rejected.spreadTooWide += 1;
-          continue;
-        }
-        if (!agg.avgPrice || agg.filledSize.lte(0)) {
-          rejected.sizeTooSmall += 1;
-          continue;
-        }
-        const slippagePct = agg.avgPrice.minus(agg.bestAsk).div(agg.bestAsk);
-        if (slippagePct.gt(maxSlippagePct)) {
-          rejected.slippageTooHigh += 1;
-          continue;
-        }
+        snapshotsByStrike.set(strike.toFixed(0), snapshots);
 
         const ticker = await deribit.getTicker(inst.instrument_name);
         const iv = Number((ticker as any)?.result?.mark_iv ?? 0);
         const premiumPerUnit = agg.avgPrice;
-        const premiumTotal = premiumPerUnit.mul(requiredSize);
+        const premiumTotal = premiumPerUnit.mul(targetSize);
         const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
         const allInPremium = premiumTotal.mul(new Decimal(rollMultiplier));
         if (!bestCandidate || (!fastPreview && allInPremium.lt(bestCandidate.allInPremium))) {
@@ -3399,17 +3492,18 @@ app.post("/put/quote", async (req) => {
             premiumPerUnit,
             premiumTotal,
             availableSize: agg.totalAskSize,
-            strike: new Decimal(inst.strike),
+            strike,
             iv,
             spreadPct: agg.spread,
             rollMultiplier,
-            allInPremium
+            allInPremium,
+            hedgeSize: targetSize
           };
           bestSnapshots = snapshots;
           chosenExecutionPlans = agg.plans;
           chosenSnapshots = snapshotsByStrike;
         }
-        plansByStrike.set(new Decimal(inst.strike).toFixed(0), agg.plans);
+        plansByStrike.set(strike.toFixed(0), agg.plans);
         if (fastPreview && bestCandidate) {
           fastPreviewHit = true;
           break;
@@ -3439,6 +3533,12 @@ app.post("/put/quote", async (req) => {
   }
 
   const quote = bestCandidate;
+  if (quote?.hedgeSize) {
+    hedgeSizeForRenew = quote.hedgeSize;
+  }
+  if (quote?.hedgeSize) {
+    hedgeSizeForQuote = quote.hedgeSize;
+  }
   const survivalTolerance = new Decimal(
     riskControls.survival_tolerance_pct ?? 0.98
   );
@@ -3555,7 +3655,7 @@ app.post("/put/quote", async (req) => {
       drawdownFloorPct,
       optionType,
       strike: bestCandidate.strike,
-      hedgeSize: requiredSize,
+      hedgeSize: hedgeSizeForQuote,
       requiredSize,
       tolerancePct: survivalTolerance
     });
@@ -3567,7 +3667,7 @@ app.post("/put/quote", async (req) => {
           books: bestSnapshots
         }
       : null;
-    const canFullyCover = bestCandidate.availableSize.greaterThanOrEqualTo(requiredSize);
+    const canFullyCover = bestCandidate.availableSize.greaterThanOrEqualTo(hedgeSizeForQuote);
 
     if (premiumFloor.breached) {
       const minNotificationRatio = new Decimal(
@@ -3587,7 +3687,7 @@ app.post("/put/quote", async (req) => {
       if (canPassThrough && !passThroughCapped) {
         const venueInfo = attachVenueMetadata({
           selectionSnapshot: fallbackSnapshot,
-          hedgeSize: requiredSize.toFixed(4)
+          hedgeSize: hedgeSizeForQuote.toFixed(4)
         } as Record<string, unknown>);
         await audit("premium_pass_through", {
           type: "uncapped",
@@ -3615,7 +3715,7 @@ app.post("/put/quote", async (req) => {
           targetStrike: targetStrike.toNumber(),
           premiumUsdc: premiumTotal.toFixed(2),
           premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
+          hedgeSize: hedgeSizeForQuote.toFixed(4),
           sizingMethod: body.optionDelta ? "delta" : "notional",
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
@@ -3638,7 +3738,7 @@ app.post("/put/quote", async (req) => {
           rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
           hedge: {
             instrument: optionInstrument,
-            size: requiredSize.toFixed(4),
+            size: hedgeSizeForQuote.toFixed(4),
             premiumUsdc: allInPremium.toFixed(2),
             expiryTag: bestCandidate.expiryTag,
             daysToExpiry: bestCandidate.targetDays,
@@ -3740,7 +3840,7 @@ app.post("/put/quote", async (req) => {
             spotPrice: spotPrice.toNumber(),
             premiumUsdc: premiumTotal.toFixed(2),
             premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-            hedgeSize: requiredSize.toFixed(4),
+            hedgeSize: hedgeSizeForQuote.toFixed(4),
             sizingMethod: body.optionDelta ? "delta" : "notional",
             bufferTargetPct: "0.00",
             markIv: feeIv.raw,
@@ -3837,7 +3937,7 @@ app.post("/put/quote", async (req) => {
             spotPrice: spotPrice.toNumber(),
             premiumUsdc: premiumTotal.toFixed(2),
             premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-            hedgeSize: requiredSize.toFixed(4),
+            hedgeSize: hedgeSizeForQuote.toFixed(4),
             sizingMethod: body.optionDelta ? "delta" : "notional",
             bufferTargetPct: "0.00",
             markIv: feeIv.raw,
@@ -3894,7 +3994,7 @@ app.post("/put/quote", async (req) => {
 
         const venueInfo = attachVenueMetadata({
           selectionSnapshot: fallbackSnapshot,
-          hedgeSize: requiredSize.toFixed(4)
+          hedgeSize: hedgeSizeForQuote.toFixed(4)
         } as Record<string, unknown>);
         await audit("premium_pass_through", {
           type: "capped",
@@ -3924,7 +4024,7 @@ app.post("/put/quote", async (req) => {
           targetStrike: targetStrike.toNumber(),
           premiumUsdc: premiumTotal.toFixed(2),
           premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
+          hedgeSize: hedgeSizeForQuote.toFixed(4),
           sizingMethod: body.optionDelta ? "delta" : "notional",
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
@@ -3947,7 +4047,7 @@ app.post("/put/quote", async (req) => {
           rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
           hedge: {
             instrument: optionInstrument,
-            size: requiredSize.toFixed(4),
+            size: hedgeSizeForQuote.toFixed(4),
             premiumUsdc: allInPremium.toFixed(2),
             expiryTag: bestCandidate.expiryTag,
             daysToExpiry: bestCandidate.targetDays,
@@ -4048,7 +4148,7 @@ app.post("/put/quote", async (req) => {
         spotPrice: spotPrice.toNumber(),
         premiumUsdc: premiumTotal.toFixed(2),
         premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-        hedgeSize: requiredSize.toFixed(4),
+        hedgeSize: hedgeSizeForQuote.toFixed(4),
         sizingMethod: body.optionDelta ? "delta" : "notional",
         bufferTargetPct: "0.00",
         markIv: feeIv.raw,
@@ -4115,7 +4215,7 @@ app.post("/put/quote", async (req) => {
         instrument: optionInstrument,
         premiumUsdc: premiumTotal.toFixed(2),
         premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-        hedgeSize: requiredSize.toFixed(4),
+        hedgeSize: hedgeSizeForQuote.toFixed(4),
         sizingMethod: body.optionDelta ? "delta" : "notional",
         bufferTargetPct: "0.00",
         markIv: feeIv.raw,
@@ -4156,7 +4256,7 @@ app.post("/put/quote", async (req) => {
         instrument: optionInstrument,
         premiumUsdc: premiumTotal.toFixed(2),
         premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-        hedgeSize: requiredSize.toFixed(4),
+        hedgeSize: hedgeSizeForQuote.toFixed(4),
         sizingMethod: body.optionDelta ? "delta" : "notional",
         bufferTargetPct: "0.00",
         markIv: feeIv.raw,
@@ -4200,7 +4300,7 @@ app.post("/put/quote", async (req) => {
           instrument: optionInstrument,
           premiumUsdc: premiumTotal.toFixed(2),
           premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
+          hedgeSize: hedgeSizeForQuote.toFixed(4),
           sizingMethod: body.optionDelta ? "delta" : "notional",
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
@@ -4253,7 +4353,7 @@ app.post("/put/quote", async (req) => {
           strike: bestCandidate.strike.toFixed(0),
           premiumUsdc: bestCandidate.premiumPerUnit.mul(partialSize).toFixed(2),
           premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
+          hedgeSize: hedgeSizeForQuote.toFixed(4),
           sizingMethod: body.optionDelta ? "delta" : "notional",
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
@@ -4420,7 +4520,7 @@ app.post("/put/quote", async (req) => {
     leverage,
     premiumRatio: premiumFloor.ratio.toFixed(4)
   });
-  const canFullyCoverQuote = quote.availableSize.greaterThanOrEqualTo(requiredSize);
+  const canFullyCoverQuote = quote.availableSize.greaterThanOrEqualTo(hedgeSizeForQuote);
   if (premiumFloor.breached && canPassThrough && passThroughCapped && passThroughCapInfo.maxFee) {
     const cappedFee = passThroughCapInfo.maxFee;
     const optionSymbol = optionType === "put" ? "P" : "C";
@@ -4441,7 +4541,7 @@ app.post("/put/quote", async (req) => {
               books: bestSnapshots
             }
           : null,
-        hedgeSize: requiredSize.toFixed(4)
+        hedgeSize: hedgeSizeForQuote.toFixed(4)
       } as Record<string, unknown>);
       await audit("premium_pass_through", {
         type: "capped_with_subsidy",
@@ -4457,7 +4557,7 @@ app.post("/put/quote", async (req) => {
         leverage,
         optionType,
         instrument: optionInstrument,
-        hedgeSize: requiredSize.toFixed(4),
+        hedgeSize: hedgeSizeForQuote.toFixed(4),
         fullProtection: true,
         optionVenue: (venueInfo as any).optionVenue ?? null,
         venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
@@ -4469,7 +4569,7 @@ app.post("/put/quote", async (req) => {
         strike: quote.strike.toFixed(0),
         premiumUsdc: quote.premiumTotal.toFixed(2),
         premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-        hedgeSize: requiredSize.toFixed(4),
+        hedgeSize: hedgeSizeForQuote.toFixed(4),
         sizingMethod: body.optionDelta ? "delta" : "notional",
         bufferTargetPct: "0.00",
         markIv: feeIv.raw,
@@ -4493,7 +4593,7 @@ app.post("/put/quote", async (req) => {
           drawdownFloorPct,
           optionType,
           strike: quote.strike,
-          hedgeSize: requiredSize,
+          hedgeSize: hedgeSizeForQuote,
           requiredSize,
           tolerancePct: survivalTolerance
         }),
@@ -4562,7 +4662,7 @@ app.post("/put/quote", async (req) => {
         strike: quote.strike.toFixed(0),
         premiumUsdc: quote.premiumTotal.toFixed(2),
         premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-        hedgeSize: requiredSize.toFixed(4),
+        hedgeSize: hedgeSizeForQuote.toFixed(4),
         sizingMethod: body.optionDelta ? "delta" : "notional",
         bufferTargetPct: "0.00",
         markIv: feeIv.raw,
@@ -4585,7 +4685,7 @@ app.post("/put/quote", async (req) => {
           drawdownFloorPct,
           optionType,
           strike: quote.strike,
-          hedgeSize: requiredSize,
+          hedgeSize: hedgeSizeForQuote,
           requiredSize,
           tolerancePct: survivalTolerance
         }),
@@ -4655,7 +4755,7 @@ app.post("/put/quote", async (req) => {
             strike: quote.strike.toFixed(0),
             premiumUsdc: quote.premiumPerUnit.mul(partialSize).toFixed(2),
             premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-            hedgeSize: requiredSize.toFixed(4),
+            hedgeSize: hedgeSizeForQuote.toFixed(4),
             sizingMethod: body.optionDelta ? "delta" : "notional",
             bufferTargetPct: "0.00",
             markIv: feeIv.raw,
@@ -4678,7 +4778,7 @@ app.post("/put/quote", async (req) => {
               drawdownFloorPct,
               optionType,
               strike: quote.strike,
-              hedgeSize: requiredSize,
+              hedgeSize: hedgeSizeForQuote,
               requiredSize,
               tolerancePct: survivalTolerance
             }),
@@ -4770,7 +4870,7 @@ app.post("/put/quote", async (req) => {
           strike: quote.strike.toFixed(0),
           premiumUsdc: quote.premiumTotal.toFixed(2),
           premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
+          hedgeSize: hedgeSizeForQuote.toFixed(4),
           sizingMethod: body.optionDelta ? "delta" : "notional",
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
@@ -4794,7 +4894,7 @@ app.post("/put/quote", async (req) => {
             drawdownFloorPct,
             optionType,
             strike: quote.strike,
-            hedgeSize: requiredSize,
+            hedgeSize: hedgeSizeForQuote,
             requiredSize,
             tolerancePct: survivalTolerance
           }),
@@ -4818,7 +4918,7 @@ app.post("/put/quote", async (req) => {
           strike: quote.strike.toFixed(0),
           premiumUsdc: quote.premiumTotal.toFixed(2),
           premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
+          hedgeSize: hedgeSizeForQuote.toFixed(4),
           sizingMethod: body.optionDelta ? "delta" : "notional",
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
@@ -4844,7 +4944,7 @@ app.post("/put/quote", async (req) => {
             drawdownFloorPct,
             optionType,
             strike: quote.strike,
-            hedgeSize: requiredSize,
+            hedgeSize: hedgeSizeForQuote,
             requiredSize,
             tolerancePct: survivalTolerance
           }),
@@ -4924,7 +5024,7 @@ app.post("/put/quote", async (req) => {
     score: null,
     liquidityOverride: liquidityOverrideUsed,
     hedgeSize: (() => {
-      const adjusted = hedgeSize.mul(hedgeFactor);
+      const adjusted = hedgeSizeForQuote.mul(hedgeFactor);
       const available = quote.availableSize;
       return capHedgeSize(adjusted, available).toFixed(4);
     })(),
@@ -5214,7 +5314,19 @@ app.post("/put/auto-renew", async (req) => {
   const baseMaxSlippagePct = riskControls.max_slippage_pct ?? 0.01;
   const useBodySpread = false;
   const useBodySlippage = false;
-  const requiredSize = new Decimal(body.amount ?? 0);
+  const minSize = new Decimal(riskControls.min_option_size ?? 0.01);
+  const requestedSize = new Decimal(body.amount ?? 0);
+  const ledgerCoverage = body.coverageId ? coverageLedger.get(body.coverageId) : null;
+  const ledgerRequiredSize = ledgerCoverage?.positions?.length
+    ? ledgerCoverage.positions.reduce((acc, pos) => {
+        const notional = new Decimal(pos.marginUsd || 0).mul(new Decimal(pos.leverage || 1));
+        const sizeUnits = pos.entryPrice ? notional.div(new Decimal(pos.entryPrice)) : new Decimal(0);
+        return acc.add(sizeUnits);
+      }, new Decimal(0))
+    : null;
+  const baseRequiredSize = Decimal.max(minSize, ledgerRequiredSize ?? requestedSize);
+  const requiredSize = baseRequiredSize;
+  let hedgeSizeForRenew = requiredSize;
   const spotPrice = new Decimal(body.spotPrice);
   const drawdownFloorPct = new Decimal(body.drawdownFloorPct);
   const tierName = body.tierName || "Unknown";
@@ -5256,6 +5368,7 @@ app.post("/put/auto-renew", async (req) => {
     spreadPct: Decimal;
     rollMultiplier: number;
     allInPremium: Decimal;
+    hedgeSize: Decimal;
   } | null = null;
   let bestSnapshots: QuoteBookSnapshot[] | null = null;
   const liquidityOverrideEnabled = riskControls.liquidity_override_enabled ?? false;
@@ -5295,8 +5408,35 @@ app.post("/put/auto-renew", async (req) => {
       );
 
       for (const inst of strikeCandidates) {
-        const quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+        let quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
         if (!quotes.length) continue;
+        const strike = new Decimal(inst.strike);
+        const coverageSize = requiredHedgeSizeForFullCoverage({
+          spotPrice,
+          drawdownFloorPct,
+          optionType,
+          strike,
+          requiredSize
+        });
+        if (!coverageSize) continue;
+        const targetSize = Decimal.max(minSize, coverageSize);
+        let agg = aggregateOptionQuotes(quotes, "buy", targetSize);
+        if (
+          venueConfig.mode === "bybit_only" &&
+          agg.filledSize.lt(targetSize) &&
+          venueConfig.deribit_enabled
+        ) {
+          const deribitQuote = await fetchDeribitQuoteForInstrument(inst.instrument_name, spotPrice);
+          if (deribitQuote) {
+            quotes = [...quotes, deribitQuote];
+            agg = aggregateOptionQuotes(quotes, "buy", targetSize);
+          }
+        }
+        if (!agg.bestBid || !agg.bestAsk) continue;
+        if (agg.spread.gt(maxSpreadPct)) continue;
+        if (!agg.avgPrice || agg.filledSize.lte(0) || agg.filledSize.lt(targetSize)) continue;
+        const slippagePct = agg.avgPrice.minus(agg.bestAsk).div(agg.bestAsk);
+        if (slippagePct.gt(maxSlippagePct)) continue;
         const snapshots = quotes.map((quote) => ({
           venue: quote.venue,
           instrument: quote.instrument,
@@ -5308,18 +5448,12 @@ app.post("/put/auto-renew", async (req) => {
           timestampMs: quote.book.timestampMs ?? null,
           markPriceUsd: serializeDecimal(quote.book.markPriceUsd, 6)
         }));
-        snapshotsByStrike.set(new Decimal(inst.strike).toFixed(0), snapshots);
-        const agg = aggregateOptionQuotes(quotes, "buy", requiredSize);
-        if (!agg.bestBid || !agg.bestAsk) continue;
-        if (agg.spread.gt(maxSpreadPct)) continue;
-        if (!agg.avgPrice || agg.filledSize.lte(0)) continue;
-        const slippagePct = agg.avgPrice.minus(agg.bestAsk).div(agg.bestAsk);
-        if (slippagePct.gt(maxSlippagePct)) continue;
+        snapshotsByStrike.set(strike.toFixed(0), snapshots);
 
         const ticker = await deribit.getTicker(inst.instrument_name);
         const iv = Number((ticker as any)?.result?.mark_iv ?? 0);
         const premiumPerUnit = agg.avgPrice;
-        const premiumTotal = premiumPerUnit.mul(requiredSize);
+        const premiumTotal = premiumPerUnit.mul(targetSize);
         const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
         const allInPremium = premiumTotal.mul(new Decimal(rollMultiplier));
         if (!bestCandidate || allInPremium.lt(bestCandidate.allInPremium)) {
@@ -5329,17 +5463,18 @@ app.post("/put/auto-renew", async (req) => {
             premiumPerUnit,
             premiumTotal,
             availableSize: agg.totalAskSize,
-            strike: new Decimal(inst.strike),
+            strike,
             iv,
             spreadPct: agg.spread,
             rollMultiplier,
-            allInPremium
+            allInPremium,
+            hedgeSize: targetSize
           };
           bestSnapshots = snapshots;
           chosenExecutionPlans = agg.plans;
           chosenSnapshots = snapshotsByStrike;
         }
-        plansByStrike.set(new Decimal(inst.strike).toFixed(0), agg.plans);
+        plansByStrike.set(strike.toFixed(0), agg.plans);
       }
     }
 
@@ -5364,7 +5499,7 @@ app.post("/put/auto-renew", async (req) => {
   let renewReason = "flat_fee";
   let subsidyUsdc = new Decimal(0);
   let effectiveFeeUsdc = new Decimal(body.fixedPriceUsdc);
-  let effectiveSize = requiredSize;
+  let effectiveSize = hedgeSizeForRenew;
   let effectiveExpiryTag = quote?.expiryTag || body.expiryTag || "";
   let effectiveStrike: Decimal | null = quote?.strike ?? null;
   let effectivePremiumUsdc = quote?.premiumTotal ?? new Decimal(0);
@@ -5379,7 +5514,7 @@ app.post("/put/auto-renew", async (req) => {
         drawdownFloorPct,
         optionType,
         strike: quote.strike,
-        hedgeSize: requiredSize,
+        hedgeSize: hedgeSizeForRenew,
         requiredSize,
         tolerancePct: survivalTolerance
       })
@@ -5472,7 +5607,7 @@ app.post("/put/auto-renew", async (req) => {
     premiumRatio: renewPremiumFloor.ratio.toFixed(4)
   });
   const canFullyCover = effectiveAvailableSize
-    ? effectiveAvailableSize.greaterThanOrEqualTo(requiredSize)
+    ? effectiveAvailableSize.greaterThanOrEqualTo(effectiveSize)
     : false;
   if (renewPremiumFloor.breached && renewReason !== "pass_through") {
     if (renewCanPassThrough && !renewPassThroughCapped) {
