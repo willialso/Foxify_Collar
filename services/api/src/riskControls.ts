@@ -54,9 +54,21 @@ export interface RiskControlsConfig {
       high?: number;
     }
   >;
+  dynamic_cap_enabled?: boolean;
+  dynamic_cap_max_uplift_pct?: number;
+  dynamic_cap_liquidity_ratio_low?: number;
+  dynamic_cap_liquidity_ratio_high?: number;
+  dynamic_cap_iv_uplift_pct_normal?: number;
+  dynamic_cap_iv_uplift_pct_high?: number;
   fee_leverage_multipliers_by_x?: Record<string, number>;
   pass_through_cap_by_leverage?: Record<string, number>;
   pass_through_cap_by_tier?: Record<string, Record<string, number>>;
+  dynamic_cap_enabled?: boolean;
+  dynamic_cap_max_uplift_pct?: number;
+  dynamic_cap_liquidity_ratio_low?: number;
+  dynamic_cap_liquidity_ratio_high?: number;
+  dynamic_cap_iv_uplift_pct_normal?: number;
+  dynamic_cap_iv_uplift_pct_high?: number;
   max_leverage_by_tier?: Record<string, { put: number; call: number }>;
   enable_premium_pass_through?: boolean;
   require_user_opt_in_for_pass_through?: boolean;
@@ -149,6 +161,12 @@ const DEFAULTS: RiskControlsConfig = {
     high: 0.8
   },
   fee_iv_regime_multipliers_by_tier: {},
+  dynamic_cap_enabled: true,
+  dynamic_cap_max_uplift_pct: 0.25,
+  dynamic_cap_liquidity_ratio_low: 1.0,
+  dynamic_cap_liquidity_ratio_high: 1.5,
+  dynamic_cap_iv_uplift_pct_normal: 0.1,
+  dynamic_cap_iv_uplift_pct_high: 0.25,
   fee_leverage_multipliers_by_x: {},
   pass_through_cap_by_leverage: {},
   pass_through_cap_by_tier: {},

@@ -103,5 +103,15 @@
   "ctc_price_buffer_pct": 0.02,
   "enable_premium_pass_through": true,
   "require_user_opt_in_for_pass_through": false,
-  "pass_through_min_notification_ratio": 1.5
+  "pass_through_min_notification_ratio": 1.5,
+  "fee_iv_regime_thresholds": {
+    "low": 0.5,
+    "high": 0.8
+  },
+  "dynamic_cap_enabled": true,
+  "dynamic_cap_max_uplift_pct": 0.25,
+  "dynamic_cap_liquidity_ratio_low": 1.0,
+  "dynamic_cap_liquidity_ratio_high": 1.5,
+  "dynamic_cap_iv_uplift_pct_normal": 0.1,
+  "dynamic_cap_iv_uplift_pct_high": 0.25
 }

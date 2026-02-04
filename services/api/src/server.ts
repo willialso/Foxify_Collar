@@ -48,7 +48,8 @@ import {
   canApplySubsidy,
   recordSubsidy,
   subsidySummary,
-  resetRiskState
+  resetRiskState,
+  type LiquidityState
 } from "./riskControls";
 import { sendWebhookAlert } from "@foxify/hedging";
 
@@ -438,6 +439,7 @@ function upsertCoverageLedger(
     hedgeType: update.hedgeType ?? existing?.hedgeType ?? null,
     optionType: update.optionType ?? existing?.optionType ?? null,
     strike: update.strike ?? existing?.strike ?? null,
+    coverageLegs: update.coverageLegs ?? existing?.coverageLegs ?? undefined,
     notionalUsdc: update.notionalUsdc ?? existing?.notionalUsdc ?? null,
     floorUsd: update.floorUsd ?? existing?.floorUsd ?? null,
     equityUsd: update.equityUsd ?? existing?.equityUsd ?? null,
@@ -577,6 +579,13 @@ type CoverageLedgerEntry = {
   hedgeType?: "option" | "perp" | null;
   optionType?: "put" | "call" | null;
   strike?: number | null;
+  coverageLegs?: Array<{
+    instrument: string;
+    size: number;
+    venue?: string | null;
+    optionType?: "put" | "call" | null;
+    strike?: number | null;
+  }>;
   notionalUsdc?: number | null;
   floorUsd?: number | null;
   equityUsd?: number | null;
@@ -794,6 +803,31 @@ function shouldLogMtmUpdate(params: {
   return false;
 }
 
+function mergeCoverageLegs(
+  existing: CoverageLedgerEntry["coverageLegs"] | undefined,
+  leg: {
+    instrument: string;
+    size: number;
+    venue?: string | null;
+    optionType?: "put" | "call" | null;
+    strike?: number | null;
+  }
+): CoverageLedgerEntry["coverageLegs"] {
+  const legs = Array.isArray(existing) ? existing.slice() : [];
+  const idx = legs.findIndex((entry) => entry.instrument === leg.instrument);
+  if (idx >= 0) {
+    const updated = { ...legs[idx] };
+    updated.size = Number(updated.size || 0) + leg.size;
+    updated.venue = leg.venue ?? updated.venue;
+    updated.optionType = leg.optionType ?? updated.optionType;
+    updated.strike = leg.strike ?? updated.strike;
+    legs[idx] = updated;
+    return legs;
+  }
+  legs.push({ ...leg });
+  return legs;
+}
+
 function sumCoverageCredits(): Decimal {
   let total = new Decimal(0);
   for (const entry of coverageLedger.values()) {
@@ -844,11 +878,30 @@ async function computeCoverageMtmSnapshots(): Promise<void> {
       const notional = new Decimal(pos.marginUsd || 0).mul(new Decimal(pos.leverage || 1));
       return acc.add(notional);
     }, new Decimal(0));
-    const hedgeSize = entry.hedgeSize ? new Decimal(entry.hedgeSize) : new Decimal(0);
+    const hedgeSize = Array.isArray(entry.coverageLegs)
+      ? new Decimal(
+          entry.coverageLegs.reduce((sum, leg) => sum + Number(leg.size || 0), 0)
+        )
+      : entry.hedgeSize
+        ? new Decimal(entry.hedgeSize)
+        : new Decimal(0);
     const hedgeVenue =
       entry.markSource ?? entry.selectedVenue ?? inferVenueFromInstrument(entry.hedgeInstrument);
     let hedgeMtmTotal = new Decimal(0);
-    if (
+    if (Array.isArray(entry.coverageLegs) && entry.coverageLegs.length > 0) {
+      for (const leg of entry.coverageLegs) {
+        if (!leg.instrument || !leg.size) continue;
+        const legVenue = leg.venue ?? hedgeVenue;
+        const mark = await fetchCoverageOptionMarkUsdc(
+          legVenue ?? "deribit",
+          leg.instrument,
+          spotPrice
+        );
+        if (mark) {
+          hedgeMtmTotal = hedgeMtmTotal.add(mark.mul(new Decimal(leg.size)));
+        }
+      }
+    } else if (
       entry.hedgeType === "option" &&
       entry.hedgeInstrument &&
       hedgeSize.gt(0) &&
@@ -865,6 +918,25 @@ async function computeCoverageMtmSnapshots(): Promise<void> {
       entry.equityUsd && entry.floorUsd && entry.equityUsd > 0
         ? new Decimal(1).minus(new Decimal(entry.floorUsd).div(entry.equityUsd))
         : new Decimal(0.2);
+    const optionType = entry.optionType ?? "put";
+    const floorPrice = computeFloorPrice(spotPrice, drawdownFloorPct, optionType);
+    let coverageCreditTotal = new Decimal(0);
+    if (Array.isArray(entry.coverageLegs) && entry.coverageLegs.length > 0) {
+      for (const leg of entry.coverageLegs) {
+        if (!Number.isFinite(leg.strike) || !leg.size) continue;
+        const intrinsic = computeIntrinsicAtFloor({
+          spotPrice,
+          drawdownFloorPct,
+          optionType: leg.optionType ?? optionType,
+          strike: new Decimal(leg.strike)
+        });
+        if (intrinsic.gt(0)) {
+          coverageCreditTotal = coverageCreditTotal.add(
+            intrinsic.mul(new Decimal(leg.size))
+          );
+        }
+      }
+    }
     const survivalTolerance = new Decimal(riskControls.survival_tolerance_pct ?? 0.98);
 
     for (const position of entry.positions) {
@@ -897,15 +969,21 @@ async function computeCoverageMtmSnapshots(): Promise<void> {
       const survivalCheck = buildSurvivalCheck({
         spotPrice,
         drawdownFloorPct,
-        optionType: entry.optionType ?? "put",
+        optionType,
         strike: entry.strike ? new Decimal(entry.strike) : null,
         hedgeSize: hedgedSize,
         requiredSize: sizeUnits,
         tolerancePct: survivalTolerance
       });
-      const coverageRatio = survivalCheck?.coverageRatio
+      const coverageRatioBase = survivalCheck?.coverageRatio
         ? new Decimal(survivalCheck.coverageRatio)
         : null;
+      const requiredCredit = spotPrice.sub(floorPrice).abs().mul(sizeUnits);
+      const coverageRatio = coverageCreditTotal.gt(0)
+        ? requiredCredit.gt(0)
+          ? coverageCreditTotal.mul(hedgeShare).div(requiredCredit)
+          : null
+        : coverageRatioBase;
       let creditApplied = new Decimal(0);
       if (bufferUsdc.isNegative()) {
         creditApplied = bufferUsdc.abs();
@@ -960,7 +1038,7 @@ async function computeCoverageMtmSnapshots(): Promise<void> {
         hedgeSize: hedgedSize.toFixed(6),
         optionType: entry.optionType ?? null,
         strike: entry.strike ?? null,
-        floorPrice: survivalCheck?.floorPrice ?? null,
+        floorPrice: survivalCheck?.floorPrice ?? floorPrice.toFixed(2),
         mtmAttribution: entry.mtmAttribution ?? "position"
       });
       upsertCoverageLedger({
@@ -1209,19 +1287,74 @@ function resolvePassThroughCapMultiplier(leverage?: number, tierName?: string): 
   return new Decimal(selected);
 }
 
+function resolveDynamicCapMultiplier(ivScaled: number, liquidity: LiquidityState): Decimal {
+  const enabled = riskControls.dynamic_cap_enabled !== false;
+  if (!enabled) return new Decimal(1);
+  const ivValue = Number.isFinite(ivScaled) ? ivScaled : 0;
+  const baseLiquidity = riskControls.initial_liquidity_usdc ?? 0;
+  const liquidityRatio =
+    baseLiquidity > 0 ? liquidity.liquidityBalanceUsdc / baseLiquidity : 0;
+  const low = riskControls.dynamic_cap_liquidity_ratio_low ?? 1.0;
+  const high = riskControls.dynamic_cap_liquidity_ratio_high ?? 1.5;
+  const liquidityScore =
+    liquidityRatio <= low
+      ? 0
+      : liquidityRatio >= high
+        ? 1
+        : (liquidityRatio - low) / (high - low);
+  const thresholds = riskControls.fee_iv_regime_thresholds ?? { low: 0.5, high: 0.8 };
+  const normalUplift = riskControls.dynamic_cap_iv_uplift_pct_normal ?? 0.1;
+  const highUplift = riskControls.dynamic_cap_iv_uplift_pct_high ?? 0.25;
+  const maxUplift = riskControls.dynamic_cap_max_uplift_pct ?? 0.25;
+  let ivBoost = 0;
+  if (ivValue >= thresholds.high) {
+    ivBoost = highUplift;
+  } else if (ivValue >= thresholds.low) {
+    ivBoost = normalUplift;
+  }
+  const uplift = Math.min(maxUplift, ivBoost * liquidityScore);
+  return new Decimal(1).add(new Decimal(uplift));
+}
+
 function applyPassThroughCap(
   baseFee: Decimal,
   allInPremium: Decimal,
   leverage?: number,
-  tierName?: string
-): { maxFee: Decimal | null; capped: boolean; capMultiplier: Decimal | null; tierName?: string } {
+  tierName?: string,
+  ivScaled = 0,
+  liquidity = liquiditySummary()
+): {
+  maxFee: Decimal | null;
+  capped: boolean;
+  capMultiplier: Decimal | null;
+  dynamicMultiplier: Decimal;
+  tierName?: string;
+} {
   const capMultiplier = resolvePassThroughCapMultiplier(leverage, tierName);
   if (!capMultiplier) {
-    return { maxFee: null, capped: false, capMultiplier: null, tierName };
+    return {
+      maxFee: null,
+      capped: false,
+      capMultiplier: null,
+      dynamicMultiplier: new Decimal(1),
+      tierName
+    };
   }
-  const maxFee = baseFee.mul(capMultiplier);
+  const dynamicMultiplier = resolveDynamicCapMultiplier(ivScaled, liquidity);
+  const maxFee = baseFee.mul(capMultiplier).mul(dynamicMultiplier);
   const capped = allInPremium.gt(maxFee);
-  return { maxFee, capped, capMultiplier, tierName };
+  return { maxFee, capped, capMultiplier, dynamicMultiplier, tierName };
+}
+
+function formatCapMultiplier(
+  info: {
+    capMultiplier: Decimal | null;
+    dynamicMultiplier: Decimal;
+  },
+  digits = 4
+): string | null {
+  if (!info.capMultiplier) return null;
+  return info.capMultiplier.mul(info.dynamicMultiplier).toFixed(digits);
 }
 
 function resolvePremiumMarkupPct(tierName: string, leverage?: number): Decimal {
@@ -2815,16 +2948,29 @@ app.post("/deribit/order", async (req) => {
     await saveHedgeLedger();
   }
   if (body.coverageId) {
+    const legSize = Number.isFinite(filledAmount) ? filledAmount : body.amount;
+    const existing = coverageLedger.get(body.coverageId);
+    const coverageLegs =
+      inferredHedgeType === "option"
+        ? mergeCoverageLegs(existing?.coverageLegs, {
+            instrument,
+            size: legSize,
+            venue,
+            optionType: resolvedOptionType,
+            strike: resolvedStrike
+          })
+        : existing?.coverageLegs;
     upsertCoverageLedger({
       coverageId: body.coverageId,
       hedgeInstrument: instrument,
-      hedgeSize: Number.isFinite(filledAmount) ? filledAmount : body.amount,
+      hedgeSize: legSize,
       hedgeType: inferredHedgeType === "option" ? "option" : "perp",
       optionType: resolvedOptionType,
       strike: resolvedStrike,
       selectedVenue: venue,
       markSource: venue === "bybit" || venue === "deribit" ? venue : null,
-      notionalUsdc: body.notionalUsdc ?? null
+      notionalUsdc: body.notionalUsdc ?? null,
+      coverageLegs
     });
     await saveCoverageLedger();
   }
@@ -3736,7 +3882,13 @@ app.post("/put/quote", async (req) => {
     const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
     const userOptedIn = body.allowPremiumPassThrough !== false;
     const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
-    const passThroughCapInfo = applyPassThroughCap(baseFeeUsdc, allInPremium, leverage, tierName);
+    const passThroughCapInfo = applyPassThroughCap(
+      baseFeeUsdc,
+      allInPremium,
+      leverage,
+      tierName,
+      feeIv.scaled ?? 0
+    );
     const passThroughCapped = passThroughCapInfo.maxFee
       ? passThroughFee.gt(passThroughCapInfo.maxFee)
       : false;
@@ -3847,9 +3999,7 @@ app.post("/put/quote", async (req) => {
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
+          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
           passThroughCapped: false,
           reason: "premium_floor_pass_through",
           liquidityOverride: liquidityOverrideUsed,
@@ -3906,7 +4056,7 @@ app.post("/put/quote", async (req) => {
             canPassThrough,
             capped: true,
             capMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(4)
+              ? formatCapMultiplier(passThroughCapInfo)
               : null,
             tierName,
             leverage,
@@ -3972,9 +4122,7 @@ app.post("/put/quote", async (req) => {
             feeRegime: feeRegime.regime,
             feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
             feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-            passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(4)
-              : null,
+            passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
             passThroughCapped: true,
             reason: rejectReason,
             liquidityOverride: liquidityOverrideUsed,
@@ -4004,11 +4152,11 @@ app.post("/put/quote", async (req) => {
               ratio,
               threshold,
               capMultiplier: passThroughCapInfo.capMultiplier
-                ? passThroughCapInfo.capMultiplier.toFixed(2)
+                ? formatCapMultiplier(passThroughCapInfo, 2)
                 : "N/A",
               explanation:
                 `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
-                `of ${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}×. ` +
+                `of ${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}×. ` +
                 `Reduce leverage, duration, or widen the floor to lower premium.`
             },
             warning: {
@@ -4040,7 +4188,7 @@ app.post("/put/quote", async (req) => {
             canPassThrough,
             capped: true,
             capMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(4)
+              ? formatCapMultiplier(passThroughCapInfo)
               : null,
             tierName,
             leverage,
@@ -4069,9 +4217,7 @@ app.post("/put/quote", async (req) => {
             feeRegime: feeRegime.regime,
             feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
             feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-            passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(4)
-              : null,
+            passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
             passThroughCapped: true,
             reason: rejectReason,
             liquidityOverride: liquidityOverrideUsed,
@@ -4086,11 +4232,11 @@ app.post("/put/quote", async (req) => {
               ratio,
               threshold,
               capMultiplier: passThroughCapInfo.capMultiplier
-                ? passThroughCapInfo.capMultiplier.toFixed(2)
+                ? formatCapMultiplier(passThroughCapInfo, 2)
                 : "N/A",
               explanation:
                 `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds maximum ` +
-                `${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
+                `${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
                 `Try: lower leverage, shorter duration, wider floor, or smaller size.`
             },
             warning: {
@@ -4124,7 +4270,7 @@ app.post("/put/quote", async (req) => {
           allInPremium: allInPremium.toFixed(2),
           cappedFee: cappedFee.toFixed(2),
           capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
+            ? formatCapMultiplier(passThroughCapInfo)
             : null,
           ratio,
           tierName,
@@ -4156,9 +4302,7 @@ app.post("/put/quote", async (req) => {
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
+          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
           passThroughCapped: true,
           reason: "premium_floor_pass_through_capped",
           liquidityOverride: liquidityOverrideUsed,
@@ -4181,7 +4325,7 @@ app.post("/put/quote", async (req) => {
             hedgePremium: allInPremium.toFixed(2),
             cappedFee: cappedFee.toFixed(2),
             capMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(2)
+              ? formatCapMultiplier(passThroughCapInfo, 2)
               : "N/A",
             platformSubsidy: subsidyNeededCapped.toFixed(2),
             totalFee: cappedFee.toFixed(2),
@@ -4190,7 +4334,7 @@ app.post("/put/quote", async (req) => {
             explanation:
               `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds ${tierName} tier cap. ` +
               `Fee capped at $${cappedFee.toFixed(2)} ` +
-              `(${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× base). ` +
+              `(${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}× base). ` +
               `Platform subsidizing $${subsidyNeededCapped.toFixed(2)} for full protection.`
           },
           warning: shouldNotify
@@ -4218,7 +4362,7 @@ app.post("/put/quote", async (req) => {
         canPassThrough,
         capped: passThroughCapped,
         capMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
+          ? formatCapMultiplier(passThroughCapInfo)
           : null,
         tierName,
         leverage,
@@ -4280,9 +4424,7 @@ app.post("/put/quote", async (req) => {
         feeRegime: feeRegime.regime,
         feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
         feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
+        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
         passThroughCapped: passThroughCapped,
         reason: rejectReason,
         liquidityOverride: liquidityOverrideUsed,
@@ -4298,11 +4440,11 @@ app.post("/put/quote", async (req) => {
           ratio,
           threshold,
           capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(2)
+            ? formatCapMultiplier(passThroughCapInfo, 2)
             : "N/A",
           explanation: passThroughCapped
             ? `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds maximum ` +
-              `${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
+              `${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
               `Try: lower leverage, shorter duration, wider floor, or smaller size.`
             : `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds threshold. ` +
               `Pass-through not enabled. Contact support if you need higher limits.`
@@ -4346,9 +4488,7 @@ app.post("/put/quote", async (req) => {
         feeRegime: feeRegime.regime,
         feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
         feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
+        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
         passThroughCapped: passThroughCapped,
         reason: "subsidized",
         capBreached: false,
@@ -4387,9 +4527,7 @@ app.post("/put/quote", async (req) => {
         feeRegime: feeRegime.regime,
         feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
         feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
+        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
         passThroughCapped: passThroughCapped,
         reason: "coverage_override",
         capBreached: true,
@@ -4404,7 +4542,13 @@ app.post("/put/quote", async (req) => {
     }
 
     if (canPassThrough && allInPremium.gt(feeUsdc)) {
-      const passThroughCapInfoLate = applyPassThroughCap(baseFeeUsdc, allInPremium, leverage, tierName);
+      const passThroughCapInfoLate = applyPassThroughCap(
+        baseFeeUsdc,
+        allInPremium,
+        leverage,
+        tierName,
+        feeIv.scaled ?? 0
+      );
       if (!passThroughCapInfoLate.capped) {
         const optionSymbol = optionType === "put" ? "P" : "C";
         const optionInstrument = buildVenueInstrumentName(
@@ -4431,9 +4575,7 @@ app.post("/put/quote", async (req) => {
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfoLate.capMultiplier
-            ? passThroughCapInfoLate.capMultiplier.toFixed(4)
-            : null,
+          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfoLate),
           passThroughCapped: false,
           reason: "pass_through",
           liquidityOverride: liquidityOverrideUsed,
@@ -4461,7 +4603,7 @@ app.post("/put/quote", async (req) => {
           canPassThrough,
           capped: passThroughCapped,
           capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
+            ? formatCapMultiplier(passThroughCapInfo)
             : null,
           tierName,
           leverage,
@@ -4485,9 +4627,7 @@ app.post("/put/quote", async (req) => {
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
+          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
           passThroughCapped: passThroughCapped,
           reason: "partial_not_allowed",
           liquidityOverride: liquidityOverrideUsed,
@@ -4537,9 +4677,7 @@ app.post("/put/quote", async (req) => {
         feeRegime: feeRegime.regime,
         feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
         feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
+        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
         passThroughCapped: passThroughCapped,
         reason: "partial",
         liquidityOverride: liquidityOverrideUsed,
@@ -4618,7 +4756,13 @@ app.post("/put/quote", async (req) => {
   const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
   const userOptedIn = body.allowPremiumPassThrough !== false;
   const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
-  const passThroughCapInfo = applyPassThroughCap(baseFeeUsdc, allInPremium, leverage, tierName);
+  const passThroughCapInfo = applyPassThroughCap(
+    baseFeeUsdc,
+    allInPremium,
+    leverage,
+    tierName,
+    feeIv.scaled ?? 0
+  );
   const passThroughCapped = passThroughCapInfo.maxFee
     ? passThroughFee.gt(passThroughCapInfo.maxFee)
     : false;
@@ -4672,7 +4816,7 @@ app.post("/put/quote", async (req) => {
         cappedFee: cappedFee.toFixed(2),
         platformSubsidy: subsidyNeededFull.toFixed(2),
         capMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(2)
+          ? formatCapMultiplier(passThroughCapInfo, 2)
           : null,
         ratio: premiumFloor.ratio.toFixed(4),
         tierName,
@@ -4703,9 +4847,7 @@ app.post("/put/quote", async (req) => {
         feeRegime: feeRegime.regime,
         feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
         feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
+        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
         passThroughCapped: true,
         reason: "pass_through_capped_subsidized",
         liquidityOverride: liquidityOverrideUsed,
@@ -4736,7 +4878,7 @@ app.post("/put/quote", async (req) => {
           hedgePremium: allInPremium.toFixed(2),
           cappedFee: cappedFee.toFixed(2),
           capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(2)
+            ? formatCapMultiplier(passThroughCapInfo, 2)
             : "N/A",
           platformSubsidy: subsidyNeededFull.toFixed(2),
           ratio: premiumFloor.ratio.toFixed(4),
@@ -4744,14 +4886,14 @@ app.post("/put/quote", async (req) => {
           explanation:
             `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds ${tierName} tier cap. ` +
             `Fee capped at $${cappedFee.toFixed(2)} ` +
-            `(${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× base). ` +
+            `(${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}× base). ` +
             `Platform subsidizing $${subsidyNeededFull.toFixed(2)} for full protection.`
         },
         warning: {
           type: "premium_capped_full_protection",
           ratio: premiumFloor.ratio.toFixed(4),
           capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(2)
+            ? formatCapMultiplier(passThroughCapInfo, 2)
             : "N/A",
           message:
             `Premium exceeds tier cap. Fee capped at $${cappedFee.toFixed(2)}. ` +
@@ -4769,7 +4911,7 @@ app.post("/put/quote", async (req) => {
         canPassThrough,
         capped: true,
         capMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(2)
+          ? formatCapMultiplier(passThroughCapInfo, 2)
           : null,
         tierName,
         leverage,
@@ -4796,9 +4938,7 @@ app.post("/put/quote", async (req) => {
         feeRegime: feeRegime.regime,
         feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
         feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
+        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
         passThroughCapped: true,
         liquidityOverride: liquidityOverrideUsed,
         replication: replicationMeta,
@@ -4827,11 +4967,11 @@ app.post("/put/quote", async (req) => {
           ratio: premiumFloor.ratio.toFixed(4),
           threshold: premiumFloor.threshold.toFixed(4),
           capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(2)
+            ? formatCapMultiplier(passThroughCapInfo, 2)
             : "N/A",
           explanation:
             `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
-            `of ${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}×. ` +
+            `of ${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}×. ` +
             `Reduce leverage, duration, or widen the floor to lower premium.`
         },
         warning: {
@@ -4889,9 +5029,7 @@ app.post("/put/quote", async (req) => {
             feeRegime: feeRegime.regime,
             feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
             feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-            passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(4)
-              : null,
+            passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
             passThroughCapped: true,
             liquidityOverride: liquidityOverrideUsed,
             replication: replicationMeta,
@@ -4920,7 +5058,7 @@ app.post("/put/quote", async (req) => {
               ratio: premiumFloor.ratio.toFixed(4),
               threshold: premiumFloor.threshold.toFixed(4),
               capMultiplier: passThroughCapInfo.capMultiplier
-                ? passThroughCapInfo.capMultiplier.toFixed(2)
+                ? formatCapMultiplier(passThroughCapInfo, 2)
                 : "N/A",
               explanation:
                 "Partial coverage not allowed for this tier. Reduce leverage or duration to lower premium."
@@ -4954,9 +5092,7 @@ app.post("/put/quote", async (req) => {
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
+          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
           passThroughCapped: true,
           reason: "pass_through_capped_partial",
           liquidityOverride: liquidityOverrideUsed,
@@ -5004,9 +5140,7 @@ app.post("/put/quote", async (req) => {
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
+          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
           passThroughCapped: true,
           reason: "pass_through_capped_subsidized",
           liquidityOverride: liquidityOverrideUsed,
@@ -5052,9 +5186,7 @@ app.post("/put/quote", async (req) => {
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
+          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
           passThroughCapped: true,
           reason: "pass_through_capped_override",
           capBreached: true,
@@ -5145,6 +5277,7 @@ app.post("/put/quote", async (req) => {
     premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
     score: null,
     liquidityOverride: liquidityOverrideUsed,
+    coverageLegs: bestPlanLegs ?? null,
     hedgeSize: (() => {
       const adjusted = hedgeSizeForQuote.mul(hedgeFactor);
       const available = quote.availableSize;
@@ -5197,9 +5330,7 @@ app.post("/put/quote", async (req) => {
   response["feeLeverageMultiplier"] = feeLeverage.multiplier
     ? feeLeverage.multiplier.toFixed(4)
     : null;
-  response["passThroughCapMultiplier"] = passThroughCapInfo.capMultiplier
-    ? passThroughCapInfo.capMultiplier.toFixed(4)
-    : null;
+  response["passThroughCapMultiplier"] = formatCapMultiplier(passThroughCapInfo);
   response["passThroughCapped"] = passThroughCapped;
   response["subsidyUsdc"] = "0.00";
   response["reason"] = feeReason;
@@ -5239,7 +5370,7 @@ app.post("/put/quote", async (req) => {
         hedgePremium: allInPremium.toFixed(2),
         cappedFee: passThroughCapInfo.maxFee.toFixed(2),
         capMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(2)
+          ? formatCapMultiplier(passThroughCapInfo, 2)
           : null,
         markupPct: markupPct.mul(100).toFixed(2),
         ratio: premiumFloor.ratio.toFixed(4),
@@ -5714,7 +5845,8 @@ app.post("/put/auto-renew", async (req) => {
     renewBaseFeeUsdc,
     effectiveAllInPremium,
     renewLeverage,
-    tierName
+    tierName,
+    effectiveIv ?? 0
   );
   const renewPassThroughCapped = renewPassThroughCap.maxFee
     ? renewPassThroughFee.gt(renewPassThroughCap.maxFee)
@@ -5759,9 +5891,7 @@ app.post("/put/auto-renew", async (req) => {
         feeLeverageMultiplier: renewFeeLeverage.multiplier
           ? renewFeeLeverage.multiplier.toFixed(4)
           : null,
-        passThroughCapMultiplier: renewPassThroughCap.capMultiplier
-          ? renewPassThroughCap.capMultiplier.toFixed(4)
-          : null,
+        passThroughCapMultiplier: formatCapMultiplier(renewPassThroughCap),
         passThroughCapped: renewPassThroughCapped,
         warning: {
           type: "premium_floor",
@@ -5800,7 +5930,8 @@ app.post("/put/auto-renew", async (req) => {
           renewBaseFeeUsdc,
           effectiveAllInPremium,
           renewLeverage,
-          tierName
+          tierName,
+          effectiveIv ?? 0
         );
         const latePassThroughFee = effectiveAllInPremium.mul(new Decimal(1).add(renewMarkupPct));
         const lateCapped = lateCap.maxFee ? latePassThroughFee.gt(lateCap.maxFee) : false;
@@ -5936,9 +6067,7 @@ app.post("/put/auto-renew", async (req) => {
     feeLeverageMultiplier: renewFeeLeverage.multiplier
       ? renewFeeLeverage.multiplier.toFixed(4)
       : null,
-    passThroughCapMultiplier: renewPassThroughCap.capMultiplier
-      ? renewPassThroughCap.capMultiplier.toFixed(4)
-      : null,
+    passThroughCapMultiplier: formatCapMultiplier(renewPassThroughCap),
     passThroughCapped: renewPassThroughCap.capped,
     capBreached: renewReason === "coverage_override",
     executionPlan: chosenExecutionPlans
@@ -6755,6 +6884,9 @@ app.post("/audit/export", async (req) => {
       hedgeType,
       optionType,
       strike: Number.isFinite(strikeValue) ? strikeValue : null,
+      coverageLegs: Array.isArray((body as any).coverageLegs)
+        ? ((body as any).coverageLegs as any[])
+        : undefined,
       notionalUsdc: Number((body as any).notionalUsdc ?? 0) || null,
       floorUsd: Number((body as any).floorUsd ?? 0) || null,
       equityUsd: Number((body as any).equityUsd ?? 0) || null,
@@ -6779,6 +6911,10 @@ app.post("/audit/export", async (req) => {
   const coveragePayload = {
     ...body,
     selectedVenue: (body as any).selectedVenue ?? hedgeVenue ?? null,
+    coverageLegs:
+      (body as any).coverageLegs ??
+      (coverageIdValue ? coverageLedger.get(coverageIdValue)?.coverageLegs : null) ??
+      null,
     hedge: {
       ...hedge,
       instrument: hedgeInstrument ?? hedge.instrument ?? null,
