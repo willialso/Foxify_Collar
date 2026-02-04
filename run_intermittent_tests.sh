@@ -7,6 +7,7 @@ INCLUDE_EXPOSURES="${INCLUDE_EXPOSURES:-false}"
 FORCE_INCREASE="${FORCE_INCREASE:-false}"
 BUFFER_TARGET_PCT="${BUFFER_TARGET_PCT:-0.05}"
 HYSTERESIS_PCT="${HYSTERESIS_PCT:-0.02}"
+POSITION_SIZE="${POSITION_SIZE:-0.033}"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required. Install with: brew install jq (mac) or apt-get install jq (linux)"
@@ -19,6 +20,7 @@ echo "CONFIG_PATH=${CONFIG_PATH}"
 echo "INCLUDE_EXPOSURES=${INCLUDE_EXPOSURES}"
 echo "FORCE_INCREASE=${FORCE_INCREASE}"
 echo "BUFFER_TARGET_PCT=${BUFFER_TARGET_PCT}"
+echo "POSITION_SIZE=${POSITION_SIZE}"
 echo
 
 if [ -f "${CONFIG_PATH}" ]; then
@@ -80,7 +82,7 @@ quote="$(curl -s "${API_BASE}/put/quote" \
     \"asset\":\"BTC\",
     \"spotPrice\":${spot},
     \"drawdownFloorPct\":0.2,
-    \"positionSize\":0.033,
+    \"positionSize\":${POSITION_SIZE},
     \"fixedPriceUsdc\":10,
     \"contractSize\":1,
     \"leverage\":1,
@@ -92,6 +94,7 @@ quote="$(curl -s "${API_BASE}/put/quote" \
 echo "${quote}" | jq
 instrument="$(echo "${quote}" | jq -r '.instrument // empty')"
 hedge_size="$(echo "${quote}" | jq -r '.hedgeSize // empty')"
+strike_value="$(echo "${quote}" | jq -r '.strike // empty')"
 if [ -z "${instrument}" ] || [ -z "${hedge_size}" ]; then
   echo "Quote missing instrument/hedgeSize; cannot proceed."
   exit 1
@@ -104,9 +107,16 @@ print((datetime.utcnow() + timedelta(days=7)).isoformat(timespec="seconds") + "Z
 PY
 )"
 
+margin_usd="$(python3 - <<PY
+spot = float("${spot}")
+pos = float("${POSITION_SIZE}")
+print(round(spot * pos, 2))
+PY
+)"
+
 exposures_payload="[]"
 if [ "${INCLUDE_EXPOSURES}" = "true" ]; then
-  exposures_payload="[{\"asset\":\"BTC\",\"side\":\"long\",\"entryPrice\":${spot},\"size\":0.033,\"leverage\":1}]"
+  exposures_payload="[{\"asset\":\"BTC\",\"side\":\"long\",\"entryPrice\":${spot},\"size\":${POSITION_SIZE},\"leverage\":1}]"
 fi
 
 if [ "${FORCE_INCREASE}" = "true" ]; then
@@ -114,6 +124,50 @@ if [ "${FORCE_INCREASE}" = "true" ]; then
   echo "Force increase enabled: bufferTargetPct=${BUFFER_TARGET_PCT}"
   echo
 fi
+
+echo "Step 5b: Seed coverage ledger via /audit/export"
+now_iso="$(python3 - <<'PY'
+from datetime import datetime, timezone
+print(datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"))
+PY
+)"
+strike_payload=""
+if [ -n "${strike_value}" ]; then
+  strike_payload=",\"strike\":${strike_value}"
+fi
+curl -s "${API_BASE}/audit/export" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"ts\":\"${now_iso}\",
+    \"tier\":\"Pro (Bronze)\",
+    \"autoRenew\":true,
+    \"feeUsd\":10,
+    \"baseFeeUsd\":10,
+    \"totalFeeUsd\":10,
+    \"coverageId\":\"test-intermittent\",
+    \"expiryIso\":\"${expiry_iso}\",
+    \"selectedVenue\":\"bybit\",
+    \"notionalUsdc\":2500,
+    \"portfolio\":{
+      \"tierName\":\"Pro (Bronze)\",
+      \"positions\":[{
+        \"id\":\"pos-test\",
+        \"asset\":\"BTC\",
+        \"side\":\"long\",
+        \"marginUsd\":${margin_usd},
+        \"leverage\":1,
+        \"entryPrice\":${spot}
+      }]
+    },
+    \"hedge\":{
+      \"hedgeType\":\"option\",
+      \"instrument\":\"${instrument}\",
+      \"hedgeSize\":${hedge_size},
+      \"optionType\":\"put\"${strike_payload},
+      \"venue\":\"bybit\"
+    }
+  }" | jq
+echo
 
 echo "Step 6: Trigger loop/tick"
 curl -s "${API_BASE}/loop/tick" \
