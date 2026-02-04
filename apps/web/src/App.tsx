@@ -257,11 +257,6 @@ export function App() {
     }, ttlMs);
   };
 
-  useEffect(() => {
-    clearPricingNotice();
-    clearActivationNotice();
-  }, [selectedIds, expiryDays, drawdownPct, level?.name, portfolioOpen, showAudit, autoRenew]);
-
   useEffect(
     () => () => {
       clearPricingNotice();
@@ -558,6 +553,11 @@ export function App() {
     ? Number(level.renew_window_minutes)
     : 1440;
   const bufferAlertPct = level?.buffer_alert_pct ? Number(level.buffer_alert_pct) : 2;
+
+  useEffect(() => {
+    clearPricingNotice();
+    clearActivationNotice();
+  }, [selectedIds, expiryDays, drawdownPct, level?.name, portfolioOpen, showAudit, autoRenew]);
 
   const portfolioStats = useMemo(() => {
     const positions = portfolio?.positions ?? [];
