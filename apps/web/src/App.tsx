@@ -1680,7 +1680,10 @@ export function App() {
                     Premium
                     {isFetchingQuote && (
                       <span className="fetching-status">
-                        <em>Fetching<span className="fetching-dots">{fetchingDots}</span></em>
+                        <em>
+                          Identifying optimal protection
+                          <span className="fetching-dots">{fetchingDots}</span>
+                        </em>
                       </span>
                     )}
                   </span>

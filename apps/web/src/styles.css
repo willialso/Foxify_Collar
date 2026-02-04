@@ -1145,7 +1145,7 @@ select.input {
 .audit-table {
   display: grid;
   gap: 6px;
-  min-width: 1320px;
+  min-width: 2000px;
 }
 
 .audit-row {
@@ -1166,6 +1166,11 @@ select.input {
     100px
     100px
     110px
+    100px
+    100px
+    100px
+    90px
+    90px
     90px;
   gap: 8px;
   align-items: center;
