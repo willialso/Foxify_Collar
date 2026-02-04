@@ -4,6 +4,9 @@ set -euo pipefail
 API_BASE="${API_BASE:-http://localhost:4100}"
 CONFIG_PATH="${CONFIG_PATH:-./configs/risk_controls.json}"
 INCLUDE_EXPOSURES="${INCLUDE_EXPOSURES:-false}"
+FORCE_INCREASE="${FORCE_INCREASE:-false}"
+BUFFER_TARGET_PCT="${BUFFER_TARGET_PCT:-0.05}"
+HYSTERESIS_PCT="${HYSTERESIS_PCT:-0.02}"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required. Install with: brew install jq (mac) or apt-get install jq (linux)"
@@ -14,6 +17,8 @@ echo "=== Intermittent Hedging Test Script ==="
 echo "API_BASE=${API_BASE}"
 echo "CONFIG_PATH=${CONFIG_PATH}"
 echo "INCLUDE_EXPOSURES=${INCLUDE_EXPOSURES}"
+echo "FORCE_INCREASE=${FORCE_INCREASE}"
+echo "BUFFER_TARGET_PCT=${BUFFER_TARGET_PCT}"
 echo
 
 if [ -f "${CONFIG_PATH}" ]; then
@@ -104,6 +109,12 @@ if [ "${INCLUDE_EXPOSURES}" = "true" ]; then
   exposures_payload="[{\"asset\":\"BTC\",\"side\":\"long\",\"entryPrice\":${spot},\"size\":0.033,\"leverage\":1}]"
 fi
 
+if [ "${FORCE_INCREASE}" = "true" ]; then
+  BUFFER_TARGET_PCT="0.30"
+  echo "Force increase enabled: bufferTargetPct=${BUFFER_TARGET_PCT}"
+  echo
+fi
+
 echo "Step 6: Trigger loop/tick"
 curl -s "${API_BASE}/loop/tick" \
   -H "Content-Type: application/json" \
@@ -113,8 +124,8 @@ curl -s "${API_BASE}/loop/tick" \
     \"initialBalanceUsdc\":\"2500\",
     \"hedgeInstrument\":\"${instrument}\",
     \"hedgeSize\":${hedge_size},
-    \"bufferTargetPct\":0.05,
-    \"hysteresisPct\":0.02,
+    \"bufferTargetPct\":${BUFFER_TARGET_PCT},
+    \"hysteresisPct\":${HYSTERESIS_PCT},
     \"expiryIso\":\"${expiry_iso}\",
     \"renewWindowMinutes\":1440,
     \"renewPayload\":{},
