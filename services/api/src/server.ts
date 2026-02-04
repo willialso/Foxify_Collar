@@ -7038,7 +7038,11 @@ app.post("/audit/export", async (req) => {
   return { status: "ok", file: name };
 });
 
-app.post("/admin/reset", async () => {
+app.post("/admin/reset", async (_req, reply) => {
+  if (APP_MODE !== "demo") {
+    reply.code(403);
+    return { status: "forbidden", message: "Reset is only available in demo mode." };
+  }
   const cleared = await clearAuditLogs();
   activeCoverages.clear();
   coverageLedger.clear();
@@ -7047,6 +7051,8 @@ app.post("/admin/reset", async () => {
   realizedHedgePnlUsdc = new Decimal(0);
   resetRiskState();
   try {
+    await rm(COVERAGE_FILE_PATH, { force: true });
+    await rm(HEDGE_LEDGER_PATH, { force: true });
     await rm(COVERAGE_LEDGER_PATH, { force: true });
   } catch {
     // ignore
