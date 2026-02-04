@@ -215,6 +215,9 @@ export function AuditDashboard({
     return value.toFixed(2);
   };
 
+  const formatCsvMoney = (value: number) =>
+    value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
   const formatSmall = (value: number) => {
     if (!Number.isFinite(value)) return "—";
     if (Math.abs(value) < 1) return value.toFixed(4);
@@ -312,9 +315,17 @@ export function AuditDashboard({
             </div>
 
             <div className="audit-metric">
+              <span className="audit-metric-label">Projected (MTM)</span>
+              <span className={`audit-metric-value ${projectedClass}`}>
+                ${formatCsvMoney(Number(stats.unrealizedPnl || 0))}
+              </span>
+              <span className="audit-metric-sub">unrealized hedge pnl</span>
+            </div>
+
+            <div className="audit-metric">
               <span className="audit-metric-label">Premium Collected</span>
               <span className="audit-metric-value audit-metric-value-positive">
-                ${(stats.revenue || 0).toFixed(2)}
+                ${formatCsvMoney(Number(stats.revenue || 0))}
               </span>
               <span className="audit-metric-sub">premiums charged</span>
             </div>
@@ -322,7 +333,7 @@ export function AuditDashboard({
             <div className="audit-metric">
               <span className="audit-metric-label">Hedging Spend</span>
               <span className="audit-metric-value audit-metric-value-warn">
-                ${(stats.hedgeSpend || 0).toFixed(2)}
+                ${formatCsvMoney(Number(stats.hedgeSpend || 0))}
               </span>
               <span className="audit-metric-sub">premiums paid</span>
             </div>
@@ -336,7 +347,7 @@ export function AuditDashboard({
                     : "audit-metric-value-warn"
                 }`}
               >
-                ${(stats.revenue - stats.hedgeSpend).toFixed(2)}
+                ${formatCsvMoney(Number(stats.revenue - stats.hedgeSpend))}
               </span>
               <span className="audit-metric-sub">
                 {(stats.revenue - stats.hedgeSpend) >= 0 ? "operating profit" : "coverage cost"}
@@ -344,19 +355,11 @@ export function AuditDashboard({
             </div>
 
             <div className="audit-metric">
-              <span className="audit-metric-label">Projected (MTM)</span>
-              <span className={`audit-metric-value ${projectedClass}`}>
-                ${Number(stats.unrealizedPnl || 0).toFixed(2)}
-              </span>
-              <span className="audit-metric-sub">Unrealized Hedge PnL</span>
-            </div>
-
-            <div className="audit-metric">
               <span className="audit-metric-label">Net Profit</span>
               <span className={`audit-metric-value ${netProfitClass}`}>
-                ${Number(stats.netProfit || 0).toFixed(2)}
+                ${formatCsvMoney(Number(stats.netProfit || 0))}
               </span>
-              <span className="audit-metric-sub">revenue − hedging − subsidy</span>
+              <span className="audit-metric-sub">after hedging & subsidy</span>
             </div>
           </div>
         </div>
@@ -457,7 +460,9 @@ export function AuditDashboard({
             const expiryTag = String(extractField(entry, "expiryTag") || parsedInstrument?.expiryTag || "—");
             const strikeValue = extractField(entry, "strike") ?? parsedInstrument?.strike ?? null;
             const side = String(extractField(entry, "side") || "—");
-            const status = String(extractField(entry, "status") || "—");
+            const statusRaw = String(extractField(entry, "status") || "—");
+            const status =
+              statusRaw === "—" && entry.event === "hedge_order" ? "filled" : statusRaw;
             const premium =
               extractField(entry, "executedPremiumUsdc") ?? extractField(entry, "premiumUsdc");
             const feeIn =
@@ -501,12 +506,30 @@ export function AuditDashboard({
               delta && typeof delta === "object"
                 ? delta.liquidityBalanceUsdc ?? delta.revenueUsdc
                 : null;
+            const instrumentLabel = (() => {
+              if (!parsedInstrument || instrument === "—") return instrument;
+              if (parsedInstrument.optionType === "perp") {
+                return `${parsedInstrument.asset} PERP`;
+              }
+              const strikeLabel =
+                strikeNum !== null && Number.isFinite(strikeNum)
+                  ? strikeNum.toLocaleString(undefined, { maximumFractionDigits: 0 })
+                  : "—";
+              const optionCode =
+                parsedInstrument.optionType === "put"
+                  ? "P"
+                  : parsedInstrument.optionType === "call"
+                    ? "C"
+                    : "";
+              const expiryLabel = expiryTag || parsedInstrument.expiryTag || "—";
+              return `${parsedInstrument.asset} ${expiryLabel} ${strikeLabel} ${optionCode}`.trim();
+            })();
             return (
               <div className="audit-row" key={`${entry.ts}-${entry.event}`}>
                 <span>{new Date(entry.ts).toLocaleTimeString()}</span>
                 <span>{entry.event}</span>
-                <span>{coverageId || "—"}</span>
-                <span>{instrument}</span>
+                <span title={coverageId || "—"}>{coverageId || "—"}</span>
+                <span title={instrument}>{instrumentLabel}</span>
                 <span>{expiryTag || "—"}</span>
                 <span>
                   {strikeNum !== null && Number.isFinite(strikeNum)

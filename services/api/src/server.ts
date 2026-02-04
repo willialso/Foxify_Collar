@@ -7043,6 +7043,8 @@ app.post("/admin/reset", async () => {
   activeCoverages.clear();
   coverageLedger.clear();
   portfolioSnapshots.clear();
+  hedgeLedger.clear();
+  realizedHedgePnlUsdc = new Decimal(0);
   resetRiskState();
   try {
     await rm(COVERAGE_LEDGER_PATH, { force: true });

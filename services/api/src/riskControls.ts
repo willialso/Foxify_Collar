@@ -115,7 +115,7 @@ const DEFAULTS: RiskControlsConfig = {
   hedge_reduction_factor: 0.7,
   max_leverage: 10,
   net_exposure_cap_usdc: {},
-  initial_liquidity_usdc: 20000,
+  initial_liquidity_usdc: 35000,
   reinvest_pct: 0.5,
   reserve_pct: 0.3,
   hedge_action_cooldown_ms: 60000,
