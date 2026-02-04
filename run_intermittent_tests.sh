@@ -8,6 +8,8 @@ FORCE_INCREASE="${FORCE_INCREASE:-false}"
 BUFFER_TARGET_PCT="${BUFFER_TARGET_PCT:-0.05}"
 HYSTERESIS_PCT="${HYSTERESIS_PCT:-0.02}"
 POSITION_SIZE="${POSITION_SIZE:-0.033}"
+LOOPS="${LOOPS:-1}"
+SLEEP_SECONDS="${SLEEP_SECONDS:-2}"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required. Install with: brew install jq (mac) or apt-get install jq (linux)"
@@ -21,6 +23,8 @@ echo "INCLUDE_EXPOSURES=${INCLUDE_EXPOSURES}"
 echo "FORCE_INCREASE=${FORCE_INCREASE}"
 echo "BUFFER_TARGET_PCT=${BUFFER_TARGET_PCT}"
 echo "POSITION_SIZE=${POSITION_SIZE}"
+echo "LOOPS=${LOOPS}"
+echo "SLEEP_SECONDS=${SLEEP_SECONDS}"
 echo
 
 if [ -f "${CONFIG_PATH}" ]; then
@@ -169,29 +173,35 @@ curl -s "${API_BASE}/audit/export" \
   }" | jq
 echo
 
-echo "Step 6: Trigger loop/tick"
-curl -s "${API_BASE}/loop/tick" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"accountId\":\"demo\",
-    \"drawdownLimitUsdc\":\"2000\",
-    \"initialBalanceUsdc\":\"2500\",
-    \"hedgeInstrument\":\"${instrument}\",
-    \"hedgeSize\":${hedge_size},
-    \"bufferTargetPct\":${BUFFER_TARGET_PCT},
-    \"hysteresisPct\":${HYSTERESIS_PCT},
-    \"expiryIso\":\"${expiry_iso}\",
-    \"renewWindowMinutes\":1440,
-    \"renewPayload\":{},
-    \"coverageId\":\"test-intermittent\",
-    \"autoRenew\":true,
-    \"notionalUsdc\":2500,
-    \"hedgeType\":\"option\",
-    \"tierName\":\"Pro (Bronze)\",
-    \"skipNetExposure\":true,
-    \"exposures\":${exposures_payload}
-  }" | jq
-echo
+for i in $(seq 1 "${LOOPS}"); do
+  echo "Step 6.${i}: Trigger loop/tick"
+  curl -s "${API_BASE}/loop/tick" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"accountId\":\"demo\",
+      \"drawdownLimitUsdc\":\"2000\",
+      \"initialBalanceUsdc\":\"2500\",
+      \"hedgeInstrument\":\"${instrument}\",
+      \"hedgeSize\":${hedge_size},
+      \"bufferTargetPct\":${BUFFER_TARGET_PCT},
+      \"hysteresisPct\":${HYSTERESIS_PCT},
+      \"expiryIso\":\"${expiry_iso}\",
+      \"renewWindowMinutes\":1440,
+      \"renewPayload\":{},
+      \"coverageId\":\"test-intermittent\",
+      \"autoRenew\":true,
+      \"notionalUsdc\":2500,
+      \"hedgeType\":\"option\",
+      \"tierName\":\"Pro (Bronze)\",
+      \"skipNetExposure\":true,
+      \"exposures\":${exposures_payload}
+    }" | jq
+  if [ "${i}" -lt "${LOOPS}" ]; then
+    echo "Sleeping ${SLEEP_SECONDS}s..."
+    sleep "${SLEEP_SECONDS}"
+  fi
+  echo
+done
 
 echo "Step 7: Recent intermittent analytics (if enabled)"
 curl -s "${API_BASE}/audit/logs?limit=50&showAll=true" | \
