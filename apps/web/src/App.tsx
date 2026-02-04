@@ -56,15 +56,6 @@ type RiskSummary = {
 };
 
 const ASSETS: Asset[] = ["BTC"];
-const PER_ASSET_FEES: Record<Asset, Record<string, number>> = {
-  BTC: {
-    "Pro (Bronze)": 20,
-    "Pro (Silver)": 35,
-    "Pro (Gold)": 60,
-    "Pro (Platinum)": 80
-  }
-};
-
 const parseNumberString = (value: unknown): string | null => {
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
   if (typeof value === "string" && value.trim().length > 0 && Number.isFinite(Number(value))) {
@@ -118,6 +109,9 @@ const parseFundedLevels = (input: unknown): FundedLevel[] => {
     .filter((item): item is FundedLevel => Boolean(item));
 };
 
+const formatSpotPrice = (value: number) =>
+  value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
 const limitToSinglePosition = (input: Portfolio | null): Portfolio | null => {
   if (!input) return null;
   return { ...input, positions: input.positions.slice(0, 1) };
@@ -137,12 +131,16 @@ export function App() {
   const [protectionStart, setProtectionStart] = useState<string | null>(null);
   const [protectionExpiry, setProtectionExpiry] = useState<string | null>(null);
   const [protectedIds, setProtectedIds] = useState<string[]>([]);
+  const [activeCoverages, setActiveCoverages] = useState<
+    Array<{ coverageId: string; expiryIso: string; positions?: PortfolioPosition[] }>
+  >([]);
   const [showAudit, setShowAudit] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [lastExecution, setLastExecution] = useState<string | null>(null);
   const [lastCoverageId, setLastCoverageId] = useState<string | null>(null);
   const [portfolioError, setPortfolioError] = useState<string | null>(null);
   const [isActivating, setIsActivating] = useState(false);
+  const [fetchingDotCount, setFetchingDotCount] = useState(1);
   const [toast, setToast] = useState<string | null>(null);
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditPrefetchSummary, setAuditPrefetchSummary] = useState<Record<string, unknown> | null>(
@@ -185,6 +183,7 @@ export function App() {
   const previewLoadingTimerRef = useRef<number | null>(null);
   const previewRequestIdRef = useRef(0);
   const previewRetryTimerRef = useRef<number | null>(null);
+  const lastPricingKeyRef = useRef<string | null>(null);
   const [hedgeContext, setHedgeContext] = useState<{
     coverageId: string;
     hedgeInstrument: string;
@@ -318,13 +317,16 @@ export function App() {
           ? (coverageResponse.coverages as any[])
           : [];
 
+        setActiveCoverages(coverages);
         if (positions && coverages.length > 0) {
           const coverageMap = new Map<string, any>();
           for (const coverage of coverages) {
-            const pos = coverage?.positions?.[0];
-            if (!pos) continue;
-            const key = `${pos.asset}-${pos.side}-${pos.entryPrice}`;
-            coverageMap.set(key, coverage);
+            const coveragePositions = Array.isArray(coverage?.positions) ? coverage.positions : [];
+            for (const pos of coveragePositions) {
+              if (!pos) continue;
+              const key = `${pos.asset}-${pos.side}-${pos.entryPrice}`;
+              coverageMap.set(key, coverage);
+            }
           }
 
           const protectedIds = positions
@@ -337,15 +339,23 @@ export function App() {
           setProtectedIds(protectedIds);
           setProtectionActive(protectedIds.length > 0);
 
-          const firstCoverage = coverages[0];
-          if (firstCoverage?.expiryIso) {
-            setProtectionExpiry(firstCoverage.expiryIso);
+          const earliestExpiry = coverages
+            .map((coverage) => coverage?.expiryIso)
+            .filter((expiry): expiry is string => Boolean(expiry))
+            .sort((a, b) => Date.parse(a) - Date.parse(b))[0];
+          if (earliestExpiry) {
+            setProtectionExpiry(earliestExpiry);
           }
-          if (firstCoverage?.coverageId) {
-            setLastCoverageId(firstCoverage.coverageId);
+          if (coverages[0]?.coverageId) {
+            setLastCoverageId(coverages[0].coverageId);
           }
 
           console.log(`✓ Loaded ${coverages.length} active coverage(s)`);
+        } else {
+          setProtectedIds([]);
+          setProtectionActive(false);
+          setProtectionExpiry(null);
+          setLastCoverageId(null);
         }
       } catch (error) {
         console.error("Failed to fetch data:", error);
@@ -440,7 +450,7 @@ export function App() {
         return;
       }
       setPortfolioError(null);
-      const nextPortfolio = limitToSinglePosition(validated.value || null);
+      const nextPortfolio = validated.value || null;
       setPortfolio(nextPortfolio);
       if (nextPortfolio?.tierName) {
         const matched = levels.find((item) => item.name === nextPortfolio.tierName) || null;
@@ -458,7 +468,7 @@ export function App() {
       const parsed = JSON.parse(saved);
       const validated = validatePortfolio(parsed);
       if (!validated.ok) return;
-      const nextPortfolio = limitToSinglePosition(validated.value || null);
+      const nextPortfolio = validated.value || null;
       setPortfolio(nextPortfolio);
       if (nextPortfolio?.tierName) {
         const matched = levels.find((item) => item.name === nextPortfolio.tierName) || null;
@@ -599,13 +609,11 @@ export function App() {
     ].join("|");
   }, [level, selectedPositions, expiryDays, drawdownPct]);
   const QUOTE_LOCK_TTL_MS = 6000;
+  const baseFeeUsdRaw = level ? Number(level.fixed_price_usdc) : 0;
+  const baseFeeUsd = Number.isFinite(baseFeeUsdRaw) ? baseFeeUsdRaw : 0;
   const perAssetFeeUsd = level
-    ? selectedPositions.reduce(
-        (sum, p) => sum + (PER_ASSET_FEES[p.asset]?.[level.name] || 0),
-        0
-      )
+    ? selectedPositions.reduce((sum) => sum + baseFeeUsd, 0)
     : 0;
-  const baseFeeUsd = level ? PER_ASSET_FEES.BTC?.[level.name] || 0 : 0;
   const totalFeeUsd = perAssetFeeUsd;
 
   const shortTierLabel = () => {
@@ -645,10 +653,6 @@ export function App() {
   };
 
   useEffect(() => {
-    if (bronzeFixed && pricingKey && !lockedQuote) {
-      setLockedQuote({ key: pricingKey, feeUsdc: baseFeeUsd, lockedAt: Date.now(), markIv: null });
-      return;
-    }
     if (!pricingKey) {
       if (lockedQuote) setLockedQuote(null);
       return;
@@ -718,6 +722,25 @@ export function App() {
   }, [lockedQuote, QUOTE_LOCK_TTL_MS]);
 
   useEffect(() => {
+    if (!pricingKey) {
+      lastPricingKeyRef.current = null;
+      return;
+    }
+    if (lastPricingKeyRef.current && lastPricingKeyRef.current !== pricingKey) {
+      setPreviewQuote(null);
+      setPreviewQuoteRaw(null);
+      setPreviewState("idle");
+      setPreviewGate("idle");
+      setPreviewLastError(null);
+      previewLastRequestAtRef.current = 0;
+      if (lockedQuote?.key !== pricingKey) {
+        setLockedQuote(null);
+      }
+    }
+    lastPricingKeyRef.current = pricingKey;
+  }, [pricingKey, lockedQuote]);
+
+  useEffect(() => {
     if (!level || selectedIds.length !== 1) {
       setPreviewGate("no_selection");
       setPreviewQuote(null);
@@ -738,14 +761,6 @@ export function App() {
     const spot = spotPrices[primary.asset] || primary.entryPrice;
     if (!spot || baseFeeUsd <= 0) {
       setPreviewGate("no_spot_fee");
-      setPreviewQuote(null);
-      setPreviewQuoteRaw(null);
-      setPreviewLoading(false);
-      setPreviewState("idle");
-      return;
-    }
-    if (level.name === "Pro (Bronze)" && primary.leverage <= 2) {
-      setPreviewGate("bronze_fixed");
       setPreviewQuote(null);
       setPreviewQuoteRaw(null);
       setPreviewLoading(false);
@@ -915,15 +930,14 @@ export function App() {
         ? new Date(protectionExpiry)
         : new Date(Date.now() + expiryDays * 24 * 60 * 60 * 1000);
     const coverageId = buildCoverageId(expiry.toISOString());
-    if (
-      protectionActive &&
-      lastCoverageId === coverageId &&
-      protectionExpiry &&
-      new Date(protectionExpiry).getTime() > Date.now()
-    ) {
+    const activeCoverage = activeCoverages.find((coverage) => coverage.coverageId === coverageId);
+    if (protectionActive && activeCoverage) {
+      const activeExpiryMs = Date.parse(activeCoverage.expiryIso || "");
+      if (Number.isFinite(activeExpiryMs) && activeExpiryMs > Date.now()) {
       setLastExecution("Protection already active for this window.");
       setIsActivating(false);
       return;
+      }
     }
     const primary = selectedPositions[0];
     const primaryAsset = primary?.asset ?? "BTC";
@@ -952,6 +966,9 @@ export function App() {
     let hedgeSize = 0;
     let bufferTargetPct = 0.05;
     let feeUsd = totalFeeUsd;
+    let markupUsd: number | null = null;
+    let premiumOutUsd: number | null = null;
+    let executedPremiumUsd: number | null = null;
     let subsidyUsd = 0;
     let reason = "flat_fee";
     let regimeLabel: string | null = null;
@@ -964,34 +981,40 @@ export function App() {
           quote = previewQuoteRaw;
         }
         const maxAttempts = 3;
-        for (let attempt = 0; attempt < maxAttempts && !canUsePreviewQuote; attempt += 1) {
-          const quoteRes = await fetch(`${API_BASE}/put/quote`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              tierName: level.name,
-              asset: primaryAsset,
-              spotPrice: spot,
-              drawdownFloorPct: drawdownPct,
-              fixedPriceUsdc: totalFeeUsd,
-              positionSize,
-              contractSize: 1,
-              leverage: primary?.leverage ?? 1,
-              ivSnapshot: ivSnapshot.value,
-              side: netSide,
-              coverageId,
-              targetDays: expiryDays,
-              allowPremiumPassThrough: true
-            })
-          });
-          quote = await quoteRes.json();
+        let cacheBust = false;
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+          if (attempt === 0 && canUsePreviewQuote && !cacheBust) {
+            quote = previewQuoteRaw;
+          } else {
+            const quoteRes = await fetch(`${API_BASE}/put/quote`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                tierName: level.name,
+                asset: primaryAsset,
+                spotPrice: spot,
+                drawdownFloorPct: drawdownPct,
+                fixedPriceUsdc: totalFeeUsd,
+                positionSize,
+                contractSize: 1,
+                leverage: primary?.leverage ?? 1,
+                ivSnapshot: ivSnapshot.value,
+                side: netSide,
+                coverageId,
+                targetDays: expiryDays,
+                allowPremiumPassThrough: true,
+                _cacheBust: cacheBust
+              })
+            });
+            quote = await quoteRes.json();
+          }
 
           if (quote?.status === "pass_through" || quote?.status === "pass_through_capped") {
             const pricing = quote?.pricing;
             const message =
               quote.status === "pass_through"
-                ? `High volatility: Premium is ${pricing?.ratio || "N/A"}× base fee. You'll be charged $${quote.feeUsdc} for full protection.`
-                : `Premium exceeds tier cap. Fee capped at $${quote.feeUsdc}. Platform subsidizing $${quote.subsidyUsdc || "0"} for full protection.`;
+                ? `High volatility: Premium is ${pricing?.ratio || "N/A"}× base premium floor. You'll be charged $${quote.feeUsdc} for full protection.`
+                : `Premium exceeds tier cap. Premium capped at $${quote.feeUsdc}. Platform subsidizing $${quote.subsidyUsdc || "0"} for full protection.`;
             setLastExecution(message);
           }
 
@@ -1008,7 +1031,7 @@ export function App() {
             const ratio = quote?.warning?.ratio ?? "";
             const explanation =
               quote?.pricing?.explanation ||
-              `Premium exceeds fee floor${ratio ? ` (ratio ${ratio}).` : "."} Pass-through required.`;
+              `Premium exceeds premium floor${ratio ? ` (ratio ${ratio}).` : "."} Pass-through required.`;
             setLastExecution(explanation);
             setIsActivating(false);
             return;
@@ -1024,6 +1047,17 @@ export function App() {
           subsidyUsd = quote.subsidyUsdc ? Number(quote.subsidyUsdc) : 0;
           reason = quote.reason || "flat_fee";
           regimeLabel = formatFeeRegime(quote.feeRegime);
+          const markupCandidate = quote?.premiumMarkupUsdc;
+          const markupValue = markupCandidate !== null && markupCandidate !== undefined
+            ? Number(markupCandidate)
+            : null;
+          markupUsd = Number.isFinite(markupValue ?? NaN) ? (markupValue as number) : null;
+          const premiumCandidate =
+            quote?.rollEstimatedPremiumUsdc ?? quote?.premiumUsdc ?? null;
+          const premiumValue = premiumCandidate !== null && premiumCandidate !== undefined
+            ? Number(premiumCandidate)
+            : null;
+          premiumOutUsd = Number.isFinite(premiumValue ?? NaN) ? (premiumValue as number) : null;
 
           hedgeInstrument = quote.instrument;
           hedgeSize = Number(quote.hedgeSize || 0);
@@ -1109,6 +1143,17 @@ export function App() {
           }
 
           orderResponse = lastResponse;
+          const orderReason = String(orderResponse?.reason || "");
+          const shouldRequote =
+            orderResponse?.status === "rejected" &&
+            (orderReason === "quote_drift" ||
+              orderReason === "quote_expired" ||
+              orderReason === "quote_unknown");
+          if (shouldRequote && attempt < maxAttempts - 1) {
+            cacheBust = true;
+            orderResponse = null;
+            continue;
+          }
           const reasonText = String(orderResponse?.reason || "");
           const retryable =
             orderResponse?.status === "paper_rejected" &&
@@ -1151,6 +1196,19 @@ export function App() {
             orderResponse = await fallbackRes.json();
           }
         }
+        if (quote && premiumOutUsd === null && markupUsd === null) {
+          const markupCandidate = quote?.premiumMarkupUsdc;
+          const markupValue = markupCandidate !== null && markupCandidate !== undefined
+            ? Number(markupCandidate)
+            : null;
+          markupUsd = Number.isFinite(markupValue ?? NaN) ? (markupValue as number) : null;
+          const premiumCandidate =
+            quote?.rollEstimatedPremiumUsdc ?? quote?.premiumUsdc ?? null;
+          const premiumValue = premiumCandidate !== null && premiumCandidate !== undefined
+            ? Number(premiumCandidate)
+            : null;
+          premiumOutUsd = Number.isFinite(premiumValue ?? NaN) ? (premiumValue as number) : null;
+        }
       }
     } catch {
       orderResponse = null;
@@ -1171,6 +1229,32 @@ export function App() {
     if (orderResponse?.filledAmount && Number.isFinite(Number(orderResponse.filledAmount))) {
       hedgeSize = Number(orderResponse.filledAmount);
     }
+    if (orderResponse) {
+      const fillPriceRaw =
+        (orderResponse as any)?.result?.average_price ??
+        (orderResponse as any)?.result?.price ??
+        (orderResponse as any)?.fillPrice ??
+        (orderResponse as any)?.price ??
+        null;
+      const filledAmountRaw =
+        (orderResponse as any)?.filledAmount ??
+        (orderResponse as any)?.result?.filled_amount ??
+        (orderResponse as any)?.amount ??
+        null;
+      const fillPrice = Number(fillPriceRaw);
+      const filledAmount = Number(filledAmountRaw);
+      if (Number.isFinite(fillPrice) && Number.isFinite(filledAmount) && filledAmount > 0) {
+        const isBybit = hedgeInstrument.endsWith("-USDT");
+        const premium = isBybit
+          ? fillPrice * filledAmount
+          : spot
+            ? fillPrice * filledAmount * spot
+            : null;
+        if (premium !== null && Number.isFinite(premium)) {
+          executedPremiumUsd = premium;
+        }
+      }
+    }
 
     const selectedPortfolioPositions =
       portfolio?.positions.filter((position) => selectedIds.includes(position.id)) ?? [];
@@ -1178,8 +1262,10 @@ export function App() {
       ts: start.toISOString(),
       tier: level.name,
       autoRenew,
+      feeUsd,
+      baseFeeUsd,
+      markupUsd,
       selectedVenue,
-      feeUsd: perAssetFeeUsd,
       totalFeeUsd: feeUsd,
       subsidyUsd,
       reason,
@@ -1199,9 +1285,11 @@ export function App() {
         instrument: hedgeInstrument || null,
         venue: selectedVenue,
         quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
-          premiumUsdc: quote?.premiumUsdc ?? null,
-          subsidyUsdc: subsidyUsd || null,
-          reason,
+        premiumUsdc: executedPremiumUsd ?? premiumOutUsd ?? null,
+        quotedPremiumUsdc: premiumOutUsd ?? null,
+        executedPremiumUsdc: executedPremiumUsd ?? null,
+        subsidyUsdc: subsidyUsd || null,
+        reason,
         hedgeSize: hedgeSize || null,
         optionType: quote?.optionType ?? null,
         strike: quote?.strike ?? null,
@@ -1221,8 +1309,24 @@ export function App() {
     setLastCoverageId(coverageId);
     setProtectionActive(true);
     setProtectionStart(payload.ts);
-    setProtectionExpiry(payload.expiryIso);
-    setProtectedIds(selectedIds);
+    setProtectionExpiry((prev) => {
+      if (!prev) return payload.expiryIso;
+      const prevMs = Date.parse(prev);
+      const nextMs = Date.parse(payload.expiryIso);
+      if (!Number.isFinite(prevMs)) return payload.expiryIso;
+      if (!Number.isFinite(nextMs)) return prev;
+      return nextMs < prevMs ? payload.expiryIso : prev;
+    });
+    setProtectedIds((prev) => Array.from(new Set([...prev, ...selectedIds])));
+    setActiveCoverages((prev) => {
+      const next = prev.filter((coverage) => coverage.coverageId !== coverageId);
+      next.push({
+        coverageId,
+        expiryIso: payload.expiryIso,
+        positions: selectedPortfolioPositions
+      });
+      return next;
+    });
     setFeeRegimeLabel(regimeLabel);
     setProtectionTierName(level.name);
     setProtectionLeverage(primary?.leverage ?? null);
@@ -1272,6 +1376,8 @@ export function App() {
 
   const formatUsd = (value: number) =>
     value.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  const formatPrice = (value: number) =>
+    value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   const mtmEquity = riskSummary ? Number(riskSummary.equityUsdc) : portfolioStats.equityUsd;
   const mtmDistanceToFloor = mtmEquity - portfolioStats.floorUsd;
@@ -1347,26 +1453,36 @@ export function App() {
     : 0;
   const hasProtectedPosition =
     portfolio?.positions?.some((pos) => protectedIds.includes(pos.id)) ?? false;
-  const bronzeFixed =
-    level?.name === "Pro (Bronze)" && (selectedPositions[0]?.leverage ?? 0) <= 2;
   const volAdjusted =
     previewQuote &&
     (previewQuote.feeRegime === "low" || previewQuote.feeRegime === "high") &&
     previewQuote.feeUsdc !== null &&
     Math.abs(previewQuote.feeUsdc - baseFeeUsd) > 0.01;
   const volStatusLabel =
-    volAdjusted && !bronzeFixed ? formatVolStatus(previewQuote?.feeRegime ?? null) : null;
+    volAdjusted ? formatVolStatus(previewQuote?.feeRegime ?? null) : null;
   const volIvLabel =
-    volAdjusted && !bronzeFixed && previewQuote?.markIv !== null
+    volAdjusted && previewQuote?.markIv !== null
       ? previewQuote.markIv.toFixed(2)
       : null;
   const volMessage =
     volStatusLabel && volIvLabel ? `${volStatusLabel} · IV ${volIvLabel}` : null;
-  const previewError = previewState === "error" && !bronzeFixed;
+  const previewError = previewState === "error";
   const hasSelection = selectedPositions.length > 0;
+  const isFetchingQuote =
+    previewState === "loading" || previewGate === "fetching" || previewGate === "pending";
+  useEffect(() => {
+    if (!isFetchingQuote) {
+      setFetchingDotCount(1);
+      return;
+    }
+    const id = window.setInterval(() => {
+      setFetchingDotCount((prev) => (prev >= 3 ? 1 : prev + 1));
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [isFetchingQuote]);
+  const fetchingDots = ".".repeat(fetchingDotCount);
   const displayFeeUsd = (() => {
     if (!hasSelection) return null;
-    if (bronzeFixed) return baseFeeUsd;
     if (lockedQuote?.key === pricingKey) return lockedQuote.feeUsdc;
     if (previewState === "ok" && previewQuote && previewQuote.feeUsdc !== null && previewQuote.feeUsdc > 0) {
       return previewQuote.feeUsdc;
@@ -1380,6 +1496,7 @@ export function App() {
     previewError ||
     previewState === "idle";
   const pricingStatusLabel = null;
+  const feeDisplayLabel = displayFeeUsd ? `$${formatUsd(displayFeeUsd)}` : "-";
 
   return (
     <div className="shell">
@@ -1448,7 +1565,7 @@ export function App() {
         <div className="subtitle">
           {showAudit
             ? "Audit data is for internal review only and will not be visible to traders in live mode."
-            : "Guaranteed Drawdown Protection. One-Click. Flat Fee."}
+            : "Guaranteed Drawdown Protection. One-Click. Premium."}
         </div>
 
         {!showAudit && (
@@ -1513,7 +1630,7 @@ export function App() {
                         </strong>
                         <div className="muted">
                           ${formatUsd(p.marginUsd)} • {p.leverage}x • Entry $
-                          {p.entryPrice.toFixed(2)}
+                          {formatPrice(p.entryPrice)}
                         </div>
                       </div>
                       <div className="position-actions">
@@ -1521,18 +1638,20 @@ export function App() {
                           {p.pnl >= 0 ? "+" : "-"}$
                           {formatUsd(Math.abs(p.pnl))}
                         </span>
-                        {isProtected && <span className="pill pill-inline">Protected</span>}
-                        <button
-                          className={selectedIds.includes(p.id) ? "btn active" : "btn"}
-                          onClick={() => toggleSelected(p.id)}
-                          disabled={isProtected}
-                        >
-                          {isProtected
-                            ? "Protected"
-                            : selectedIds.includes(p.id)
-                              ? "Selected"
-                              : "Protect"}
-                        </button>
+                        <div className="position-actions-right">
+                          {isProtected && <span className="pill pill-inline">Protected</span>}
+                          <button
+                            className={selectedIds.includes(p.id) ? "btn active" : "btn"}
+                            onClick={() => toggleSelected(p.id)}
+                            disabled={isProtected}
+                          >
+                            {isProtected
+                              ? "Protected"
+                              : selectedIds.includes(p.id)
+                                ? "Selected"
+                                : "Protect"}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   );
@@ -1557,14 +1676,22 @@ export function App() {
                   />
                 </div>
                 <div className="row row-align">
-                  <span>Fee</span>
+                  <span>
+                    Premium
+                    {isFetchingQuote && (
+                      <span className="fetching-status">
+                        <em>
+                          Identifying optimal protection
+                          <span className="fetching-dots">{fetchingDots}</span>
+                        </em>
+                      </span>
+                    )}
+                  </span>
                   <div className="row-inline row-inline-fee">
                     {pricingStatusLabel && (
                       <span className="vol-status">{pricingStatusLabel}</span>
                     )}
-                    <strong className="fee-amount">
-                      {displayFeeUsd ? `$${formatUsd(displayFeeUsd)}` : "—"}
-                    </strong>
+                    <strong className="fee-amount">{feeDisplayLabel}</strong>
                   </div>
                 </div>
               </div>
@@ -1639,30 +1766,32 @@ export function App() {
                         {p.asset} {p.side === "long" ? "Long" : "Short"}
                       </strong>
                       {protectedIds.includes(p.id) ? (
-                        <span className="pill pill-inline">Protected</span>
+                        <span className="pill pill-inline pill-left">Protected</span>
                       ) : null}
                       <div className="muted">
                         ${formatUsd(p.marginUsd)} • {p.leverage}x • Entry $
-                        {p.entryPrice.toFixed(2)}
+                        {formatPrice(p.entryPrice)}
                       </div>
                     </div>
                     <div className="position-actions">
                       <span className={p.pnl >= 0 ? "pill" : "danger"}>
                         {p.pnl >= 0 ? "+" : "-"}${formatUsd(Math.abs(p.pnl))}
                       </span>
-                      {protectedIds.includes(p.id) ? (
-                        <span className="pill pill-inline">Protected</span>
-                      ) : (
-                        <button
-                          className="btn"
-                          onClick={() => {
-                            setProtectionActive(false);
-                            setSelectedIds([p.id]);
-                          }}
-                        >
-                          Protect
-                        </button>
-                      )}
+                      <div className="position-actions-right">
+                        {protectedIds.includes(p.id) ? (
+                          <span className="pill pill-inline">Protected</span>
+                        ) : (
+                          <button
+                            className="btn"
+                            onClick={() => {
+                              setProtectionActive(false);
+                              setSelectedIds([p.id]);
+                            }}
+                          >
+                            Protect
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -1721,33 +1850,26 @@ export function App() {
                   ))}
                 </select>
               </div>
-              <div className="row">
+              <div className="row row-align">
                 <span>Funding</span>
                 <strong>${level ? formatUsd(Number(level.funding_usdc)) : "—"}</strong>
               </div>
-              <div className="row">
+              <div className="row row-align">
                 <span>Remaining</span>
                 <strong>${formatUsd(Math.max(0, remainingMargin))}</strong>
               </div>
               <div className="divider" />
-              {protectionActive && hasProtectedPosition && (
-                <div className="disclaimer">
-                  Protected position is locked. Add a new position after protection ends.
-                </div>
-              )}
               <PortfolioForm
                 levels={levels}
                 level={level}
                 remainingMargin={remainingMargin}
                 spotPrices={spotPrices}
-                existingPosition={
-                  protectionActive && hasProtectedPosition ? null : portfolio?.positions?.[0] ?? null
-                }
-                disabled={protectionActive && hasProtectedPosition}
+                existingPosition={null}
+                disabled={false}
                 onSave={async (position) => {
                   const nextPortfolio = {
                     tierName: portfolio?.tierName || level?.name || "Pro (Bronze)",
-                    positions: [position]
+                    positions: [...(portfolio?.positions ?? []), position]
                   };
                   setPortfolio(nextPortfolio);
                   await syncPositions(nextPortfolio);
@@ -1764,24 +1886,27 @@ export function App() {
                       </strong>
                       <div className="muted">
                         ${formatUsd(p.marginUsd)} • {p.leverage}x • Entry $
-                        {p.entryPrice.toFixed(2)}
+                        {formatPrice(p.entryPrice)}
                       </div>
                     </div>
                     <div className="position-actions">
-                      {isProtected && <span className="pill pill-inline">Protected</span>}
-                      <button
-                        className="btn"
-                        onClick={() => {
-                          setPortfolio((prev) => ({
-                            tierName: prev?.tierName || "",
-                            positions: prev?.positions.filter((item) => item.id !== p.id) || []
-                          }));
-                          setSelectedIds((prev) => (prev.includes(p.id) ? [] : prev));
-                        }}
-                        disabled={isProtected}
-                      >
-                        Remove
-                      </button>
+                      <div className="position-actions-right">
+                        {isProtected && <span className="pill pill-inline">Protected</span>}
+                        {!isProtected && (
+                          <button
+                            className="btn"
+                            onClick={() => {
+                              setPortfolio((prev) => ({
+                                tierName: prev?.tierName || "",
+                                positions: prev?.positions.filter((item) => item.id !== p.id) || []
+                              }));
+                              setSelectedIds((prev) => (prev.includes(p.id) ? [] : prev));
+                            }}
+                          >
+                            Remove
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 );
@@ -1967,7 +2092,7 @@ function PortfolioForm({
       </div>
       <div className="row">
         <span>Entry</span>
-        <strong>{spot ? `$${spot.toFixed(2)}` : "—"}</strong>
+        <strong>{spot ? `$${formatSpotPrice(spot)}` : "—"}</strong>
       </div>
       {!existingPosition && (
         <button

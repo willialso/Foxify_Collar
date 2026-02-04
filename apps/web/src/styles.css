@@ -253,6 +253,21 @@ body {
   min-width: 220px;
 }
 
+.fetching-status {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.fetching-status em {
+  font-style: italic;
+}
+
+.fetching-dots {
+  display: inline-block;
+  min-width: 12px;
+}
+
 .fee-amount {
   display: inline-block;
   min-width: 72px;
@@ -721,12 +736,15 @@ select.input {
 }
 
 @media (max-width: 767px) {
+  .audit-dashboard {
+    display: none;
+  }
   .shell {
     padding: 16px;
   }
 
   .card {
-    padding: 14px;
+    padding: 12px;
     border-radius: 14px;
   }
 
@@ -734,11 +752,25 @@ select.input {
     width: 100%;
   }
 
+  .section-title-row {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    align-items: center;
+    gap: 6px;
+  }
+
   .title {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 8px;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
     font-size: 14px;
+  }
+
+  .brand {
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
   .subtitle {
@@ -746,7 +778,9 @@ select.input {
   }
 
   .header-actions {
-    width: 100%;
+    width: auto;
+    margin-left: auto;
+    justify-content: flex-end;
     flex-wrap: wrap;
     gap: 6px;
   }
@@ -757,33 +791,34 @@ select.input {
 
   .stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
+    gap: 6px;
   }
 
   .stat {
-    padding: 10px;
+    padding: 8px;
   }
 
   .value {
-    font-size: 15px;
+    font-size: 14px;
   }
 
   .positions {
-    gap: 12px;
+    gap: 10px;
   }
 
   .position-row {
-    flex-direction: column;
+    display: grid;
+    gap: 6px;
     align-items: flex-start;
     background: linear-gradient(135deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
     border-color: rgba(255, 255, 255, 0.08);
     border-radius: 14px;
-    padding: 12px 14px;
+    padding: 10px 12px;
   }
 
   .position-row strong {
     display: block;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
     margin-bottom: 4px;
   }
@@ -791,24 +826,74 @@ select.input {
   .position-row .muted {
     font-size: 11px;
     line-height: 1.4;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
   }
 
   .position-actions {
     width: 100%;
-    justify-content: space-between;
-    gap: 8px;
-    margin-top: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 4px;
+  }
+
+  .position-actions-right {
+    margin-left: auto;
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+  }
+
+  .position-actions-right > .btn {
+    order: 1;
+  }
+
+  .position-actions-right > .pill-inline {
+    order: 2;
+    margin-left: 0;
   }
 
   .position-actions .btn {
-    width: 100%;
-    font-size: 12px;
-    padding: 10px 12px;
+    width: auto;
+    font-size: 11px;
+    padding: 6px 10px;
+    min-height: 32px;
+  }
+
+  .position-actions .btn.active {
+    border-radius: 999px;
+    padding: 5px 10px;
+    font-size: 10px;
+  }
+
+  .position-actions .btn[disabled] {
+    display: none;
+  }
+
+  .position-actions > span {
+    font-size: 10px;
+    padding: 4px 8px;
+  }
+
+  .position-row .pill-left {
+    display: none;
   }
 
   .row {
     flex-direction: column;
     gap: 4px;
+  }
+
+  .row-align {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
   }
 
   .row-align > span {
@@ -819,11 +904,11 @@ select.input {
     background: linear-gradient(140deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
     border-color: rgba(255, 255, 255, 0.08);
     border-radius: 14px;
-    padding: 14px;
+    padding: 12px;
   }
 
   .recommendation .row {
-    padding: 8px 0;
+    padding: 6px 0;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   }
 
@@ -832,36 +917,41 @@ select.input {
   }
 
   .recommendation .row > span {
-    font-size: 11px;
+    font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.4px;
     color: var(--muted);
   }
 
   .recommendation .row > strong {
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
     color: var(--text);
   }
 
   .row-inline-fee {
-    justify-content: flex-start;
+    justify-content: flex-end;
     min-width: 0;
-    width: 100%;
+    width: auto;
+    margin-left: auto;
   }
 
   .fee-amount {
     min-width: 0;
-    text-align: left;
+    text-align: right;
   }
 
   .input {
     width: 100%;
     text-align: left;
-    padding: 10px 12px;
+    padding: 8px 10px;
   }
 
   select.input {
+    width: 100%;
+  }
+
+  .add-position {
     width: 100%;
   }
 
@@ -871,7 +961,7 @@ select.input {
   }
 
   .modal {
-    padding: 12px;
+    padding: 10px;
   }
 
   .modal-card {
@@ -879,7 +969,7 @@ select.input {
     max-height: 90vh;
     overflow: auto;
     border-radius: 14px;
-    padding: 14px;
+    padding: 12px;
   }
 
   .modal-title {
@@ -904,8 +994,8 @@ select.input {
 
   .modal-actions .btn {
     width: 100%;
-    font-size: 12px;
-    padding: 10px 12px;
+    font-size: 11px;
+    padding: 8px 10px;
   }
 }
 
@@ -1055,7 +1145,7 @@ select.input {
 .audit-table {
   display: grid;
   gap: 6px;
-  min-width: 1160px;
+  min-width: 2000px;
 }
 
 .audit-row {
@@ -1072,9 +1162,15 @@ select.input {
     90px
     90px
     90px
+    90px
     100px
     100px
     110px
+    100px
+    100px
+    100px
+    90px
+    90px
     90px;
   gap: 8px;
   align-items: center;
@@ -1106,6 +1202,12 @@ select.input {
 
 .position-actions {
   display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.position-actions-right {
+  display: inline-flex;
   align-items: center;
   gap: 8px;
 }

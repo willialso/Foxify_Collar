@@ -133,10 +133,10 @@ export function applyBronzeFixedFee(
   leverage: number,
   feeUsdc: Decimal
 ): { fee: Decimal; applied: boolean } {
-  if (tierName !== "Pro (Bronze)" || leverage > 2) {
+  if (tierName !== "Pro (Bronze)") {
     return { fee: feeUsdc, applied: false };
   }
-  return { fee: new Decimal(20), applied: true };
+  return { fee: feeUsdc, applied: true };
 }
 
 export function applyIvFeeUplift(
@@ -294,6 +294,15 @@ export async function calculateFeeBase(
   riskControls: RiskControlsConfig
 ): Promise<FeeBaseResult> {
   const feeIv = ivSnapshot;
+  if (params.tierName === "Pro (Bronze)") {
+    const fixedFee = applyMinFee(params.tierName, params.baseFeeUsdc, riskControls);
+    return {
+      feeUsdc: fixedFee,
+      feeRegime: { regime: null, multiplier: null },
+      feeLeverage: { multiplier: new Decimal(1) },
+      feeIv
+    };
+  }
   let feeUsdc = applyMinFee(params.tierName, params.baseFeeUsdc, riskControls);
   feeUsdc = applyDurationFee(feeUsdc, params.targetDays, riskControls);
 
