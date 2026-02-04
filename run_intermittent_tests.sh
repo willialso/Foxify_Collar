@@ -3,6 +3,7 @@ set -euo pipefail
 
 API_BASE="${API_BASE:-http://localhost:4100}"
 CONFIG_PATH="${CONFIG_PATH:-./configs/risk_controls.json}"
+INCLUDE_EXPOSURES="${INCLUDE_EXPOSURES:-false}"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required. Install with: brew install jq (mac) or apt-get install jq (linux)"
@@ -12,6 +13,7 @@ fi
 echo "=== Intermittent Hedging Test Script ==="
 echo "API_BASE=${API_BASE}"
 echo "CONFIG_PATH=${CONFIG_PATH}"
+echo "INCLUDE_EXPOSURES=${INCLUDE_EXPOSURES}"
 echo
 
 if [ -f "${CONFIG_PATH}" ]; then
@@ -97,6 +99,11 @@ print((datetime.utcnow() + timedelta(days=7)).isoformat(timespec="seconds") + "Z
 PY
 )"
 
+exposures_payload="[]"
+if [ "${INCLUDE_EXPOSURES}" = "true" ]; then
+  exposures_payload="[{\"asset\":\"BTC\",\"side\":\"long\",\"entryPrice\":${spot},\"size\":0.033,\"leverage\":1}]"
+fi
+
 echo "Step 6: Trigger loop/tick"
 curl -s "${API_BASE}/loop/tick" \
   -H "Content-Type: application/json" \
@@ -116,7 +123,7 @@ curl -s "${API_BASE}/loop/tick" \
     \"notionalUsdc\":2500,
     \"hedgeType\":\"option\",
     \"tierName\":\"Pro (Bronze)\",
-    \"exposures\":[{\"asset\":\"BTC\",\"side\":\"long\",\"entryPrice\":${spot},\"size\":0.033,\"leverage\":1}]
+    \"exposures\":${exposures_payload}
   }" | jq
 echo
 
