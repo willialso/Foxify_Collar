@@ -1627,7 +1627,7 @@ export function App() {
         <div className="subtitle">
           {showAudit
             ? "Audit data is for internal review only and will not be visible to traders in live mode."
-            : "Guaranteed Drawdown Protection. One-Click."}
+            : "Guaranteed Drawdown Protection"}
         </div>
 
         {!showAudit && (
@@ -1739,6 +1739,7 @@ export function App() {
                 </div>
                 <div className="row row-align">
                   <span>
+                    Premium
                     {isFetchingQuote && (
                       <span className="fetching-status">
                         <em>
@@ -1791,23 +1792,23 @@ export function App() {
                   <span>Tier</span>
                   <strong>{shortTierLabel()}</strong>
                 </div>
-                <div className="row">
+                <div className="row row-align">
                   <span>Time Remaining</span>
                   <strong>{formatTimer(protectionExpiry)}</strong>
                 </div>
-                <div className="row">
+                <div className="row row-align">
                   <span>Distance to Floor</span>
                   <strong>
                     ${formatUsd(Math.max(0, mtmDistanceToFloor))}
                   </strong>
                 </div>
-                <div className="row">
+                <div className="row row-align">
                   <span>Auto-Renew</span>
                   <strong>{autoRenew ? "On" : "Off"}</strong>
                 </div>
                 {feeRegimeLabel &&
                   !(protectionTierName === "Pro (Bronze)" && (protectionLeverage ?? 0) <= 2) && (
-                  <div className="row">
+                  <div className="row row-align">
                     <span>Pricing Regime</span>
                     <strong>{feeRegimeLabel}</strong>
                   </div>
