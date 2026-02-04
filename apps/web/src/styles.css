@@ -390,7 +390,7 @@ select.input {
 
 .audit-metrics {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 14px;
   background: #111114;
   border: 1px solid var(--border);
@@ -1145,33 +1145,16 @@ select.input {
 .audit-table {
   display: grid;
   gap: 6px;
-  min-width: 2000px;
+  min-width: var(--audit-min-width, 2000px);
 }
 
 .audit-row {
   display: grid;
-  grid-template-columns:
-    80px
-    120px
-    1.2fr
-    1.2fr
-    80px
-    80px
-    70px
-    80px
-    90px
-    90px
-    90px
-    90px
-    100px
-    100px
-    110px
-    100px
-    100px
-    100px
-    90px
-    90px
-    90px;
+  grid-template-columns: var(
+    --audit-cols,
+    80px 120px 1.4fr 1.4fr 80px 80px 70px 90px 90px 90px 90px 100px 110px
+      110px 110px 100px 90px 100px
+  );
   gap: 8px;
   align-items: center;
   font-size: 11px;
@@ -1198,6 +1181,9 @@ select.input {
 
 .audit-head span {
   color: var(--muted);
+  white-space: normal;
+  overflow: visible;
+  text-overflow: initial;
 }
 
 .position-actions {

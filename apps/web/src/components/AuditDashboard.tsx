@@ -64,6 +64,7 @@ export function AuditDashboard({
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
   const [showNetExposure, setShowNetExposure] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [showGlossary, setShowGlossary] = useState(false);
 
   const load = useCallback(async () => {
@@ -118,8 +119,38 @@ export function AuditDashboard({
     liquidity: liquidity?.liquidityBalanceUsdc ?? 0,
     revenue: liquidity?.revenueUsdc ?? 0,
     hedgeSpend: liquidity?.hedgeSpendUsdc ?? 0,
-    unrealizedPnl: profitability?.unrealizedHedgePnlUsdc ?? 0
+    unrealizedPnl: profitability?.unrealizedHedgePnlUsdc ?? 0,
+    netProfit: profitability?.netProfitUsdc ?? 0
   };
+  const projectedClass =
+    stats.unrealizedPnl >= 0 ? "audit-metric-value-positive" : "audit-metric-value-warn";
+  const netProfitClass =
+    stats.netProfit >= 0 ? "audit-metric-value-positive" : "audit-metric-value-negative";
+  const baseColumnWidths = [
+    "80px",
+    "120px",
+    "1.4fr",
+    "1.4fr",
+    "80px",
+    "80px",
+    "70px",
+    "90px",
+    "90px",
+    "90px",
+    "90px",
+    "100px",
+    "110px",
+    "110px",
+    "110px",
+    "100px",
+    "90px",
+    "100px"
+  ];
+  const advancedColumnWidths = ["90px", "110px", "120px", "100px"];
+  const columnTemplate = showAdvanced
+    ? baseColumnWidths.concat(advancedColumnWidths).join(" ")
+    : baseColumnWidths.join(" ");
+  const minTableWidth = showAdvanced ? "2300px" : "1900px";
   // ═══════════════════════════════════════════════════════════
   // CEO AUDIT EVENTS FILTER
   // Must match CEO_AUDIT_EVENTS in services/api/src/server.ts
@@ -280,8 +311,6 @@ export function AuditDashboard({
               <span className="audit-metric-sub">capital available</span>
             </div>
 
-            <div className="audit-metrics-divider" />
-
             <div className="audit-metric">
               <span className="audit-metric-label">Premium Collected</span>
               <span className="audit-metric-value audit-metric-value-positive">
@@ -312,6 +341,22 @@ export function AuditDashboard({
               <span className="audit-metric-sub">
                 {(stats.revenue - stats.hedgeSpend) >= 0 ? "operating profit" : "coverage cost"}
               </span>
+            </div>
+
+            <div className="audit-metric">
+              <span className="audit-metric-label">Projected (MTM)</span>
+              <span className={`audit-metric-value ${projectedClass}`}>
+                ${Number(stats.unrealizedPnl || 0).toFixed(2)}
+              </span>
+              <span className="audit-metric-sub">Unrealized Hedge PnL</span>
+            </div>
+
+            <div className="audit-metric">
+              <span className="audit-metric-label">Net Profit</span>
+              <span className={`audit-metric-value ${netProfitClass}`}>
+                ${Number(stats.netProfit || 0).toFixed(2)}
+              </span>
+              <span className="audit-metric-sub">revenue − hedging − subsidy</span>
             </div>
           </div>
         </div>
@@ -355,11 +400,25 @@ export function AuditDashboard({
             >
               {showNetExposure ? "Net Exposure: On" : "Net Exposure: Off"}
             </button>
+            <button
+              className={showAdvanced ? "btn active" : "btn"}
+              onClick={() => setShowAdvanced((prev) => !prev)}
+            >
+              {showAdvanced ? "Advanced: On" : "Advanced: Off"}
+            </button>
             <span className="muted">Showing latest {MAX_AUDIT_ROWS}</span>
           </div>
         </div>
         <div className="audit-table-wrap">
-          <div className="audit-table">
+          <div
+            className="audit-table"
+            style={
+              {
+                "--audit-cols": columnTemplate,
+                "--audit-min-width": minTableWidth
+              } as Record<string, string>
+            }
+          >
             <div className="audit-row audit-head">
               <span>Time</span>
               <span>Event</span>
@@ -369,20 +428,24 @@ export function AuditDashboard({
               <span>Strike</span>
               <span>Side</span>
               <span>Status</span>
-              <span>Premium In</span>
-              <span>Premium Out</span>
+              <span>Prem In</span>
+              <span>Prem Out</span>
               <span>Hedge Size</span>
-              <span>Hedge Type</span>
-              <span>Notional</span>
               <span>Hedge Spend</span>
-              <span>Projected Payout</span>
               <span>MTM Equity</span>
               <span>Position PnL</span>
               <span>Hedge MTM</span>
               <span>Buffer</span>
               <span>Credit</span>
               <span>Coverage %</span>
-              <span>Liquidity Δ</span>
+              {showAdvanced && (
+                <>
+                  <span>Hedge Type</span>
+                  <span>Notional</span>
+                  <span>Proj Payout</span>
+                  <span>Liquidity Δ</span>
+                </>
+              )}
             </div>
             {limitedEntries.length === 0 && (
               <div className="empty">No audit entries yet.</div>
@@ -463,19 +526,10 @@ export function AuditDashboard({
                     ? formatSmall(Number(hedgeSize))
                     : "—"}
                 </span>
-                <span>{hedgeType || "—"}</span>
-                <span title={notional !== null && notional !== undefined ? `$${notional}` : "—"}>
-                  {notional !== null && notional !== undefined
-                    ? `$${formatAbbrev(Number(notional))}`
-                    : "—"}
-                </span>
                 <span title={hedgeSpend !== null && hedgeSpend !== undefined ? `$${hedgeSpend}` : "—"}>
                   {hedgeSpend !== null && hedgeSpend !== undefined
                     ? `$${formatAbbrev(Number(hedgeSpend))}`
                     : "—"}
-                </span>
-                <span title={projectedPayout !== null ? `$${projectedPayout}` : "—"}>
-                  {projectedPayout !== null ? `$${formatSmall(projectedPayout)}` : "—"}
                 </span>
                 <span title={mtmEquity !== null && mtmEquity !== undefined ? `$${mtmEquity}` : "—"}>
                   {mtmEquity !== null && mtmEquity !== undefined
@@ -507,11 +561,24 @@ export function AuditDashboard({
                     ? `${(Number(coverageRatio) * 100).toFixed(2)}%`
                     : "—"}
                 </span>
-                <span title={deltaValue !== null && deltaValue !== undefined ? String(deltaValue) : "—"}>
-                  {deltaValue !== null && deltaValue !== undefined
-                    ? formatAbbrev(Number(deltaValue))
-                    : "—"}
-                </span>
+                {showAdvanced && (
+                  <>
+                    <span>{hedgeType || "—"}</span>
+                    <span title={notional !== null && notional !== undefined ? `$${notional}` : "—"}>
+                      {notional !== null && notional !== undefined
+                        ? `$${formatAbbrev(Number(notional))}`
+                        : "—"}
+                    </span>
+                    <span title={projectedPayout !== null ? `$${projectedPayout}` : "—"}>
+                      {projectedPayout !== null ? `$${formatSmall(projectedPayout)}` : "—"}
+                    </span>
+                    <span title={deltaValue !== null && deltaValue !== undefined ? `$${deltaValue}` : "—"}>
+                      {deltaValue !== null && deltaValue !== undefined
+                        ? `$${formatAbbrev(Number(deltaValue))}`
+                        : "—"}
+                    </span>
+                  </>
+                )}
               </div>
             );
           })}
