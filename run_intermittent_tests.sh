@@ -10,6 +10,8 @@ HYSTERESIS_PCT="${HYSTERESIS_PCT:-0.02}"
 POSITION_SIZE="${POSITION_SIZE:-0.033}"
 LOOPS="${LOOPS:-1}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-2}"
+LOG_LIMIT="${LOG_LIMIT:-200}"
+POST_LOG_DELAY_SECONDS="${POST_LOG_DELAY_SECONDS:-2}"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required. Install with: brew install jq (mac) or apt-get install jq (linux)"
@@ -25,6 +27,8 @@ echo "BUFFER_TARGET_PCT=${BUFFER_TARGET_PCT}"
 echo "POSITION_SIZE=${POSITION_SIZE}"
 echo "LOOPS=${LOOPS}"
 echo "SLEEP_SECONDS=${SLEEP_SECONDS}"
+echo "LOG_LIMIT=${LOG_LIMIT}"
+echo "POST_LOG_DELAY_SECONDS=${POST_LOG_DELAY_SECONDS}"
 echo
 
 if [ -f "${CONFIG_PATH}" ]; then
@@ -203,18 +207,22 @@ for i in $(seq 1 "${LOOPS}"); do
   echo
 done
 
+echo "Waiting ${POST_LOG_DELAY_SECONDS}s for logs to flush..."
+sleep "${POST_LOG_DELAY_SECONDS}"
+echo
+
 echo "Step 7: Recent intermittent analytics (if enabled)"
-curl -s "${API_BASE}/audit/logs?limit=50&showAll=true" | \
+curl -s "${API_BASE}/audit/logs?limit=${LOG_LIMIT}&showAll=true" | \
   jq '.entries | map(select(.event=="intermittent_hedge_eval")) | .[0:5]'
 echo
 
 echo "Step 8: Recent hedge_action_skipped (profit threshold/cooldown)"
-curl -s "${API_BASE}/audit/logs?limit=50&showAll=true" | \
+curl -s "${API_BASE}/audit/logs?limit=${LOG_LIMIT}&showAll=true" | \
   jq '.entries | map(select(.event=="hedge_action_skipped")) | .[0:5]'
 echo
 
 echo "Step 9: Recent hedge_order entries"
-curl -s "${API_BASE}/audit/logs?limit=50&showAll=true" | \
+curl -s "${API_BASE}/audit/logs?limit=${LOG_LIMIT}&showAll=true" | \
   jq '.entries | map(select(.event=="hedge_order")) | .[0:5]'
 echo
 
