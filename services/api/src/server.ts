@@ -2950,6 +2950,7 @@ app.post("/deribit/order", async (req) => {
     venue === "bybit" && typeof body.instrument === "string" && !body.instrument.endsWith("-USDT")
       ? `${body.instrument}-USDT`
       : body.instrument;
+  const estimatePremiumEnabled = riskControls.estimate_premium_on_missing === true;
   let quotedPremiumPerUnit: Decimal | null = null;
   let quotedPremiumTotal: Decimal | null = null;
   if (quoteLock?.premiumPerUnitUsdc) {
@@ -2974,6 +2975,7 @@ app.post("/deribit/order", async (req) => {
     slippageUsdc: string | null;
     slippagePct: string | null;
   } | null = null;
+  let slippageCurrentPerUnit: Decimal | null = null;
   if (
     (slippageTrackingEnabled || slippageGuardEnabled) &&
     inferredHedgeType === "option" &&
@@ -3005,6 +3007,7 @@ app.post("/deribit/order", async (req) => {
       const slippagePct = quotedPremiumPerUnit.gt(0)
         ? slippageUsdc.div(quotedPremiumPerUnit)
         : new Decimal(0);
+      slippageCurrentPerUnit = currentMark;
       const slippagePositive = slippageUsdc.gt(0);
       const softBreached =
         slippagePositive &&
@@ -3070,7 +3073,7 @@ app.post("/deribit/order", async (req) => {
     null;
   const spotPrice = body.spotPrice ?? null;
   const isBybitExec = venue === "bybit";
-  const executedPremiumUsdc =
+  const premiumUsdcFromOrder =
     inferredHedgeType === "option" && fillPrice
       ? isBybitExec
         ? Number(new Decimal(fillPrice).mul(filledAmount))
@@ -3078,16 +3081,28 @@ app.post("/deribit/order", async (req) => {
           ? Number(new Decimal(fillPrice).mul(new Decimal(spotPrice)).mul(filledAmount))
           : null
       : null;
+  let estimatedPremiumUsdc: number | null = null;
+  if (premiumUsdcFromOrder === null && inferredHedgeType === "option" && estimatePremiumEnabled) {
+    if (slippageCurrentPerUnit && Number.isFinite(filledAmount)) {
+      estimatedPremiumUsdc = slippageCurrentPerUnit.mul(new Decimal(filledAmount)).toNumber();
+    } else if (quotedPremiumPerUnit && Number.isFinite(filledAmount)) {
+      estimatedPremiumUsdc = quotedPremiumPerUnit.mul(new Decimal(filledAmount)).toNumber();
+    } else if (body.premiumUsdc && Number.isFinite(body.premiumUsdc)) {
+      estimatedPremiumUsdc = Number(body.premiumUsdc);
+    }
+  }
   const baseSubsidyUsdc = Number(body.subsidyUsdc ?? 0);
   let slippageUsdc: number | null = null;
   let slippagePct: number | null = null;
   let slippageSubsidyUsdc = 0;
+  const executedPremiumResolved =
+    premiumUsdcFromOrder !== null ? premiumUsdcFromOrder : estimatedPremiumUsdc;
   if (
-    executedPremiumUsdc !== null &&
+    executedPremiumResolved !== null &&
     quotedPremiumTotal &&
     quotedPremiumTotal.gt(0)
   ) {
-    const executed = new Decimal(executedPremiumUsdc);
+    const executed = new Decimal(executedPremiumResolved);
     const slippageDelta = executed.sub(quotedPremiumTotal);
     slippageUsdc = slippageDelta.toNumber();
     slippagePct = slippageDelta.div(quotedPremiumTotal).mul(100).toNumber();
@@ -3175,7 +3190,8 @@ app.post("/deribit/order", async (req) => {
     hedgeType: inferredHedgeType,
     status: status || "submitted",
     fillPrice,
-    premiumUsdc: executedPremiumUsdc ?? body.premiumUsdc ?? null,
+    premiumUsdc: premiumUsdcFromOrder ?? body.premiumUsdc ?? null,
+    estimatedPremiumUsdc,
     feeUsdc: body.feeUsdc ?? null,
     subsidyUsdc: effectiveSubsidyUsdc || null,
     slippageUsdc,
@@ -3194,7 +3210,7 @@ app.post("/deribit/order", async (req) => {
   if (executed && body.tierName && body.feeUsdc !== undefined) {
     const premiumForAccounting =
       inferredHedgeType === "option"
-        ? Number(executedPremiumUsdc ?? body.premiumUsdc ?? 0)
+        ? Number(premiumUsdcFromOrder ?? estimatedPremiumUsdc ?? body.premiumUsdc ?? 0)
         : 0;
     const feeForAccounting = body.feeRecognized ? 0 : Number(body.feeUsdc);
     const accounting = applyRiskAccounting(
@@ -6540,6 +6556,7 @@ app.post("/loop/tick", async (req) => {
   }
 
   const hedgeCooldownMs = riskControls.hedge_action_cooldown_ms ?? 60000;
+  const estimatePremiumEnabled = riskControls.estimate_premium_on_missing === true;
   const staleMtmThresholdMs =
     riskControls.loop_stale_mtm_cooldown_ms ?? riskControls.loop_mtm_max_age_ms ?? 0;
   const blockOnStaleMtm = riskControls.loop_block_on_stale_mtm === true;
@@ -7000,6 +7017,21 @@ app.post("/loop/tick", async (req) => {
         });
         await saveCoverageLedger();
       }
+      let estimatedPremiumUsdc: number | null = null;
+      if (executed && executedPremiumUsdc === null && estimatePremiumEnabled) {
+        try {
+          const spotPriceNumber = Number(body.spotByAsset?.[inferredAsset] ?? body.spotPrice ?? 0);
+          const spot = spotPriceNumber
+            ? new Decimal(spotPriceNumber)
+            : await fetchSpotPrice(inferredAsset);
+          const mark = await fetchCoverageOptionMarkUsdc(hedgeVenue, hedgeInstrument, spot || new Decimal(0));
+          if (mark && mark.isFinite() && mark.gt(0)) {
+            estimatedPremiumUsdc = mark.mul(new Decimal(executedSize)).toNumber();
+          }
+        } catch {
+          estimatedPremiumUsdc = null;
+        }
+      }
       await audit("hedge_order", {
         instrument: executionInstrument,
         side: decision.recommendedSide,
@@ -7010,21 +7042,24 @@ app.post("/loop/tick", async (req) => {
         hedgeType: inferredHedgeType,
         positionSide: inferredPositionSide,
         premiumUsdc: executedPremiumUsdc ?? null,
+        estimatedPremiumUsdc,
         fillPrice: fillPrice ?? null,
         venue: hedgeVenue
       });
-      if (executed && loopAccountingEnabled && body.tierName && executedPremiumUsdc !== null) {
+      const loopPremiumForAccounting =
+        executedPremiumUsdc !== null ? executedPremiumUsdc : estimatedPremiumUsdc;
+      if (executed && loopAccountingEnabled && body.tierName && loopPremiumForAccounting !== null) {
         const accounting = applyRiskAccounting(
           body.tierName,
           0,
-          Number(executedPremiumUsdc),
+          Number(loopPremiumForAccounting),
           Number(notionalUsdc)
         );
         await audit("liquidity_update", {
           coverageId: body.coverageId || null,
           tier: body.tierName,
           feeUsdc: 0,
-          premiumUsdc: Number(executedPremiumUsdc),
+          premiumUsdc: Number(loopPremiumForAccounting),
           notionalUsdc,
           delta: accounting.liquidityDelta,
           totals: liquiditySummary(),
@@ -7176,10 +7211,25 @@ app.post("/loop/tick", async (req) => {
             }
           }
         }
+        let estimatedPremiumUsdc: number | null = null;
+        if (executed && executedPremiumUsdc === null && estimatePremiumEnabled) {
+          try {
+            const spotPriceNumber = Number(body.spotByAsset?.[inferredAsset] ?? body.spotPrice ?? 0);
+            const spot = spotPriceNumber
+              ? new Decimal(spotPriceNumber)
+              : await fetchSpotPrice(inferredAsset);
+            const mark = await fetchCoverageOptionMarkUsdc(hedgeVenue, hedgeInstrument, spot || new Decimal(0));
+            if (mark && mark.isFinite() && mark.gt(0)) {
+              estimatedPremiumUsdc = mark.mul(new Decimal(executedSize)).toNumber();
+            }
+          } catch {
+            estimatedPremiumUsdc = null;
+          }
+        }
+        const basePremiumUsdc =
+          executedPremiumUsdc !== null ? executedPremiumUsdc : estimatedPremiumUsdc;
         const signedPremiumUsdc =
-          executedPremiumUsdc !== null && closeSide === "sell"
-            ? -executedPremiumUsdc
-            : executedPremiumUsdc;
+          basePremiumUsdc !== null && closeSide === "sell" ? -basePremiumUsdc : basePremiumUsdc;
         await audit("hedge_order", {
           instrument: executionInstrument,
           side: closeSide,
@@ -7190,6 +7240,7 @@ app.post("/loop/tick", async (req) => {
           hedgeType: inferredHedgeType,
           positionSide: inferredPositionSide,
           premiumUsdc: signedPremiumUsdc ?? null,
+          estimatedPremiumUsdc: estimatedPremiumUsdc ?? null,
           fillPrice: fillPrice ?? null,
           venue: hedgeVenue
         });

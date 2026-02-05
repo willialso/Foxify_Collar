@@ -35,6 +35,7 @@ export interface RiskControlsConfig {
   slippage_reject_hard?: boolean;
   slippage_adjust_subsidy_enabled?: boolean;
   slippage_subsidy_cap_usdc?: number;
+  estimate_premium_on_missing?: boolean;
   max_spread_pct?: number;
   max_slippage_pct?: number;
   max_spread_pct_by_days?: Record<string, number>;
@@ -175,6 +176,7 @@ const DEFAULTS: RiskControlsConfig = {
   slippage_reject_hard: false,
   slippage_adjust_subsidy_enabled: false,
   slippage_subsidy_cap_usdc: 0,
+  estimate_premium_on_missing: false,
   max_spread_pct: 0.05,
   max_slippage_pct: 0.01,
   max_spread_pct_by_days: {},

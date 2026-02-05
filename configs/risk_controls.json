@@ -115,6 +115,7 @@
   "slippage_reject_hard": false,
   "slippage_adjust_subsidy_enabled": true,
   "slippage_subsidy_cap_usdc": 500,
+  "estimate_premium_on_missing": true,
   "loop_use_mtm_buffer": true,
   "loop_mtm_max_age_ms": 900000,
   "loop_block_on_stale_mtm": true,
