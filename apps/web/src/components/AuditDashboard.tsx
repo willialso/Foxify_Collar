@@ -119,11 +119,12 @@ export function AuditDashboard({
     liquidity: liquidity?.liquidityBalanceUsdc ?? 0,
     revenue: liquidity?.revenueUsdc ?? 0,
     hedgeSpend: liquidity?.hedgeSpendUsdc ?? 0,
-    unrealizedPnl: profitability?.unrealizedHedgePnlUsdc ?? 0,
+    projectedProfit:
+      profitability?.expectedProfitUsdc ?? profitability?.unrealizedHedgePnlUsdc ?? 0,
     netProfit: profitability?.netProfitUsdc ?? 0
   };
   const projectedClass =
-    stats.unrealizedPnl >= 0 ? "audit-metric-value-positive" : "audit-metric-value-warn";
+    stats.projectedProfit >= 0 ? "audit-metric-value-positive" : "audit-metric-value-warn";
   const netProfitClass =
     stats.netProfit >= 0 ? "audit-metric-value-positive" : "audit-metric-value-negative";
   const baseColumnWidths = [
@@ -315,11 +316,11 @@ export function AuditDashboard({
             </div>
 
             <div className="audit-metric">
-              <span className="audit-metric-label">Projected (MTM)</span>
+              <span className="audit-metric-label">Projected Profit</span>
               <span className={`audit-metric-value ${projectedClass}`}>
-                ${formatCsvMoney(Number(stats.unrealizedPnl || 0))}
+                ${formatCsvMoney(Number(stats.projectedProfit || 0))}
               </span>
-              <span className="audit-metric-sub">unrealized hedge pnl</span>
+              <span className="audit-metric-sub">booked + MTM</span>
             </div>
 
             <div className="audit-metric">
