@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { appendFile, readdir, rm, writeFile, readFile, mkdir } from "node:fs/promises";
+import { appendFile, readdir, rm, writeFile, readFile, mkdir, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import Decimal from "decimal.js";
 import {
@@ -8069,6 +8069,32 @@ app.get("/audit/logs", async (req) => {
     count: entries.length,
     totalEvents: allEntries.length,
     filtered: !showAll
+  };
+});
+
+app.get("/debug/risk-controls", async () => {
+  const current = await loadRiskControls(RISK_CONTROLS_PATH);
+  let mtime: string | null = null;
+  try {
+    const info = await stat(RISK_CONTROLS_PATH);
+    mtime = new Date(info.mtimeMs).toISOString();
+  } catch {
+    mtime = null;
+  }
+  return {
+    status: "ok",
+    path: RISK_CONTROLS_PATH.pathname,
+    mtime,
+    controls: {
+      pass_through_allow_uncapped_bronze: current.pass_through_allow_uncapped_bronze ?? false,
+      pass_through_uncapped_max_ratio: current.pass_through_uncapped_max_ratio ?? null,
+      pass_through_cap_by_tier: current.pass_through_cap_by_tier ?? {},
+      pass_through_cap_by_leverage: current.pass_through_cap_by_leverage ?? {},
+      enable_premium_pass_through: current.enable_premium_pass_through ?? null,
+      require_user_opt_in_for_pass_through: current.require_user_opt_in_for_pass_through ?? null,
+      premium_floor_ratio: current.premium_floor_ratio ?? null,
+      pass_through_min_notification_ratio: current.pass_through_min_notification_ratio ?? null
+    }
   };
 });
 
