@@ -216,6 +216,13 @@ export function AuditDashboard({
     return value.toFixed(2);
   };
 
+  const formatCashflow = (value: number, estimated?: boolean) => {
+    const sign = value < 0 ? "+" : "-";
+    const abs = Math.abs(value);
+    const suffix = estimated ? " (est)" : "";
+    return `${sign}$${formatAbbrev(abs)}${suffix}`;
+  };
+
   const formatCsvMoney = (value: number) =>
     value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
@@ -256,7 +263,9 @@ export function AuditDashboard({
     list.reduce((sum, entry) => {
       const premium =
         extractField(entry, "executedPremiumUsdc") ?? extractField(entry, "premiumUsdc");
-      return sum + (premium !== null && premium !== undefined ? Number(premium) : 0);
+      const estimated = extractField(entry, "estimatedPremiumUsdc");
+      const resolved = premium ?? estimated;
+      return sum + (resolved !== null && resolved !== undefined ? Number(resolved) : 0);
     }, 0);
   const perUserHedgeCost = sumPremium(hedgeOrders.filter((entry) => !isNetExposure(entry)));
   const poolHedgeCost = sumPremium(hedgeOrders.filter((entry) => isNetExposure(entry)));
@@ -433,9 +442,9 @@ export function AuditDashboard({
               <span>Side</span>
               <span>Status</span>
               <span>Prem In</span>
-              <span>Prem Out</span>
+              <span>Hedge Premium</span>
               <span>Hedge Size</span>
-              <span>Hedge Spend</span>
+              <span>Hedge Cashflow</span>
               <span>MTM Equity</span>
               <span>Position PnL</span>
               <span>Hedge MTM</span>
@@ -464,8 +473,14 @@ export function AuditDashboard({
             const statusRaw = String(extractField(entry, "status") || "—");
             const status =
               statusRaw === "—" && entry.event === "hedge_order" ? "filled" : statusRaw;
-            const premium =
+            const premiumRaw =
               extractField(entry, "executedPremiumUsdc") ?? extractField(entry, "premiumUsdc");
+            const estimatedPremium = extractField(entry, "estimatedPremiumUsdc");
+            const premium = premiumRaw ?? estimatedPremium;
+            const premiumEstimated =
+              (premiumRaw === null || premiumRaw === undefined) &&
+              estimatedPremium !== null &&
+              estimatedPremium !== undefined;
             const feeIn =
               extractField(entry, "totalFeeUsd") ??
               extractField(entry, "feeUsd") ??
@@ -475,9 +490,15 @@ export function AuditDashboard({
             const notional = extractField(entry, "notionalUsdc");
             const hedgeSpend =
               extractField(entry, "hedgeMarginUsdc") ??
-              extractField(entry, "executedPremiumUsdc") ??
-              extractField(entry, "premiumUsdc") ??
+              premium ??
               extractField(entry, "hedgeNotionalUsdc");
+            const hedgeSpendEstimated =
+              premiumEstimated &&
+              hedgeSpend !== null &&
+              hedgeSpend !== undefined &&
+              premium !== null &&
+              premium !== undefined &&
+              Number(hedgeSpend) === Number(premium);
             const mtmEquity = extractField(entry, "equityUsdc");
             const positionPnl = extractField(entry, "positionPnlUsdc");
             const hedgeMtm = extractField(entry, "hedgeMtmUsdc");
@@ -542,17 +563,35 @@ export function AuditDashboard({
                 <span title={feeIn !== null && feeIn !== undefined ? `$${feeIn}` : "—"}>
                   {feeIn !== null && feeIn !== undefined ? `$${formatSmall(Number(feeIn))}` : "—"}
                 </span>
-                <span title={premium !== null && premium !== undefined ? `$${premium}` : "—"}>
-                  {premium !== null && premium !== undefined ? `$${formatSmall(Number(premium))}` : "—"}
+                <span
+                  title={
+                    premium !== null && premium !== undefined
+                      ? `${Number(premium) < 0 ? "credit" : "spend"} $${Math.abs(
+                          Number(premium)
+                        ).toFixed(2)}${premiumEstimated ? " (est)" : ""}`
+                      : "—"
+                  }
+                >
+                  {premium !== null && premium !== undefined
+                    ? `$${formatSmall(Math.abs(Number(premium)))}${premiumEstimated ? " est" : ""}`
+                    : "—"}
                 </span>
                 <span title={hedgeSize !== null && hedgeSize !== undefined ? String(hedgeSize) : "—"}>
                   {hedgeSize !== null && hedgeSize !== undefined
                     ? formatSmall(Number(hedgeSize))
                     : "—"}
                 </span>
-                <span title={hedgeSpend !== null && hedgeSpend !== undefined ? `$${hedgeSpend}` : "—"}>
+                <span
+                  title={
+                    hedgeSpend !== null && hedgeSpend !== undefined
+                      ? `${Number(hedgeSpend) < 0 ? "credit" : "spend"} $${Math.abs(
+                          Number(hedgeSpend)
+                        ).toFixed(2)}${hedgeSpendEstimated ? " (est)" : ""}`
+                      : "—"
+                  }
+                >
                   {hedgeSpend !== null && hedgeSpend !== undefined
-                    ? `$${formatAbbrev(Number(hedgeSpend))}`
+                    ? formatCashflow(Number(hedgeSpend), hedgeSpendEstimated)
                     : "—"}
                 </span>
                 <span title={mtmEquity !== null && mtmEquity !== undefined ? `$${mtmEquity}` : "—"}>
