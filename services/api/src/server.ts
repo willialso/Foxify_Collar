@@ -96,6 +96,8 @@ await app.register(cors, { origin: true });
 const LOOP_INTERVAL_MS = Number(process.env.LOOP_INTERVAL_MS || "600000");
 const MTM_INTERVAL_MS = Number(process.env.MTM_INTERVAL_MS || "300000");
 const APP_MODE = process.env.APP_MODE || "demo";
+const ALLOW_DERIBIT_PRIVATE_MTM =
+  process.env.ALLOW_DERIBIT_PRIVATE_MTM === "true" || APP_MODE !== "demo";
 const AUDIT_SEED = process.env.AUDIT_SEED !== "false";
 const API_PORT = Number(process.env.PORT || process.env.API_PORT || "4100");
 const API_HOST = process.env.HOST || "0.0.0.0";
@@ -1898,7 +1900,7 @@ app.get("/risk/summary", async (req) => {
 
   const needsPositionPnl = !query.positionPnlUsdc;
   const needsHedgeMtm = !query.hedgeMtmUsdc;
-  if (needsPositionPnl || needsHedgeMtm) {
+  if (ALLOW_DERIBIT_PRIVATE_MTM && (needsPositionPnl || needsHedgeMtm)) {
     try {
       const assets = ["BTC"];
       for (const asset of assets) {
@@ -3055,6 +3057,9 @@ app.post("/deribit/order", async (req) => {
 });
 
 app.get("/deribit/positions", async () => {
+  if (!ALLOW_DERIBIT_PRIVATE_MTM) {
+    return { status: "disabled", reason: "private_mtm_disabled", positions: [] };
+  }
   return deribit.getPositions("BTC");
 });
 
@@ -3224,6 +3229,15 @@ app.post("/pricing/ctc", async (req) => {
 });
 
 app.get("/risk/mtm", async () => {
+  if (!ALLOW_DERIBIT_PRIVATE_MTM) {
+    return {
+      status: "disabled",
+      reason: "private_mtm_disabled",
+      positionPnlUsdc: "0.0000",
+      hedgeMtmUsdc: "0.0000",
+      positions: []
+    };
+  }
   const positions = await deribit.getPositions("BTC");
   const positionPnl = positions.reduce((acc, pos) => {
     const pnl = pos.floating_profit_loss ?? pos.unrealized_pnl ?? 0;
