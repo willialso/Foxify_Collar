@@ -162,7 +162,7 @@ This structure is intentionally modular to enable a future migration to a dedica
 **Caching**
 - Quote responses are cached across all status types.
 - Cache keys use fuzzy buckets (spot rounded to $500, drawdown rounded to 5%, days rounded to whole days).
-- TTL defaults to 5 minutes (env-configurable).
+- TTL is env-configurable and can be tuned for demo or production latency targets.
 
 ### 4.2 Hedge Control Loop
 **Flow**
@@ -362,6 +362,8 @@ Response:
 
 #### GET /risk/mtm
 Purpose: Return MTM components computed from Deribit positions
+Notes:
+- When `ALLOW_DERIBIT_PRIVATE_MTM=true`, MTM can use authenticated Deribit positions; otherwise the API operates in public/paper mode.
 
 #### POST /put/preview
 Purpose: Async quote preview with cache  
@@ -628,9 +630,10 @@ PORT=8000
 HOST=0.0.0.0
 DERIBIT_ENV=testnet
 DERIBIT_PAPER=true
+ALLOW_DERIBIT_PRIVATE_MTM=false
 DERIBIT_CLIENT_ID=provided_via_secrets_manager
 DERIBIT_CLIENT_SECRET=provided_via_secrets_manager
-QUOTE_CACHE_TTL_MS=300000
+QUOTE_CACHE_TTL_MS=4000
 QUOTE_CACHE_STALE_MS=20000
 QUOTE_CACHE_HARD_MS=120000
 AUDIT_LOG_PATH=./logs/audit.log
