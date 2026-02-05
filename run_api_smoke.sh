@@ -6,8 +6,13 @@ PORT="${PORT:-4100}"
 STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-25}"
 RISK_CONTROLS_PATH="${RISK_CONTROLS_PATH:-./configs/risk_controls.json}"
 RISK_CONTROLS_BACKUP="${RISK_CONTROLS_BACKUP:-/tmp/risk_controls_smoke_backup.json}"
+LOG_DIR="${LOG_DIR:-./logs}"
+COVERAGE_LEDGER_FILE="${COVERAGE_LEDGER_FILE:-${LOG_DIR}/coverage-ledger.json}"
+COVERAGE_LEDGER_BACKUP="${COVERAGE_LEDGER_BACKUP:-/tmp/coverage_ledger_smoke_backup.json}"
+STALE_LEDGER_MINUTES="${STALE_LEDGER_MINUTES:-10}"
 STALE_MTM_AGE_MS="${STALE_MTM_AGE_MS:-1000}"
 NET_EXPOSURE_MIN_BUDGET_USDC="${NET_EXPOSURE_MIN_BUDGET_USDC:-999999}"
+LEDGER_BACKUP_EXISTS=0
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required. Install with: brew install jq (mac) or apt-get install jq (linux)"
@@ -30,6 +35,11 @@ cleanup() {
   fi
   if [ -f "${RISK_CONTROLS_BACKUP}" ]; then
     cp "${RISK_CONTROLS_BACKUP}" "${RISK_CONTROLS_PATH}" || true
+  fi
+  if [ "${LEDGER_BACKUP_EXISTS}" -eq 1 ]; then
+    cp "${COVERAGE_LEDGER_BACKUP}" "${COVERAGE_LEDGER_FILE}" || true
+  else
+    rm -f "${COVERAGE_LEDGER_FILE}" || true
   fi
 }
 trap cleanup EXIT
@@ -54,6 +64,37 @@ if [ -f "${RISK_CONTROLS_PATH}" ]; then
 else
   echo "Risk controls not found at ${RISK_CONTROLS_PATH} (skipping overrides)."
 fi
+
+mkdir -p "${LOG_DIR}"
+if [ -f "${COVERAGE_LEDGER_FILE}" ]; then
+  cp "${COVERAGE_LEDGER_FILE}" "${COVERAGE_LEDGER_BACKUP}"
+  LEDGER_BACKUP_EXISTS=1
+fi
+python3 - <<PY
+import json
+from datetime import datetime, timedelta, timezone
+
+stale_ts = (datetime.now(timezone.utc) - timedelta(minutes=${STALE_LEDGER_MINUTES})).isoformat(timespec="seconds").replace("+00:00", "Z")
+now_ts = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+data = {
+  "ledger": [
+    {
+      "coverageId": "smoke-mtm",
+      "lastMtm": {
+        "bufferUsdc": "100.00",
+        "coverageRatio": "1.0000",
+        "ts": stale_ts
+      },
+      "positions": [],
+      "updatedAt": now_ts
+    }
+  ],
+  "timestamp": now_ts
+}
+with open("${COVERAGE_LEDGER_FILE}", "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+echo "Seeded stale coverage ledger at ${COVERAGE_LEDGER_FILE}."
 
 echo "Starting API (demo mode)..."
 APP_MODE=demo \
