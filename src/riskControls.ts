@@ -82,6 +82,8 @@ export interface RiskControlsConfig {
   enable_premium_pass_through?: boolean;
   require_user_opt_in_for_pass_through?: boolean;
   pass_through_min_notification_ratio?: number;
+  pass_through_allow_uncapped_bronze?: boolean;
+  pass_through_uncapped_max_ratio?: number;
   phase3_rollout_enabled?: boolean;
   phase3_safety_guard_enabled?: boolean;
   intermittent_analytics_enabled?: boolean;
@@ -205,6 +207,8 @@ const DEFAULTS: RiskControlsConfig = {
   enable_premium_pass_through: true,
   require_user_opt_in_for_pass_through: false,
   pass_through_min_notification_ratio: 1.5,
+  pass_through_allow_uncapped_bronze: false,
+  pass_through_uncapped_max_ratio: 0,
   phase3_rollout_enabled: false,
   phase3_safety_guard_enabled: true,
   intermittent_analytics_enabled: false,

@@ -51,11 +51,11 @@
   },
   "pass_through_cap_by_tier": {
     "Pro (Bronze)": {
-      "1": 4.0,
-      "2": 3.5,
-      "3": 3.0,
-      "5": 2.5,
-      "10": 2.0
+      "1": 6.0,
+      "2": 5.0,
+      "3": 4.0,
+      "5": 3.5,
+      "10": 3.0
     },
     "Pro (Silver)": {
       "1": 6.0,
@@ -130,6 +130,8 @@
   "enable_premium_pass_through": true,
   "require_user_opt_in_for_pass_through": false,
   "pass_through_min_notification_ratio": 1.5,
+  "pass_through_allow_uncapped_bronze": true,
+  "pass_through_uncapped_max_ratio": 8.0,
   "phase3_rollout_enabled": true,
   "phase3_safety_guard_enabled": true,
   "intermittent_analytics_enabled": true,
