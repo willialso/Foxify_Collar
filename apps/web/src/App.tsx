@@ -1097,6 +1097,13 @@ export function App() {
             return;
           }
 
+          if (
+            quote?.warning?.message &&
+            (quote?.status === "pass_through" || quote?.status === "pass_through_capped")
+          ) {
+            setPricingNoticeTimed(String(quote.warning.message));
+          }
+
           const optionUnavailable =
             !quote || quote.status === "no_quote" || quote.status === "perp_fallback";
           if (optionUnavailable) {
