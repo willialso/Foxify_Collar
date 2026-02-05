@@ -5,6 +5,7 @@ export interface RiskControlsConfig {
   risk_budget_pct_max: number;
   volatility_throttle_iv: number;
   hedge_reduction_factor: number;
+  enable_hedge_reduction?: boolean;
   max_leverage?: number;
   net_exposure_cap_usdc: Record<string, number>;
   initial_liquidity_usdc?: number;
@@ -12,8 +13,14 @@ export interface RiskControlsConfig {
   reserve_pct?: number;
   hedge_action_cooldown_ms?: number;
   min_hedge_notional_usdc?: number;
+  loop_use_mtm_buffer?: boolean;
+  loop_mtm_max_age_ms?: number;
+  loop_enable_decrease?: boolean;
+  loop_require_notional_usdc?: boolean;
+  loop_accounting_enabled?: boolean;
   net_exposure_min_notional_usdc?: number;
   net_exposure_cooldown_ms?: number;
+  net_exposure_perp_accounting_enabled?: boolean;
   max_spread_pct?: number;
   max_slippage_pct?: number;
   max_spread_pct_by_days?: Record<string, number>;
@@ -74,6 +81,7 @@ export interface RiskControlsConfig {
   intermittent_selection_live_enabled?: boolean;
   intermittent_selection_size_tolerance_pct?: number;
   intermittent_profit_threshold_enabled?: boolean;
+  intermittent_profit_enforce_override?: boolean;
   intermittent_profit_min_improvement_usdc?: number;
   intermittent_profit_min_improvement_ratio?: number;
   intermittent_profit_critical_buffer_pct?: number;
@@ -123,6 +131,7 @@ const DEFAULTS: RiskControlsConfig = {
   risk_budget_pct_max: 0.4,
   volatility_throttle_iv: 0.8,
   hedge_reduction_factor: 0.7,
+  enable_hedge_reduction: false,
   max_leverage: 10,
   net_exposure_cap_usdc: {},
   initial_liquidity_usdc: 35000,
@@ -130,8 +139,14 @@ const DEFAULTS: RiskControlsConfig = {
   reserve_pct: 0.3,
   hedge_action_cooldown_ms: 60000,
   min_hedge_notional_usdc: 250,
+  loop_use_mtm_buffer: false,
+  loop_mtm_max_age_ms: 900000,
+  loop_enable_decrease: false,
+  loop_require_notional_usdc: false,
+  loop_accounting_enabled: false,
   net_exposure_min_notional_usdc: 500,
   net_exposure_cooldown_ms: 120000,
+  net_exposure_perp_accounting_enabled: false,
   max_spread_pct: 0.05,
   max_slippage_pct: 0.01,
   max_spread_pct_by_days: {},
@@ -184,6 +199,7 @@ const DEFAULTS: RiskControlsConfig = {
   intermittent_selection_live_enabled: false,
   intermittent_selection_size_tolerance_pct: 0.2,
   intermittent_profit_threshold_enabled: false,
+  intermittent_profit_enforce_override: false,
   intermittent_profit_min_improvement_usdc: 0,
   intermittent_profit_min_improvement_ratio: 0,
   intermittent_profit_critical_buffer_pct: 0.02,
