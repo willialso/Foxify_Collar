@@ -26,6 +26,15 @@ export interface RiskControlsConfig {
   net_exposure_budget_guard_enabled?: boolean;
   net_exposure_min_budget_usdc?: number;
   net_exposure_force_coverage_id?: boolean;
+  slippage_tracking_enabled?: boolean;
+  slippage_guard_enabled?: boolean;
+  slippage_soft_pct?: number;
+  slippage_soft_usdc?: number;
+  slippage_hard_pct?: number;
+  slippage_hard_usdc?: number;
+  slippage_reject_hard?: boolean;
+  slippage_adjust_subsidy_enabled?: boolean;
+  slippage_subsidy_cap_usdc?: number;
   max_spread_pct?: number;
   max_slippage_pct?: number;
   max_spread_pct_by_days?: Record<string, number>;
@@ -157,6 +166,15 @@ const DEFAULTS: RiskControlsConfig = {
   net_exposure_budget_guard_enabled: false,
   net_exposure_min_budget_usdc: 0,
   net_exposure_force_coverage_id: false,
+  slippage_tracking_enabled: false,
+  slippage_guard_enabled: false,
+  slippage_soft_pct: 0,
+  slippage_soft_usdc: 0,
+  slippage_hard_pct: 0,
+  slippage_hard_usdc: 0,
+  slippage_reject_hard: false,
+  slippage_adjust_subsidy_enabled: false,
+  slippage_subsidy_cap_usdc: 0,
   max_spread_pct: 0.05,
   max_slippage_pct: 0.01,
   max_spread_pct_by_days: {},

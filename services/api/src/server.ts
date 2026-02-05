@@ -189,6 +189,9 @@ const quoteCache = new Map<string, QuoteCacheEntry>();
 const quoteInflight = new Map<string, Promise<Record<string, unknown>>>();
 type QuoteLock = {
   feeUsdc: Decimal;
+  premiumTotalUsdc?: Decimal;
+  premiumPerUnitUsdc?: Decimal;
+  hedgeSize?: Decimal;
   issuedAt: number;
   expiresAt: number;
   tierName: string;
@@ -2846,6 +2849,14 @@ app.post("/deribit/order", async (req) => {
     hedgeMtmUsdc?: string;
     floorPrice?: number;
   };
+  const slippageTrackingEnabled = riskControls.slippage_tracking_enabled === true;
+  const slippageGuardEnabled = riskControls.slippage_guard_enabled === true;
+  const slippageSoftPct = new Decimal(riskControls.slippage_soft_pct ?? 0);
+  const slippageSoftUsdc = new Decimal(riskControls.slippage_soft_usdc ?? 0);
+  const slippageHardPct = new Decimal(riskControls.slippage_hard_pct ?? 0);
+  const slippageHardUsdc = new Decimal(riskControls.slippage_hard_usdc ?? 0);
+  const slippageRejectHard = riskControls.slippage_reject_hard === true;
+  let quoteLock: QuoteLock | null = null;
   if (body.intent !== "close" && body.quoteId && body.feeUsdc !== undefined) {
     const lock = quoteLocks.get(body.quoteId);
     if (!lock) {
@@ -2885,6 +2896,7 @@ app.post("/deribit/order", async (req) => {
         };
       }
     }
+    quoteLock = lock;
   }
   if (body.intent === "close") {
     if (!body.drawdownLimitUsdc || !body.initialBalanceUsdc) {
@@ -2938,6 +2950,109 @@ app.post("/deribit/order", async (req) => {
     venue === "bybit" && typeof body.instrument === "string" && !body.instrument.endsWith("-USDT")
       ? `${body.instrument}-USDT`
       : body.instrument;
+  let quotedPremiumPerUnit: Decimal | null = null;
+  let quotedPremiumTotal: Decimal | null = null;
+  if (quoteLock?.premiumPerUnitUsdc) {
+    quotedPremiumPerUnit = quoteLock.premiumPerUnitUsdc;
+  }
+  if (quoteLock?.premiumTotalUsdc) {
+    quotedPremiumTotal = quoteLock.premiumTotalUsdc;
+  }
+  if (!quotedPremiumPerUnit && body.premiumUsdc && body.amount) {
+    const premiumRaw = new Decimal(body.premiumUsdc);
+    const amountRaw = new Decimal(body.amount);
+    if (premiumRaw.isFinite() && premiumRaw.gt(0) && amountRaw.gt(0)) {
+      quotedPremiumPerUnit = premiumRaw.div(amountRaw);
+      quotedPremiumTotal = premiumRaw;
+    }
+  }
+  let slippageEval: {
+    status: "ok" | "soft" | "hard" | "skip";
+    reason: string;
+    quotedPerUnit: string | null;
+    currentPerUnit: string | null;
+    slippageUsdc: string | null;
+    slippagePct: string | null;
+  } | null = null;
+  if (
+    (slippageTrackingEnabled || slippageGuardEnabled) &&
+    inferredHedgeType === "option" &&
+    quotedPremiumPerUnit
+  ) {
+    let spotPriceForMark: Decimal | null = null;
+    const spotRaw = Number(body.spotPrice ?? 0);
+    if (Number.isFinite(spotRaw) && spotRaw > 0) {
+      spotPriceForMark = new Decimal(spotRaw);
+    } else if (venue !== "bybit") {
+      spotPriceForMark = await fetchSpotPrice(parseInstrumentAsset(instrument) || "BTC");
+    }
+    const currentMark = await fetchCoverageOptionMarkUsdc(
+      venue,
+      instrument,
+      spotPriceForMark || new Decimal(0)
+    );
+    if (!currentMark || !currentMark.isFinite() || currentMark.lte(0)) {
+      slippageEval = {
+        status: "skip",
+        reason: "market_unavailable",
+        quotedPerUnit: quotedPremiumPerUnit.toFixed(6),
+        currentPerUnit: null,
+        slippageUsdc: null,
+        slippagePct: null
+      };
+    } else {
+      const slippageUsdc = currentMark.sub(quotedPremiumPerUnit);
+      const slippagePct = quotedPremiumPerUnit.gt(0)
+        ? slippageUsdc.div(quotedPremiumPerUnit)
+        : new Decimal(0);
+      const slippagePositive = slippageUsdc.gt(0);
+      const softBreached =
+        slippagePositive &&
+        ((slippageSoftPct.gt(0) && slippagePct.gt(slippageSoftPct)) ||
+          (slippageSoftUsdc.gt(0) && slippageUsdc.gt(slippageSoftUsdc)));
+      const hardBreached =
+        slippagePositive &&
+        ((slippageHardPct.gt(0) && slippagePct.gt(slippageHardPct)) ||
+          (slippageHardUsdc.gt(0) && slippageUsdc.gt(slippageHardUsdc)));
+      slippageEval = {
+        status: hardBreached ? "hard" : softBreached ? "soft" : "ok",
+        reason: hardBreached ? "hard_threshold" : softBreached ? "soft_threshold" : "ok",
+        quotedPerUnit: quotedPremiumPerUnit.toFixed(6),
+        currentPerUnit: currentMark.toFixed(6),
+        slippageUsdc: slippageUsdc.toFixed(6),
+        slippagePct: slippagePct.mul(100).toFixed(4)
+      };
+      if (slippageGuardEnabled && hardBreached && slippageRejectHard) {
+        if (slippageTrackingEnabled) {
+          await audit("slippage_guard", {
+            status: "rejected",
+            reason: slippageEval.reason,
+            quoteId: body.quoteId ?? null,
+            coverageId: body.coverageId || null,
+            instrument,
+            quotedPerUnit: slippageEval.quotedPerUnit,
+            currentPerUnit: slippageEval.currentPerUnit,
+            slippageUsdc: slippageEval.slippageUsdc,
+            slippagePct: slippageEval.slippagePct
+          });
+        }
+        return { status: "rejected", reason: "slippage_guard", slippage: slippageEval };
+      }
+    }
+    if (slippageTrackingEnabled && slippageEval) {
+      await audit("slippage_guard", {
+        status: slippageEval.status,
+        reason: slippageEval.reason,
+        quoteId: body.quoteId ?? null,
+        coverageId: body.coverageId || null,
+        instrument,
+        quotedPerUnit: slippageEval.quotedPerUnit,
+        currentPerUnit: slippageEval.currentPerUnit,
+        slippageUsdc: slippageEval.slippageUsdc,
+        slippagePct: slippageEval.slippagePct
+      });
+    }
+  }
   const response = await executionRegistry.placeOrder(venue, {
     instrument,
     amount: body.amount,
@@ -2963,6 +3078,31 @@ app.post("/deribit/order", async (req) => {
           ? Number(new Decimal(fillPrice).mul(new Decimal(spotPrice)).mul(filledAmount))
           : null
       : null;
+  const baseSubsidyUsdc = Number(body.subsidyUsdc ?? 0);
+  let slippageUsdc: number | null = null;
+  let slippagePct: number | null = null;
+  let slippageSubsidyUsdc = 0;
+  if (
+    executedPremiumUsdc !== null &&
+    quotedPremiumTotal &&
+    quotedPremiumTotal.gt(0)
+  ) {
+    const executed = new Decimal(executedPremiumUsdc);
+    const slippageDelta = executed.sub(quotedPremiumTotal);
+    slippageUsdc = slippageDelta.toNumber();
+    slippagePct = slippageDelta.div(quotedPremiumTotal).mul(100).toNumber();
+    const slippageCap = new Decimal(riskControls.slippage_subsidy_cap_usdc ?? 0);
+    if (
+      riskControls.slippage_adjust_subsidy_enabled === true &&
+      slippageDelta.gt(0)
+    ) {
+      const allowed = slippageCap.gt(0)
+        ? Decimal.min(slippageDelta, slippageCap)
+        : slippageDelta;
+      slippageSubsidyUsdc = allowed.toNumber();
+    }
+  }
+  const effectiveSubsidyUsdc = baseSubsidyUsdc + slippageSubsidyUsdc;
   const fillPriceUsdc =
     inferredHedgeType === "option"
       ? fillPrice
@@ -3037,7 +3177,10 @@ app.post("/deribit/order", async (req) => {
     fillPrice,
     premiumUsdc: executedPremiumUsdc ?? body.premiumUsdc ?? null,
     feeUsdc: body.feeUsdc ?? null,
-    subsidyUsdc: body.subsidyUsdc ?? null,
+    subsidyUsdc: effectiveSubsidyUsdc || null,
+    slippageUsdc,
+    slippagePct,
+    quotedPremiumUsdc: quotedPremiumTotal ? quotedPremiumTotal.toNumber() : null,
     reason: body.reason ?? null,
     accountId: body.accountId ?? null,
     floorPrice: body.floorPrice ?? null,
@@ -3066,15 +3209,15 @@ app.post("/deribit/order", async (req) => {
       tier: body.tierName,
       feeUsdc: feeForAccounting,
       premiumUsdc: premiumForAccounting,
-      subsidyUsdc: body.subsidyUsdc ?? 0,
+      subsidyUsdc: effectiveSubsidyUsdc,
       notionalUsdc: body.notionalUsdc ?? 0,
       hedgeNotionalUsdc,
       hedgeMarginUsdc,
       delta: accounting.liquidityDelta,
       totals: liquiditySummary()
     });
-    if (body.subsidyUsdc && body.subsidyUsdc > 0) {
-      recordSubsidy(body.tierName, body.accountId || null, Number(body.subsidyUsdc));
+    if (effectiveSubsidyUsdc > 0) {
+      recordSubsidy(body.tierName, body.accountId || null, effectiveSubsidyUsdc);
     }
   }
   return response;
@@ -3356,10 +3499,33 @@ app.post("/put/quote", async (req) => {
     responseAny.quoteIssuedAt = new Date(issuedAt).toISOString();
     responseAny.quoteExpiresAt = new Date(expiresAt).toISOString();
     const feeRaw = Number(responseAny.feeUsdc ?? 0);
+    const premiumTotalRaw = Number(
+      responseAny.premiumUsdc ?? responseAny.rollEstimatedPremiumUsdc ?? 0
+    );
+    const premiumPerUnitRaw = Number(responseAny.premiumPerUnitUsdc ?? 0);
+    const hedgeSizeRaw = Number(responseAny.hedgeSize ?? 0);
+    const premiumPerUnit =
+      Number.isFinite(premiumPerUnitRaw) && premiumPerUnitRaw > 0
+        ? new Decimal(premiumPerUnitRaw)
+        : Number.isFinite(premiumTotalRaw) &&
+            premiumTotalRaw > 0 &&
+            Number.isFinite(hedgeSizeRaw) &&
+            hedgeSizeRaw > 0
+          ? new Decimal(premiumTotalRaw).div(new Decimal(hedgeSizeRaw))
+          : undefined;
     const instruments = extractQuoteInstruments(responseAny);
     if (Number.isFinite(feeRaw) && feeRaw > 0) {
       quoteLocks.set(quoteId, {
         feeUsdc: new Decimal(feeRaw),
+        premiumTotalUsdc:
+          Number.isFinite(premiumTotalRaw) && premiumTotalRaw > 0
+            ? new Decimal(premiumTotalRaw)
+            : undefined,
+        premiumPerUnitUsdc: premiumPerUnit,
+        hedgeSize:
+          Number.isFinite(hedgeSizeRaw) && hedgeSizeRaw > 0
+            ? new Decimal(hedgeSizeRaw)
+            : undefined,
         issuedAt,
         expiresAt,
         tierName: String(body.tierName || "Unknown"),
