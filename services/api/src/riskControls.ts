@@ -10,6 +10,10 @@ export interface RiskControlsConfig {
   initial_liquidity_usdc?: number;
   reinvest_pct?: number;
   reserve_pct?: number;
+  hedge_action_cooldown_ms?: number;
+  min_hedge_notional_usdc?: number;
+  net_exposure_min_notional_usdc?: number;
+  net_exposure_cooldown_ms?: number;
   max_spread_pct?: number;
   max_slippage_pct?: number;
   max_spread_pct_by_days?: Record<string, number>;
@@ -50,6 +54,12 @@ export interface RiskControlsConfig {
       high?: number;
     }
   >;
+  dynamic_cap_enabled?: boolean;
+  dynamic_cap_max_uplift_pct?: number;
+  dynamic_cap_liquidity_ratio_low?: number;
+  dynamic_cap_liquidity_ratio_high?: number;
+  dynamic_cap_iv_uplift_pct_normal?: number;
+  dynamic_cap_iv_uplift_pct_high?: number;
   fee_leverage_multipliers_by_x?: Record<string, number>;
   pass_through_cap_by_leverage?: Record<string, number>;
   pass_through_cap_by_tier?: Record<string, Record<string, number>>;
@@ -57,6 +67,16 @@ export interface RiskControlsConfig {
   enable_premium_pass_through?: boolean;
   require_user_opt_in_for_pass_through?: boolean;
   pass_through_min_notification_ratio?: number;
+  phase3_rollout_enabled?: boolean;
+  phase3_safety_guard_enabled?: boolean;
+  intermittent_analytics_enabled?: boolean;
+  intermittent_selection_shadow_enabled?: boolean;
+  intermittent_selection_live_enabled?: boolean;
+  intermittent_selection_size_tolerance_pct?: number;
+  intermittent_profit_threshold_enabled?: boolean;
+  intermittent_profit_min_improvement_usdc?: number;
+  intermittent_profit_min_improvement_ratio?: number;
+  intermittent_profit_critical_buffer_pct?: number;
   premium_markup_pct_by_tier?: Record<string, number>;
   leverage_markup_pct_by_x?: Record<string, number>;
   drift_tolerance_pct_by_tier?: Record<string, number>;
@@ -105,9 +125,13 @@ const DEFAULTS: RiskControlsConfig = {
   hedge_reduction_factor: 0.7,
   max_leverage: 10,
   net_exposure_cap_usdc: {},
-  initial_liquidity_usdc: 20000,
+  initial_liquidity_usdc: 35000,
   reinvest_pct: 0.5,
   reserve_pct: 0.3,
+  hedge_action_cooldown_ms: 60000,
+  min_hedge_notional_usdc: 250,
+  net_exposure_min_notional_usdc: 500,
+  net_exposure_cooldown_ms: 120000,
   max_spread_pct: 0.05,
   max_slippage_pct: 0.01,
   max_spread_pct_by_days: {},
@@ -141,12 +165,28 @@ const DEFAULTS: RiskControlsConfig = {
     high: 0.8
   },
   fee_iv_regime_multipliers_by_tier: {},
+  dynamic_cap_enabled: true,
+  dynamic_cap_max_uplift_pct: 0.25,
+  dynamic_cap_liquidity_ratio_low: 1.0,
+  dynamic_cap_liquidity_ratio_high: 1.5,
+  dynamic_cap_iv_uplift_pct_normal: 0.1,
+  dynamic_cap_iv_uplift_pct_high: 0.25,
   fee_leverage_multipliers_by_x: {},
   pass_through_cap_by_leverage: {},
   pass_through_cap_by_tier: {},
   enable_premium_pass_through: true,
   require_user_opt_in_for_pass_through: false,
   pass_through_min_notification_ratio: 1.5,
+  phase3_rollout_enabled: false,
+  phase3_safety_guard_enabled: true,
+  intermittent_analytics_enabled: false,
+  intermittent_selection_shadow_enabled: false,
+  intermittent_selection_live_enabled: false,
+  intermittent_selection_size_tolerance_pct: 0.2,
+  intermittent_profit_threshold_enabled: false,
+  intermittent_profit_min_improvement_usdc: 0,
+  intermittent_profit_min_improvement_ratio: 0,
+  intermittent_profit_critical_buffer_pct: 0.02,
   premium_markup_pct_by_tier: {},
   leverage_markup_pct_by_x: {},
   drift_tolerance_pct_by_tier: {},
