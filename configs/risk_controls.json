@@ -131,7 +131,7 @@
   "require_user_opt_in_for_pass_through": false,
   "pass_through_min_notification_ratio": 1.5,
   "pass_through_allow_uncapped_bronze": true,
-  "pass_through_uncapped_max_ratio": 8.0,
+  "pass_through_uncapped_max_ratio": 1000,
   "phase3_rollout_enabled": true,
   "phase3_safety_guard_enabled": true,
   "intermittent_analytics_enabled": true,
