@@ -64,6 +64,7 @@ export function AuditDashboard({
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
   const [showNetExposure, setShowNetExposure] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [showGlossary, setShowGlossary] = useState(false);
 
   const load = useCallback(async () => {
@@ -118,13 +119,43 @@ export function AuditDashboard({
     liquidity: liquidity?.liquidityBalanceUsdc ?? 0,
     revenue: liquidity?.revenueUsdc ?? 0,
     hedgeSpend: liquidity?.hedgeSpendUsdc ?? 0,
-    unrealizedPnl: profitability?.unrealizedHedgePnlUsdc ?? 0
+    unrealizedPnl: profitability?.unrealizedHedgePnlUsdc ?? 0,
+    netProfit: profitability?.netProfitUsdc ?? 0
   };
+  const projectedClass =
+    stats.unrealizedPnl >= 0 ? "audit-metric-value-positive" : "audit-metric-value-warn";
+  const netProfitClass =
+    stats.netProfit >= 0 ? "audit-metric-value-positive" : "audit-metric-value-negative";
+  const baseColumnWidths = [
+    "80px",
+    "120px",
+    "1.4fr",
+    "1.4fr",
+    "80px",
+    "80px",
+    "70px",
+    "90px",
+    "90px",
+    "90px",
+    "90px",
+    "100px",
+    "110px",
+    "110px",
+    "110px",
+    "100px",
+    "90px",
+    "100px"
+  ];
+  const advancedColumnWidths = ["90px", "110px", "120px", "100px"];
+  const columnTemplate = showAdvanced
+    ? baseColumnWidths.concat(advancedColumnWidths).join(" ")
+    : baseColumnWidths.join(" ");
+  const minTableWidth = showAdvanced ? "2300px" : "1900px";
   // ═══════════════════════════════════════════════════════════
   // CEO AUDIT EVENTS FILTER
   // Must match CEO_AUDIT_EVENTS in services/api/src/server.ts
-  // Last synced: 2026-01-31
-  // Count: 13 events
+  // Last synced: 2026-02-03
+  // Count: 16 events
   // ═══════════════════════════════════════════════════════════
   const allowedEvents = new Set([
     "coverage_activated",
@@ -134,6 +165,9 @@ export function AuditDashboard({
     "liquidity_update",
     "hedge_order",
     "hedge_action",
+    "mtm_position",
+    "mtm_credit",
+    "demo_credit",
     "put_quote_failed",
     "put_renew_failed",
     "option_exec_failed",
@@ -181,6 +215,9 @@ export function AuditDashboard({
     return value.toFixed(2);
   };
 
+  const formatCsvMoney = (value: number) =>
+    value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
   const formatSmall = (value: number) => {
     if (!Number.isFinite(value)) return "—";
     if (Math.abs(value) < 1) return value.toFixed(4);
@@ -216,7 +253,8 @@ export function AuditDashboard({
   const coverageEntries = scopedEntries.filter((entry) => entry.event === "coverage_activated");
   const sumPremium = (list: AuditEntry[]) =>
     list.reduce((sum, entry) => {
-      const premium = extractField(entry, "premiumUsdc");
+      const premium =
+        extractField(entry, "executedPremiumUsdc") ?? extractField(entry, "premiumUsdc");
       return sum + (premium !== null && premium !== undefined ? Number(premium) : 0);
     }, 0);
   const perUserHedgeCost = sumPremium(hedgeOrders.filter((entry) => !isNetExposure(entry)));
@@ -276,20 +314,26 @@ export function AuditDashboard({
               <span className="audit-metric-sub">capital available</span>
             </div>
 
-            <div className="audit-metrics-divider" />
+            <div className="audit-metric">
+              <span className="audit-metric-label">Projected (MTM)</span>
+              <span className={`audit-metric-value ${projectedClass}`}>
+                ${formatCsvMoney(Number(stats.unrealizedPnl || 0))}
+              </span>
+              <span className="audit-metric-sub">unrealized hedge pnl</span>
+            </div>
 
             <div className="audit-metric">
-              <span className="audit-metric-label">Revenue Collected</span>
+              <span className="audit-metric-label">Premium Collected</span>
               <span className="audit-metric-value audit-metric-value-positive">
-                ${(stats.revenue || 0).toFixed(2)}
+                ${formatCsvMoney(Number(stats.revenue || 0))}
               </span>
-              <span className="audit-metric-sub">fees charged</span>
+              <span className="audit-metric-sub">premiums charged</span>
             </div>
 
             <div className="audit-metric">
               <span className="audit-metric-label">Hedging Spend</span>
               <span className="audit-metric-value audit-metric-value-warn">
-                ${(stats.hedgeSpend || 0).toFixed(2)}
+                ${formatCsvMoney(Number(stats.hedgeSpend || 0))}
               </span>
               <span className="audit-metric-sub">premiums paid</span>
             </div>
@@ -303,11 +347,19 @@ export function AuditDashboard({
                     : "audit-metric-value-warn"
                 }`}
               >
-                ${(stats.revenue - stats.hedgeSpend).toFixed(2)}
+                ${formatCsvMoney(Number(stats.revenue - stats.hedgeSpend))}
               </span>
               <span className="audit-metric-sub">
                 {(stats.revenue - stats.hedgeSpend) >= 0 ? "operating profit" : "coverage cost"}
               </span>
+            </div>
+
+            <div className="audit-metric">
+              <span className="audit-metric-label">Net Profit</span>
+              <span className={`audit-metric-value ${netProfitClass}`}>
+                ${formatCsvMoney(Number(stats.netProfit || 0))}
+              </span>
+              <span className="audit-metric-sub">after hedging & subsidy</span>
             </div>
           </div>
         </div>
@@ -351,11 +403,25 @@ export function AuditDashboard({
             >
               {showNetExposure ? "Net Exposure: On" : "Net Exposure: Off"}
             </button>
+            <button
+              className={showAdvanced ? "btn active" : "btn"}
+              onClick={() => setShowAdvanced((prev) => !prev)}
+            >
+              {showAdvanced ? "Advanced: On" : "Advanced: Off"}
+            </button>
             <span className="muted">Showing latest {MAX_AUDIT_ROWS}</span>
           </div>
         </div>
         <div className="audit-table-wrap">
-          <div className="audit-table">
+          <div
+            className="audit-table"
+            style={
+              {
+                "--audit-cols": columnTemplate,
+                "--audit-min-width": minTableWidth
+              } as Record<string, string>
+            }
+          >
             <div className="audit-row audit-head">
               <span>Time</span>
               <span>Event</span>
@@ -365,13 +431,24 @@ export function AuditDashboard({
               <span>Strike</span>
               <span>Side</span>
               <span>Status</span>
-              <span>Premium</span>
+              <span>Prem In</span>
+              <span>Prem Out</span>
               <span>Hedge Size</span>
-              <span>Hedge Type</span>
-              <span>Notional</span>
               <span>Hedge Spend</span>
-              <span>Projected Payout</span>
-              <span>Liquidity Δ</span>
+              <span>MTM Equity</span>
+              <span>Position PnL</span>
+              <span>Hedge MTM</span>
+              <span>Buffer</span>
+              <span>Credit</span>
+              <span>Coverage %</span>
+              {showAdvanced && (
+                <>
+                  <span>Hedge Type</span>
+                  <span>Notional</span>
+                  <span>Proj Payout</span>
+                  <span>Liquidity Δ</span>
+                </>
+              )}
             </div>
             {limitedEntries.length === 0 && (
               <div className="empty">No audit entries yet.</div>
@@ -383,15 +460,29 @@ export function AuditDashboard({
             const expiryTag = String(extractField(entry, "expiryTag") || parsedInstrument?.expiryTag || "—");
             const strikeValue = extractField(entry, "strike") ?? parsedInstrument?.strike ?? null;
             const side = String(extractField(entry, "side") || "—");
-            const status = String(extractField(entry, "status") || "—");
-            const premium = extractField(entry, "premiumUsdc");
+            const statusRaw = String(extractField(entry, "status") || "—");
+            const status =
+              statusRaw === "—" && entry.event === "hedge_order" ? "filled" : statusRaw;
+            const premium =
+              extractField(entry, "executedPremiumUsdc") ?? extractField(entry, "premiumUsdc");
+            const feeIn =
+              extractField(entry, "totalFeeUsd") ??
+              extractField(entry, "feeUsd") ??
+              extractField(entry, "feeUsdc");
             const hedgeSize = extractField(entry, "hedgeSize") ?? extractField(entry, "amount");
             const hedgeType = extractField(entry, "hedgeType") || extractField(entry, "optionType");
             const notional = extractField(entry, "notionalUsdc");
             const hedgeSpend =
               extractField(entry, "hedgeMarginUsdc") ??
+              extractField(entry, "executedPremiumUsdc") ??
               extractField(entry, "premiumUsdc") ??
               extractField(entry, "hedgeNotionalUsdc");
+            const mtmEquity = extractField(entry, "equityUsdc");
+            const positionPnl = extractField(entry, "positionPnlUsdc");
+            const hedgeMtm = extractField(entry, "hedgeMtmUsdc");
+            const bufferUsdc = extractField(entry, "drawdownBufferUsdc");
+            const creditUsdc = extractField(entry, "creditUsdc");
+            const coverageRatio = extractField(entry, "coverageRatio");
             const floorPrice = extractField(entry, "floorPrice");
             const optionType =
               String(extractField(entry, "optionType") || parsedInstrument?.optionType || "")
@@ -415,18 +506,41 @@ export function AuditDashboard({
               delta && typeof delta === "object"
                 ? delta.liquidityBalanceUsdc ?? delta.revenueUsdc
                 : null;
+            const instrumentLabel = (() => {
+              if (!parsedInstrument || instrument === "—") return instrument;
+              if (parsedInstrument.optionType === "perp") {
+                return `${parsedInstrument.asset} PERP`;
+              }
+              const strikeLabel =
+                strikeNum !== null && Number.isFinite(strikeNum)
+                  ? strikeNum.toLocaleString(undefined, { maximumFractionDigits: 0 })
+                  : "—";
+              const optionCode =
+                parsedInstrument.optionType === "put"
+                  ? "P"
+                  : parsedInstrument.optionType === "call"
+                    ? "C"
+                    : "";
+              const expiryLabel = expiryTag || parsedInstrument.expiryTag || "—";
+              return `${parsedInstrument.asset} ${expiryLabel} ${strikeLabel} ${optionCode}`.trim();
+            })();
             return (
               <div className="audit-row" key={`${entry.ts}-${entry.event}`}>
                 <span>{new Date(entry.ts).toLocaleTimeString()}</span>
                 <span>{entry.event}</span>
-                <span>{coverageId || "—"}</span>
-                <span>{instrument}</span>
+                <span title={coverageId || "—"}>{coverageId || "—"}</span>
+                <span title={instrument}>{instrumentLabel}</span>
                 <span>{expiryTag || "—"}</span>
                 <span>
-                  {strikeNum !== null && Number.isFinite(strikeNum) ? strikeNum.toFixed(0) : "—"}
+                  {strikeNum !== null && Number.isFinite(strikeNum)
+                    ? strikeNum.toLocaleString(undefined, { maximumFractionDigits: 0 })
+                    : "—"}
                 </span>
                 <span>{side || "—"}</span>
                 <span>{status || "—"}</span>
+                <span title={feeIn !== null && feeIn !== undefined ? `$${feeIn}` : "—"}>
+                  {feeIn !== null && feeIn !== undefined ? `$${formatSmall(Number(feeIn))}` : "—"}
+                </span>
                 <span title={premium !== null && premium !== undefined ? `$${premium}` : "—"}>
                   {premium !== null && premium !== undefined ? `$${formatSmall(Number(premium))}` : "—"}
                 </span>
@@ -435,25 +549,59 @@ export function AuditDashboard({
                     ? formatSmall(Number(hedgeSize))
                     : "—"}
                 </span>
-                <span>{hedgeType || "—"}</span>
-                <span title={notional !== null && notional !== undefined ? `$${notional}` : "—"}>
-                  {notional !== null && notional !== undefined
-                    ? `$${formatAbbrev(Number(notional))}`
-                    : "—"}
-                </span>
                 <span title={hedgeSpend !== null && hedgeSpend !== undefined ? `$${hedgeSpend}` : "—"}>
                   {hedgeSpend !== null && hedgeSpend !== undefined
                     ? `$${formatAbbrev(Number(hedgeSpend))}`
                     : "—"}
                 </span>
-                <span title={projectedPayout !== null ? `$${projectedPayout}` : "—"}>
-                  {projectedPayout !== null ? `$${formatSmall(projectedPayout)}` : "—"}
-                </span>
-                <span title={deltaValue !== null && deltaValue !== undefined ? String(deltaValue) : "—"}>
-                  {deltaValue !== null && deltaValue !== undefined
-                    ? formatAbbrev(Number(deltaValue))
+                <span title={mtmEquity !== null && mtmEquity !== undefined ? `$${mtmEquity}` : "—"}>
+                  {mtmEquity !== null && mtmEquity !== undefined
+                    ? `$${formatSmall(Number(mtmEquity))}`
                     : "—"}
                 </span>
+                <span title={positionPnl !== null && positionPnl !== undefined ? `$${positionPnl}` : "—"}>
+                  {positionPnl !== null && positionPnl !== undefined
+                    ? `$${formatSmall(Number(positionPnl))}`
+                    : "—"}
+                </span>
+                <span title={hedgeMtm !== null && hedgeMtm !== undefined ? `$${hedgeMtm}` : "—"}>
+                  {hedgeMtm !== null && hedgeMtm !== undefined
+                    ? `$${formatSmall(Number(hedgeMtm))}`
+                    : "—"}
+                </span>
+                <span title={bufferUsdc !== null && bufferUsdc !== undefined ? `$${bufferUsdc}` : "—"}>
+                  {bufferUsdc !== null && bufferUsdc !== undefined
+                    ? `$${formatSmall(Number(bufferUsdc))}`
+                    : "—"}
+                </span>
+                <span title={creditUsdc !== null && creditUsdc !== undefined ? `$${creditUsdc}` : "—"}>
+                  {creditUsdc !== null && creditUsdc !== undefined
+                    ? `$${formatSmall(Number(creditUsdc))}`
+                    : "—"}
+                </span>
+                <span title={coverageRatio !== null && coverageRatio !== undefined ? String(coverageRatio) : "—"}>
+                  {coverageRatio !== null && coverageRatio !== undefined
+                    ? `${(Number(coverageRatio) * 100).toFixed(2)}%`
+                    : "—"}
+                </span>
+                {showAdvanced && (
+                  <>
+                    <span>{hedgeType || "—"}</span>
+                    <span title={notional !== null && notional !== undefined ? `$${notional}` : "—"}>
+                      {notional !== null && notional !== undefined
+                        ? `$${formatAbbrev(Number(notional))}`
+                        : "—"}
+                    </span>
+                    <span title={projectedPayout !== null ? `$${projectedPayout}` : "—"}>
+                      {projectedPayout !== null ? `$${formatSmall(projectedPayout)}` : "—"}
+                    </span>
+                    <span title={deltaValue !== null && deltaValue !== undefined ? `$${deltaValue}` : "—"}>
+                      {deltaValue !== null && deltaValue !== undefined
+                        ? `$${formatAbbrev(Number(deltaValue))}`
+                        : "—"}
+                    </span>
+                  </>
+                )}
               </div>
             );
           })}
@@ -582,7 +730,7 @@ export function AuditDashboard({
                   <div className="glossary-term">
                     <dt>Premium</dt>
                     <dd>
-                      Fee paid by user to purchase protection. Calculated based on amount, duration,
+                      Premium paid by user to purchase protection. Calculated based on amount, duration,
                       volatility, and market conditions.
                     </dd>
                   </div>
@@ -699,12 +847,20 @@ export function AuditDashboard({
                   <div className="glossary-term">
                     <dt>liquidity_update</dt>
                     <dd>
-                      Liquidity accounting update after fees/hedges. Includes deltas and totals.
+                      Liquidity accounting update after premiums/hedges. Includes deltas and totals.
                     </dd>
                   </div>
                   <div className="glossary-term">
                     <dt>mtm_credit</dt>
                     <dd>Equity update that includes hedge MTM contribution.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>mtm_position</dt>
+                    <dd>Per-position MTM snapshot with buffer and coverage ratio.</dd>
+                  </div>
+                  <div className="glossary-term">
+                    <dt>demo_credit</dt>
+                    <dd>Simulated margin credit issued when buffer breaches floor.</dd>
                   </div>
                   <div className="glossary-term">
                     <dt>put_quote_failed</dt>
