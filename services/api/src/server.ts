@@ -7129,6 +7129,20 @@ app.post("/loop/tick", async (req) => {
         liquidity.revenueUsdc * riskControls.risk_budget_pct_max - liquidity.hedgeSpendUsdc
       );
       const hedgeBudgetRemaining = Math.max(liquidityBudget, revenueBudget);
+      const budgetGuardEnabled = riskControls.net_exposure_budget_guard_enabled === true;
+      const minBudget = riskControls.net_exposure_min_budget_usdc ?? 0;
+      if (budgetGuardEnabled && (hedgeBudgetRemaining <= 0 || hedgeBudgetRemaining < minBudget)) {
+        await audit("hedge_action_skipped", {
+          action: "net_exposure",
+          reason: "budget_guard",
+          tierName,
+          hedgeBudgetRemaining,
+          liquidityBudget,
+          revenueBudget,
+          minBudget
+        });
+        continue;
+      }
 
       const maxPreferredDays = riskControls.max_target_days ?? 7;
       const maxFallbackDays = riskControls.fallback_target_days ?? 14;
@@ -7156,6 +7170,9 @@ app.post("/loop/tick", async (req) => {
         .mul(new Decimal(0.0015))
         .toNumber();
       const effectiveBudget = hedgeBudgetRemaining + recoverableMarginUsdc;
+      const netCoverageId = riskControls.net_exposure_force_coverage_id === true
+        ? `net-${plan.asset}`
+        : body.coverageId || `net-${plan.asset}`;
 
       let optionChosen: {
         instrument: string;
@@ -7355,7 +7372,8 @@ app.post("/loop/tick", async (req) => {
             hedgeType: "option",
             hedgeFactor: hedgeFactor.toNumber(),
             fundingRate,
-            coverageIds
+            coverageIds,
+            coverageId: netCoverageId
           });
           const res = await app.inject({
             method: "POST",
@@ -7365,7 +7383,7 @@ app.post("/loop/tick", async (req) => {
               amount: candidate.sizeUnits.toNumber(),
               side: "buy",
               type: "market",
-              coverageId: body.coverageId || `net-${plan.asset}`,
+              coverageId: netCoverageId,
               notionalUsdc: plan.targetNotional.abs().toNumber(),
               hedgeType: "option",
               optionType,
@@ -7411,7 +7429,8 @@ app.post("/loop/tick", async (req) => {
           hedgeType: "option",
           hedgeFactor: hedgeFactor.toNumber(),
           fundingRate,
-          coverageIds
+          coverageIds,
+          coverageId: netCoverageId
         });
         await app.inject({
           method: "POST",
@@ -7421,7 +7440,7 @@ app.post("/loop/tick", async (req) => {
             amount: optionChosen.sizeUnits.toNumber(),
             side: "buy",
             type: "market",
-            coverageId: body.coverageId || `net-${plan.asset}`,
+            coverageId: netCoverageId,
             notionalUsdc: plan.targetNotional.abs().toNumber(),
             hedgeType: "option",
             optionType,
@@ -7457,7 +7476,8 @@ app.post("/loop/tick", async (req) => {
         hedgeType: "perp",
         hedgeFactor: hedgeFactor.toNumber(),
         fundingRate,
-        coverageIds
+        coverageIds,
+        coverageId: netCoverageId
       });
       if (riskControls.net_exposure_perp_accounting_enabled === true) {
         const res = await app.inject({
@@ -7468,7 +7488,7 @@ app.post("/loop/tick", async (req) => {
             amount: routedPlan.size.toNumber(),
             side: perpSide,
             type: "market",
-            coverageId: body.coverageId || `net-${plan.asset}`,
+            coverageId: netCoverageId,
             notionalUsdc: plan.targetNotional.abs().toNumber(),
             hedgeType: "perp",
             feeUsdc: 0,
@@ -7497,6 +7517,7 @@ app.post("/loop/tick", async (req) => {
           hedgeFactor: hedgeFactor.toNumber(),
           fundingRate,
           coverageIds,
+          coverageId: netCoverageId,
           venue: routedPlan.venue
         });
         netExecuted = true;

@@ -23,6 +23,9 @@ export interface RiskControlsConfig {
   net_exposure_min_notional_usdc?: number;
   net_exposure_cooldown_ms?: number;
   net_exposure_perp_accounting_enabled?: boolean;
+  net_exposure_budget_guard_enabled?: boolean;
+  net_exposure_min_budget_usdc?: number;
+  net_exposure_force_coverage_id?: boolean;
   max_spread_pct?: number;
   max_slippage_pct?: number;
   max_spread_pct_by_days?: Record<string, number>;
@@ -140,6 +143,9 @@ const DEFAULTS: RiskControlsConfig = {
   net_exposure_min_notional_usdc: 500,
   net_exposure_cooldown_ms: 120000,
   net_exposure_perp_accounting_enabled: false,
+  net_exposure_budget_guard_enabled: false,
+  net_exposure_min_budget_usdc: 0,
+  net_exposure_force_coverage_id: false,
   max_spread_pct: 0.05,
   max_slippage_pct: 0.01,
   max_spread_pct_by_days: {},
