@@ -93,15 +93,15 @@ These are intentionally outside Atticus scope and handled by Foxify or existing 
 ## 3. System Architecture
 
 ### 3.1 High-Level Architecture
-```mermaid
-flowchart LR
-  UI[Foxify UI Widget<br/>apps/web] <--> API[Atticus API<br/>services/api]
-  API <--> Hedge[Hedging Engine<br/>services/hedging]
-  API --> Logs[Audit + State Logs<br/>logs/*.json]
-  API <--> Deribit[Deribit REST/WS]
-  API <--> Bybit[Bybit REST (pricing)]
-  API --> Alerts[Webhook Alerts]
-  Hedge --> Deribit
+```text
+[Foxify UI Widget] <--> [Atticus API] <--> [Hedging Engine]
+        |                     |                |
+        |                     +--> [Audit + State Logs]
+        |                     +--> [Deribit REST/WS]
+        |                     +--> [Bybit REST (pricing)]
+        |                     +--> [Webhook Alerts]
+        |                                     |
+        +-------------------------------------+--> [Deribit REST/WS]
 ```
 
 ### 3.2 Component Breakdown
@@ -137,6 +137,7 @@ flowchart LR
 Runtime state is held in memory for low latency. Persistent artifacts are written to disk for auditability and portability:
 - `logs/audit.log` (JSONL)
 - `logs/coverages.json`
+- `logs/coverage-ledger.json`
 - `logs/hedge-ledger.json`
 
 This structure is intentionally modular to enable a future migration to a dedicated database without redesigning the API contract.
@@ -578,7 +579,7 @@ MVP deployments should use Foxify's gateway or API management layer for:
 - Rate limiting
 
 ### 9.3 Key Management
-Deribit credentials are loaded from environment variables. For production, keys should be stored in a secrets manager with rotation and least-privilege access.
+Venue credentials are provisioned via the Foxify secrets manager and injected at runtime. Credential material is intentionally omitted from this document. For production, keys should be rotated and scoped with least-privilege access.
 
 ### 9.4 Data Security and Privacy
 - No PII is required by the Atticus API in MVP scope.
@@ -631,8 +632,6 @@ HOST=0.0.0.0
 DERIBIT_ENV=testnet
 DERIBIT_PAPER=true
 ALLOW_DERIBIT_PRIVATE_MTM=false
-DERIBIT_CLIENT_ID=provided_via_secrets_manager
-DERIBIT_CLIENT_SECRET=provided_via_secrets_manager
 QUOTE_CACHE_TTL_MS=4000
 QUOTE_CACHE_STALE_MS=20000
 QUOTE_CACHE_HARD_MS=120000
@@ -642,7 +641,7 @@ RISK_CONTROLS_PATH=./configs/risk_controls.json
 Additional runtime env used in code:
 - `LOOP_INTERVAL_MS`, `MTM_INTERVAL_MS`, `APP_MODE`, `FOXIFY_APPROVED`, `ACCOUNTS_CONFIG_PATH`
 
-Venue credentials are provisioned by the Foxify deployment environment (secrets manager or equivalent). Bybit pricing uses public endpoints unless authenticated execution is explicitly enabled.
+Sensitive credential variables are provisioned by the Foxify deployment environment (secrets manager or equivalent) and are intentionally omitted here. Bybit pricing uses public endpoints unless authenticated execution is explicitly enabled.
 
 ### 11.3 Scaling Strategy
 The API is designed to be stateless at the request boundary. Scaling to multiple instances requires an external database for coverages, audit logs, and hedge ledger persistence.
@@ -722,7 +721,7 @@ Paper mode allows safe validation of quote and execution flows without live trad
 ---
 
 ## 15. Disclosure and IP Protection
-This document provides technical depth sufficient for architecture validation, integration planning, and operational assurance. Proprietary parameter values, scoring weights, and strategy heuristics are intentionally summarized rather than disclosed in full. Detailed internal logic and calibration data can be provided under NDA in the Technical Appendix.
+This document provides technical depth sufficient for architecture validation, integration planning, and operational assurance. Proprietary parameter values, scoring weights, and strategy heuristics are intentionally summarized rather than disclosed in full. Sensitive credential material is intentionally omitted. Detailed internal logic, calibration data, and secure configuration details can be provided under NDA in the Technical Appendix.
 
 ---
 
