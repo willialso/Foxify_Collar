@@ -631,6 +631,7 @@ const hedgeLedger = new Map<string, { size: Decimal; avgCostUsdc: Decimal }>();
 let realizedHedgePnlUsdc = new Decimal(0);
 let lastMtmSnapshot: { equityUsdc: Decimal; positionPnlUsdc: Decimal; hedgeMtmUsdc: Decimal } | null =
   null;
+let lastMtmSnapshotAt = 0;
 
 function parseInstrumentAsset(instrument: string): string | null {
   const parts = instrument.split("-");
@@ -1975,6 +1976,7 @@ app.get("/risk/summary", async (req) => {
     positionPnlUsdc: positionPnl,
     hedgeMtmUsdc: hedgeMtm
   };
+  lastMtmSnapshotAt = Date.now();
   const mtmHasValue = !positionPnl.isZero() || !hedgeMtm.isZero();
   if (mtmHasValue) {
     await audit("mtm_credit", {
@@ -5304,7 +5306,8 @@ app.post("/put/quote", async (req) => {
   if (iv && iv > riskControls.volatility_throttle_iv) {
     hedgeFactor = Math.min(hedgeFactor, riskControls.hedge_reduction_factor);
   }
-  hedgeFactor = Math.max(1, hedgeFactor);
+  const allowHedgeReduction = riskControls.enable_hedge_reduction === true;
+  hedgeFactor = allowHedgeReduction ? Math.min(1, hedgeFactor) : Math.max(1, hedgeFactor);
 
   const optionSymbol = optionType === "put" ? "P" : "C";
   const optionInstrument = buildVenueInstrumentName(
@@ -6289,7 +6292,36 @@ app.post("/loop/tick", async (req) => {
   const inferredOptionType = body.optionType || (inferredPositionSide === "short" ? "call" : "put");
   const inferredHedgeType = body.hedgeType || "option";
 
-  const bufferPct = new Decimal(riskPayload.drawdownBufferPct).div(100);
+  const baseBufferPct = new Decimal(riskPayload.drawdownBufferPct).div(100);
+  let bufferPct = baseBufferPct;
+  let bufferSource: "risk_summary" | "coverage_ledger" | "mtm_snapshot" | "mtm_stale" | "mtm_invalid" =
+    "risk_summary";
+  const useMtmBuffer = riskControls.loop_use_mtm_buffer === true;
+  if (useMtmBuffer && body.coverageId) {
+    const ledgerEntry = coverageLedger.get(body.coverageId);
+    const ledgerBuffer = ledgerEntry?.lastMtm?.bufferUsdc;
+    const initialBalance = new Decimal(body.initialBalanceUsdc || "0");
+    if (ledgerBuffer !== undefined && ledgerBuffer !== null && initialBalance.gt(0)) {
+      bufferPct = new Decimal(ledgerBuffer).div(initialBalance);
+      bufferSource = "coverage_ledger";
+    }
+  }
+  if (useMtmBuffer && bufferSource === "risk_summary" && lastMtmSnapshot) {
+    const maxAgeMs = riskControls.loop_mtm_max_age_ms ?? 0;
+    const ageMs = Date.now() - lastMtmSnapshotAt;
+    if (maxAgeMs <= 0 || ageMs <= maxAgeMs) {
+      const drawdownLimit = new Decimal(body.drawdownLimitUsdc || "0");
+      const initialBalance = new Decimal(body.initialBalanceUsdc || "0");
+      if (initialBalance.gt(0)) {
+        bufferPct = lastMtmSnapshot.equityUsdc.minus(drawdownLimit).div(initialBalance);
+        bufferSource = "mtm_snapshot";
+      } else {
+        bufferSource = "mtm_invalid";
+      }
+    } else {
+      bufferSource = "mtm_stale";
+    }
+  }
   let decision = evaluateRollingHedge({
     bufferPct,
     hedgeState: {
@@ -6321,11 +6353,19 @@ app.post("/loop/tick", async (req) => {
 
   const hedgeCooldownMs = riskControls.hedge_action_cooldown_ms ?? 60000;
   const minHedgeNotional = riskControls.min_hedge_notional_usdc ?? 0;
+  const loopAccountingEnabled = riskControls.loop_accounting_enabled === true;
   const coverageKey = body.coverageId || body.accountId || "unknown";
   const lastHedgeAt = hedgeActionCooldownByCoverage.get(coverageKey) ?? 0;
   const withinCooldown =
     hedgeCooldownMs > 0 && Date.now() - lastHedgeAt < hedgeCooldownMs;
-  const notionalUsdc = Number(body.notionalUsdc ?? 0);
+  const ledgerNotional =
+    body.coverageId && coverageLedger.has(body.coverageId)
+      ? coverageLedger.get(body.coverageId)?.notionalUsdc ?? null
+      : null;
+  const notionalUsdc = Number(body.notionalUsdc ?? ledgerNotional ?? 0);
+  const requireNotional = riskControls.loop_require_notional_usdc === true;
+  const missingNotional =
+    requireNotional && (!Number.isFinite(notionalUsdc) || notionalUsdc <= 0);
   const belowNotional =
     Number.isFinite(notionalUsdc) &&
     minHedgeNotional > 0 &&
@@ -6345,7 +6385,9 @@ app.post("/loop/tick", async (req) => {
     phase3RolloutEnabled && !phase3SafetyGuardEnabled && requestedSelectionLive;
   const profitThresholdsEnabled = phase3RolloutEnabled && requestedProfitThresholds;
   const profitThresholdsEnforced =
-    phase3RolloutEnabled && !phase3SafetyGuardEnabled && requestedProfitThresholds;
+    phase3RolloutEnabled &&
+    requestedProfitThresholds &&
+    (!phase3SafetyGuardEnabled || riskControls.intermittent_profit_enforce_override === true);
   const intermittentConfig = {
     rolloutEnabled: phase3RolloutEnabled,
     safetyGuardEnabled: phase3SafetyGuardEnabled,
@@ -6388,10 +6430,10 @@ app.post("/loop/tick", async (req) => {
         coverageId: body.coverageId || null,
         notionalUsdc: notionalUsdc || null
       });
-    } else if (withinCooldown || belowNotional) {
+    } else if (withinCooldown || belowNotional || missingNotional) {
       await audit("hedge_action_skipped", {
         action: "increase",
-        reason: withinCooldown ? "cooldown" : "min_notional",
+        reason: withinCooldown ? "cooldown" : missingNotional ? "missing_notional" : "min_notional",
         coverageId: body.coverageId || null,
         notionalUsdc: notionalUsdc || null,
         cooldownMs: hedgeCooldownMs
@@ -6596,6 +6638,7 @@ app.post("/loop/tick", async (req) => {
         await audit("intermittent_hedge_eval", {
           coverageId: body.coverageId || null,
           bufferPct: bufferPct.toFixed(4),
+          bufferSource,
           bufferTargetPct: body.bufferTargetPct,
           hysteresisPct: body.hysteresisPct,
           decision: decision.hedgeAction,
@@ -6672,6 +6715,8 @@ app.post("/loop/tick", async (req) => {
       });
       let executedSize = Number(executionSize ?? 0);
       const orderStatus = String((orderResult as any)?.status || "");
+      let fillPriceUsdc: Decimal | null = null;
+      let executedPremiumUsdc: number | null = null;
       if (orderResult && typeof orderResult === "object") {
         const filled =
           (orderResult as any).filledAmount ??
@@ -6695,7 +6740,7 @@ app.post("/loop/tick", async (req) => {
           const spot = await fetchSpotPrice(inferredAsset);
           spotPriceNumber = spot ? spot.toNumber() : 0;
         }
-        const fillPriceUsdc =
+        fillPriceUsdc =
           inferredHedgeType === "option"
             ? isBybitExec
               ? new Decimal(fillPrice)
@@ -6704,6 +6749,7 @@ app.post("/loop/tick", async (req) => {
                 : null
             : new Decimal(fillPrice);
         if (fillPriceUsdc) {
+          executedPremiumUsdc = fillPriceUsdc.mul(new Decimal(executedSize)).toNumber();
           const sizeDelta = new Decimal(executedSize).mul(
             decision.recommendedSide === "buy" ? 1 : -1
           );
@@ -6757,9 +6803,210 @@ app.post("/loop/tick", async (req) => {
         coverageId: body.coverageId || null,
         notionalUsdc: body.notionalUsdc ?? null,
         hedgeType: inferredHedgeType,
-        positionSide: inferredPositionSide
+        positionSide: inferredPositionSide,
+        premiumUsdc: executedPremiumUsdc ?? null,
+        fillPrice: fillPrice ?? null,
+        venue: hedgeVenue
       });
+      if (executed && loopAccountingEnabled && body.tierName && executedPremiumUsdc !== null) {
+        const accounting = applyRiskAccounting(
+          body.tierName,
+          0,
+          Number(executedPremiumUsdc),
+          Number(notionalUsdc)
+        );
+        await audit("liquidity_update", {
+          coverageId: body.coverageId || null,
+          tier: body.tierName,
+          feeUsdc: 0,
+          premiumUsdc: Number(executedPremiumUsdc),
+          notionalUsdc,
+          delta: accounting.liquidityDelta,
+          totals: liquiditySummary(),
+          reason: "loop_tick"
+        });
+      }
       hedgeActionCooldownByCoverage.set(coverageKey, Date.now());
+      }
+    }
+  } else if (decision.hedgeAction === "decrease") {
+    if (riskControls.loop_enable_decrease !== true) {
+      await audit("hedge_action_skipped", {
+        action: "decrease",
+        reason: "decrease_disabled",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null
+      });
+    } else if (inferredHedgeType !== "option") {
+      await audit("hedge_action_skipped", {
+        action: "decrease",
+        reason: "options_only",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null
+      });
+    } else if (withinCooldown || belowNotional || missingNotional) {
+      await audit("hedge_action_skipped", {
+        action: "decrease",
+        reason: withinCooldown ? "cooldown" : missingNotional ? "missing_notional" : "min_notional",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null,
+        cooldownMs: hedgeCooldownMs
+      });
+    } else {
+      const executionInstrument = body.hedgeInstrument;
+      const requestedHedgeSize = Number(body.hedgeSize ?? 0);
+      const ledgerEntry = executionInstrument ? hedgeLedger.get(executionInstrument) : null;
+      const currentSize = ledgerEntry?.size ?? new Decimal(0);
+      const availableSize = currentSize.abs();
+      const reduceSize =
+        Number.isFinite(requestedHedgeSize) && requestedHedgeSize > 0
+          ? Decimal.min(availableSize, new Decimal(requestedHedgeSize)).toNumber()
+          : 0;
+      if (!executionInstrument || reduceSize <= 0) {
+        await audit("hedge_action_skipped", {
+          action: "decrease",
+          reason: "no_position_to_reduce",
+          coverageId: body.coverageId || null,
+          notionalUsdc: notionalUsdc || null
+        });
+      } else {
+        const closeSide = currentSize.gt(0) ? "sell" : "buy";
+        const selectedVenue =
+          typeof body.selectedVenue === "string"
+            ? body.selectedVenue
+            : body.coverageId
+              ? coverageLedger.get(body.coverageId)?.selectedVenue
+              : null;
+        const inferredVenue = inferVenueFromInstrument(executionInstrument);
+        const hedgeVenue =
+          selectedVenue ||
+          inferredVenue ||
+          (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
+        const hedgeInstrument =
+          hedgeVenue === "bybit" &&
+          typeof executionInstrument === "string" &&
+          !executionInstrument.endsWith("-USDT")
+            ? `${executionInstrument}-USDT`
+            : executionInstrument;
+        const inferredAsset = parseInstrumentAsset(hedgeInstrument) || "BTC";
+        await audit("hedge_action", {
+          action: "decrease",
+          reason: decision.reason,
+          instrument: executionInstrument,
+          size: reduceSize,
+          coverageId: body.coverageId || null,
+          notionalUsdc: body.notionalUsdc ?? null,
+          hedgeType: inferredHedgeType,
+          positionSide: inferredPositionSide,
+          recommendedSide: closeSide
+        });
+        const orderResult = await executionRegistry.placeOrder(hedgeVenue, {
+          instrument: hedgeInstrument,
+          amount: reduceSize,
+          side: closeSide,
+          type: "market",
+          spotPrice: body.spotPrice
+        });
+        let executedSize = Number(reduceSize ?? 0);
+        const orderStatus = String((orderResult as any)?.status || "");
+        let fillPriceUsdc: Decimal | null = null;
+        let executedPremiumUsdc: number | null = null;
+        if (orderResult && typeof orderResult === "object") {
+          const filled =
+            (orderResult as any).filledAmount ??
+            (orderResult as any).result?.filledAmount ??
+            (orderResult as any).filled_amount;
+          if (Number.isFinite(filled)) {
+            executedSize = Number(filled);
+          }
+        }
+        const fillPrice =
+          (orderResult as any)?.result?.average_price ??
+          (orderResult as any)?.result?.price ??
+          (orderResult as any)?.fillPrice ??
+          null;
+        const executed =
+          orderStatus === "paper_filled" || orderStatus === "filled" || orderStatus === "ok";
+        if (executed && fillPrice && executedSize > 0) {
+          const isBybitExec = hedgeVenue === "bybit";
+          let spotPriceNumber = Number(body.spotByAsset?.[inferredAsset] ?? body.spotPrice ?? 0);
+          if (!spotPriceNumber && !isBybitExec) {
+            const spot = await fetchSpotPrice(inferredAsset);
+            spotPriceNumber = spot ? spot.toNumber() : 0;
+          }
+          fillPriceUsdc =
+            inferredHedgeType === "option"
+              ? isBybitExec
+                ? new Decimal(fillPrice)
+                : spotPriceNumber
+                  ? new Decimal(fillPrice).mul(new Decimal(spotPriceNumber))
+                  : null
+              : new Decimal(fillPrice);
+          if (fillPriceUsdc) {
+            executedPremiumUsdc = fillPriceUsdc.mul(new Decimal(executedSize)).toNumber();
+            const sizeDelta = new Decimal(executedSize).mul(closeSide === "buy" ? 1 : -1);
+            updateHedgeLedger({
+              instrument: hedgeInstrument,
+              sizeDelta,
+              fillPriceUsdc
+            });
+            await saveHedgeLedger();
+            if (body.coverageId && typeof hedgeInstrument === "string") {
+              const parsed = parseOptionInstrument(hedgeInstrument);
+              const legVenue = hedgeVenue ?? inferVenueFromInstrument(hedgeInstrument);
+              const sizeDeltaValue = sizeDelta.toNumber();
+              const existing = coverageLedger.get(body.coverageId);
+              const coverageLegs = mergeCoverageLegs(existing?.coverageLegs, {
+                instrument: hedgeInstrument,
+                size: sizeDeltaValue,
+                venue: legVenue,
+                optionType: parsed.optionType,
+                strike: parsed.strike
+              });
+              upsertCoverageLedger({
+                coverageId: body.coverageId,
+                coverageLegs
+              });
+              await saveCoverageLedger();
+            }
+          }
+        }
+        const signedPremiumUsdc =
+          executedPremiumUsdc !== null && closeSide === "sell"
+            ? -executedPremiumUsdc
+            : executedPremiumUsdc;
+        await audit("hedge_order", {
+          instrument: executionInstrument,
+          side: closeSide,
+          amount: executedSize || reduceSize,
+          type: "market",
+          coverageId: body.coverageId || null,
+          notionalUsdc: body.notionalUsdc ?? null,
+          hedgeType: inferredHedgeType,
+          positionSide: inferredPositionSide,
+          premiumUsdc: signedPremiumUsdc ?? null,
+          fillPrice: fillPrice ?? null,
+          venue: hedgeVenue
+        });
+        if (executed && loopAccountingEnabled && body.tierName && signedPremiumUsdc !== null) {
+          const accounting = applyRiskAccounting(
+            body.tierName,
+            0,
+            Number(signedPremiumUsdc),
+            Number(notionalUsdc)
+          );
+          await audit("liquidity_update", {
+            coverageId: body.coverageId || null,
+            tier: body.tierName,
+            feeUsdc: 0,
+            premiumUsdc: Number(signedPremiumUsdc),
+            notionalUsdc,
+            delta: accounting.liquidityDelta,
+            totals: liquiditySummary(),
+            reason: "loop_tick"
+          });
+        }
+        hedgeActionCooldownByCoverage.set(coverageKey, Date.now());
       }
     }
   }
@@ -7173,25 +7420,48 @@ app.post("/loop/tick", async (req) => {
         fundingRate,
         coverageIds
       });
-      await executionRegistry.placeOrder(routedPlan.venue || "deribit", {
-        instrument,
-        amount: routedPlan.size.toNumber(),
-        side: perpSide,
-        type: "market"
-      });
-      await audit("hedge_order", {
-        instrument,
-        side: perpSide,
-        amount: routedPlan.size.toNumber(),
-        type: "market",
-        notionalUsdc: plan.targetNotional.abs().toNumber(),
-        hedgeType: "perp",
-        hedgeFactor: hedgeFactor.toNumber(),
-        fundingRate,
-        coverageIds,
-        venue: routedPlan.venue
-      });
-      netExecuted = true;
+      if (riskControls.net_exposure_perp_accounting_enabled === true) {
+        const res = await app.inject({
+          method: "POST",
+          url: "/deribit/order",
+          payload: {
+            instrument,
+            amount: routedPlan.size.toNumber(),
+            side: perpSide,
+            type: "market",
+            coverageId: body.coverageId || `net-${plan.asset}`,
+            notionalUsdc: plan.targetNotional.abs().toNumber(),
+            hedgeType: "perp",
+            feeUsdc: 0,
+            tierName,
+            spotPrice,
+            venue: routedPlan.venue
+          }
+        });
+        const payload = res.json() as Record<string, unknown>;
+        const status = String(payload?.status || "");
+        netExecuted = status === "paper_filled" || status === "filled" || status === "ok";
+      } else {
+        await executionRegistry.placeOrder(routedPlan.venue || "deribit", {
+          instrument,
+          amount: routedPlan.size.toNumber(),
+          side: perpSide,
+          type: "market"
+        });
+        await audit("hedge_order", {
+          instrument,
+          side: perpSide,
+          amount: routedPlan.size.toNumber(),
+          type: "market",
+          notionalUsdc: plan.targetNotional.abs().toNumber(),
+          hedgeType: "perp",
+          hedgeFactor: hedgeFactor.toNumber(),
+          fundingRate,
+          coverageIds,
+          venue: routedPlan.venue
+        });
+        netExecuted = true;
+      }
     }
     if (netExecuted) {
       netExposureCooldownByTier.set(netKey, Date.now());
