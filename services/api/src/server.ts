@@ -6296,19 +6296,34 @@ app.post("/loop/tick", async (req) => {
   let bufferPct = baseBufferPct;
   let bufferSource: "risk_summary" | "coverage_ledger" | "mtm_snapshot" | "mtm_stale" | "mtm_invalid" =
     "risk_summary";
+  let mtmAgeMs: number | null = null;
   const useMtmBuffer = riskControls.loop_use_mtm_buffer === true;
+  const maxAgeMs = riskControls.loop_mtm_max_age_ms ?? 0;
   if (useMtmBuffer && body.coverageId) {
     const ledgerEntry = coverageLedger.get(body.coverageId);
     const ledgerBuffer = ledgerEntry?.lastMtm?.bufferUsdc;
+    const ledgerTs = ledgerEntry?.lastMtm?.ts;
     const initialBalance = new Decimal(body.initialBalanceUsdc || "0");
+    if (ledgerTs) {
+      const ledgerAge = Date.now() - Date.parse(ledgerTs);
+      if (Number.isFinite(ledgerAge)) {
+        mtmAgeMs = ledgerAge;
+      }
+    }
     if (ledgerBuffer !== undefined && ledgerBuffer !== null && initialBalance.gt(0)) {
-      bufferPct = new Decimal(ledgerBuffer).div(initialBalance);
-      bufferSource = "coverage_ledger";
+      if (maxAgeMs > 0 && mtmAgeMs !== null && mtmAgeMs > maxAgeMs) {
+        bufferSource = "mtm_stale";
+      } else {
+        bufferPct = new Decimal(ledgerBuffer).div(initialBalance);
+        bufferSource = "coverage_ledger";
+      }
     }
   }
   if (useMtmBuffer && bufferSource === "risk_summary" && lastMtmSnapshot) {
-    const maxAgeMs = riskControls.loop_mtm_max_age_ms ?? 0;
     const ageMs = Date.now() - lastMtmSnapshotAt;
+    if (Number.isFinite(ageMs)) {
+      mtmAgeMs = ageMs;
+    }
     if (maxAgeMs <= 0 || ageMs <= maxAgeMs) {
       const drawdownLimit = new Decimal(body.drawdownLimitUsdc || "0");
       const initialBalance = new Decimal(body.initialBalanceUsdc || "0");
@@ -6321,6 +6336,13 @@ app.post("/loop/tick", async (req) => {
     } else {
       bufferSource = "mtm_stale";
     }
+  }
+  if (
+    useMtmBuffer &&
+    bufferSource === "risk_summary" &&
+    (mtmAgeMs !== null || lastMtmSnapshot)
+  ) {
+    bufferSource = "mtm_invalid";
   }
   let decision = evaluateRollingHedge({
     bufferPct,
@@ -6352,6 +6374,14 @@ app.post("/loop/tick", async (req) => {
   }
 
   const hedgeCooldownMs = riskControls.hedge_action_cooldown_ms ?? 60000;
+  const staleMtmThresholdMs =
+    riskControls.loop_stale_mtm_cooldown_ms ?? riskControls.loop_mtm_max_age_ms ?? 0;
+  const blockOnStaleMtm = riskControls.loop_block_on_stale_mtm === true;
+  const mtmStaleByAge =
+    staleMtmThresholdMs > 0 && mtmAgeMs !== null && mtmAgeMs > staleMtmThresholdMs;
+  const mtmBlocked =
+    blockOnStaleMtm &&
+    (bufferSource === "mtm_stale" || bufferSource === "mtm_invalid" || mtmStaleByAge);
   const minHedgeNotional = riskControls.min_hedge_notional_usdc ?? 0;
   const loopAccountingEnabled = riskControls.loop_accounting_enabled === true;
   const coverageKey = body.coverageId || body.accountId || "unknown";
@@ -6430,13 +6460,21 @@ app.post("/loop/tick", async (req) => {
         coverageId: body.coverageId || null,
         notionalUsdc: notionalUsdc || null
       });
-    } else if (withinCooldown || belowNotional || missingNotional) {
+    } else if (withinCooldown || belowNotional || missingNotional || mtmBlocked) {
       await audit("hedge_action_skipped", {
         action: "increase",
-        reason: withinCooldown ? "cooldown" : missingNotional ? "missing_notional" : "min_notional",
+        reason: withinCooldown
+          ? "cooldown"
+          : mtmBlocked
+            ? "mtm_stale"
+            : missingNotional
+              ? "missing_notional"
+              : "min_notional",
         coverageId: body.coverageId || null,
         notionalUsdc: notionalUsdc || null,
-        cooldownMs: hedgeCooldownMs
+        cooldownMs: hedgeCooldownMs,
+        bufferSource,
+        mtmAgeMs: mtmAgeMs ?? null
       });
     } else {
       let executionInstrument = body.hedgeInstrument;
@@ -6639,6 +6677,7 @@ app.post("/loop/tick", async (req) => {
           coverageId: body.coverageId || null,
           bufferPct: bufferPct.toFixed(4),
           bufferSource,
+          mtmAgeMs: mtmAgeMs ?? null,
           bufferTargetPct: body.bufferTargetPct,
           hysteresisPct: body.hysteresisPct,
           decision: decision.hedgeAction,

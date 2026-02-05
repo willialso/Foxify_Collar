@@ -15,6 +15,8 @@ export interface RiskControlsConfig {
   min_hedge_notional_usdc?: number;
   loop_use_mtm_buffer?: boolean;
   loop_mtm_max_age_ms?: number;
+  loop_block_on_stale_mtm?: boolean;
+  loop_stale_mtm_cooldown_ms?: number;
   loop_enable_decrease?: boolean;
   loop_require_notional_usdc?: boolean;
   loop_accounting_enabled?: boolean;
@@ -141,6 +143,8 @@ const DEFAULTS: RiskControlsConfig = {
   min_hedge_notional_usdc: 250,
   loop_use_mtm_buffer: false,
   loop_mtm_max_age_ms: 900000,
+  loop_block_on_stale_mtm: false,
+  loop_stale_mtm_cooldown_ms: 0,
   loop_enable_decrease: false,
   loop_require_notional_usdc: false,
   loop_accounting_enabled: false,

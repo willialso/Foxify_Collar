@@ -105,6 +105,8 @@
   "net_exposure_cooldown_ms": 600000,
   "loop_use_mtm_buffer": true,
   "loop_mtm_max_age_ms": 900000,
+  "loop_block_on_stale_mtm": true,
+  "loop_stale_mtm_cooldown_ms": 900000,
   "loop_enable_decrease": true,
   "loop_require_notional_usdc": false,
   "loop_accounting_enabled": true,

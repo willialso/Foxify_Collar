@@ -11,6 +11,18 @@ export interface RiskControlsConfig {
   initial_liquidity_usdc?: number;
   reinvest_pct?: number;
   reserve_pct?: number;
+  hedge_action_cooldown_ms?: number;
+  min_hedge_notional_usdc?: number;
+  loop_use_mtm_buffer?: boolean;
+  loop_mtm_max_age_ms?: number;
+  loop_block_on_stale_mtm?: boolean;
+  loop_stale_mtm_cooldown_ms?: number;
+  loop_enable_decrease?: boolean;
+  loop_require_notional_usdc?: boolean;
+  loop_accounting_enabled?: boolean;
+  net_exposure_min_notional_usdc?: number;
+  net_exposure_cooldown_ms?: number;
+  net_exposure_perp_accounting_enabled?: boolean;
   max_spread_pct?: number;
   max_slippage_pct?: number;
   max_spread_pct_by_days?: Record<string, number>;
@@ -64,6 +76,7 @@ export interface RiskControlsConfig {
   intermittent_selection_live_enabled?: boolean;
   intermittent_selection_size_tolerance_pct?: number;
   intermittent_profit_threshold_enabled?: boolean;
+  intermittent_profit_enforce_override?: boolean;
   intermittent_profit_min_improvement_usdc?: number;
   intermittent_profit_min_improvement_ratio?: number;
   intermittent_profit_critical_buffer_pct?: number;
@@ -115,6 +128,18 @@ const DEFAULTS: RiskControlsConfig = {
   initial_liquidity_usdc: 35000,
   reinvest_pct: 0.5,
   reserve_pct: 0.3,
+  hedge_action_cooldown_ms: 60000,
+  min_hedge_notional_usdc: 250,
+  loop_use_mtm_buffer: false,
+  loop_mtm_max_age_ms: 900000,
+  loop_block_on_stale_mtm: false,
+  loop_stale_mtm_cooldown_ms: 0,
+  loop_enable_decrease: false,
+  loop_require_notional_usdc: false,
+  loop_accounting_enabled: false,
+  net_exposure_min_notional_usdc: 500,
+  net_exposure_cooldown_ms: 120000,
+  net_exposure_perp_accounting_enabled: false,
   max_spread_pct: 0.05,
   max_slippage_pct: 0.01,
   max_spread_pct_by_days: {},
@@ -161,6 +186,7 @@ const DEFAULTS: RiskControlsConfig = {
   intermittent_selection_live_enabled: false,
   intermittent_selection_size_tolerance_pct: 0.2,
   intermittent_profit_threshold_enabled: false,
+  intermittent_profit_enforce_override: false,
   intermittent_profit_min_improvement_usdc: 0,
   intermittent_profit_min_improvement_ratio: 0,
   intermittent_profit_critical_buffer_pct: 0.02,
