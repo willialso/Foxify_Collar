@@ -62,6 +62,7 @@ export interface RiskControlsConfig {
   intermittent_analytics_enabled?: boolean;
   intermittent_selection_shadow_enabled?: boolean;
   intermittent_selection_live_enabled?: boolean;
+  intermittent_selection_size_tolerance_pct?: number;
   intermittent_profit_threshold_enabled?: boolean;
   intermittent_profit_min_improvement_usdc?: number;
   intermittent_profit_min_improvement_ratio?: number;
@@ -158,6 +159,7 @@ const DEFAULTS: RiskControlsConfig = {
   intermittent_analytics_enabled: false,
   intermittent_selection_shadow_enabled: false,
   intermittent_selection_live_enabled: false,
+  intermittent_selection_size_tolerance_pct: 0.2,
   intermittent_profit_threshold_enabled: false,
   intermittent_profit_min_improvement_usdc: 0,
   intermittent_profit_min_improvement_ratio: 0,

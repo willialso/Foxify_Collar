@@ -6362,7 +6362,17 @@ app.post("/loop/tick", async (req) => {
       });
     } else {
       let executionInstrument = body.hedgeInstrument;
-      let executionSize = Number(body.hedgeSize ?? 0);
+      const requestedHedgeSize = Number(body.hedgeSize ?? 0);
+      let executionSize = requestedHedgeSize;
+      const sizeTolerancePctRaw = Number(
+        riskControls.intermittent_selection_size_tolerance_pct ?? 0.2
+      );
+      const sizeTolerancePct =
+        Number.isFinite(sizeTolerancePctRaw) && sizeTolerancePctRaw >= 0
+          ? sizeTolerancePctRaw
+          : 0;
+      let sizeSelectionApplied = false;
+      let sizeDeltaPct: number | null = null;
       let selectionMode: "disabled" | "shadow" | "live" = "disabled";
       let selectionError: string | null = null;
       let candidateQuoteStatus: string | null = null;
@@ -6480,6 +6490,21 @@ app.post("/loop/tick", async (req) => {
                       ? Number(quoteData.survivalCheck.coverageRatio)
                       : null
                 };
+                const candidateHedgeSize =
+                  candidatePlan.hedgeSize !== null && Number.isFinite(candidatePlan.hedgeSize)
+                    ? candidatePlan.hedgeSize
+                    : null;
+                if (candidateHedgeSize && candidateHedgeSize > 0 && executionSize > 0) {
+                  sizeDeltaPct = Math.abs(candidateHedgeSize - executionSize) / executionSize;
+                  if (
+                    intermittentConfig.selectionLive &&
+                    Number.isFinite(sizeDeltaPct) &&
+                    sizeDeltaPct <= sizeTolerancePct
+                  ) {
+                    executionSize = candidateHedgeSize;
+                    sizeSelectionApplied = true;
+                  }
+                }
                 if (candidatePlan.strike !== null) {
                   const intrinsic = computeIntrinsicAtFloor({
                     spotPrice: new Decimal(spotPriceNumber),
@@ -6541,6 +6566,10 @@ app.post("/loop/tick", async (req) => {
           reason: decision.reason,
           phase3RolloutEnabled: intermittentConfig.rolloutEnabled,
           phase3SafetyGuardEnabled: intermittentConfig.safetyGuardEnabled,
+          requestedHedgeSize: Number.isFinite(requestedHedgeSize) ? requestedHedgeSize : null,
+          selectedHedgeSize: Number.isFinite(executionSize) ? executionSize : null,
+          sizeDeltaPct: sizeDeltaPct !== null ? Number(sizeDeltaPct.toFixed(4)) : null,
+          sizeSelectionApplied,
           selectionMode,
           selectionError,
           quoteStatus: candidateQuoteStatus,

@@ -116,6 +116,7 @@ jq -r '{
   intermittent_analytics_enabled,
   intermittent_selection_shadow_enabled,
   intermittent_selection_live_enabled,
+  intermittent_selection_size_tolerance_pct,
   intermittent_profit_threshold_enabled,
   intermittent_profit_min_improvement_usdc,
   intermittent_profit_min_improvement_ratio,

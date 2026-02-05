@@ -109,6 +109,7 @@
   "intermittent_analytics_enabled": true,
   "intermittent_selection_shadow_enabled": true,
   "intermittent_selection_live_enabled": false,
+  "intermittent_selection_size_tolerance_pct": 0.2,
   "intermittent_profit_threshold_enabled": true,
   "intermittent_profit_min_improvement_usdc": 0,
   "intermittent_profit_min_improvement_ratio": 0,
