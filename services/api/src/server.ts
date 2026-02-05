@@ -6219,6 +6219,8 @@ app.post("/loop/tick", async (req) => {
     optionType?: "put" | "call";
   };
 
+  Object.assign(riskControls, await loadRiskControls(RISK_CONTROLS_PATH));
+
   const combined = getCombinedExposureBook();
   const baseExposures =
     combined.exposures.length > 0 ? combined.exposures : body.exposures ?? [];
@@ -6294,11 +6296,28 @@ app.post("/loop/tick", async (req) => {
     notionalUsdc > 0 &&
     notionalUsdc < minHedgeNotional;
 
+  const phase3RolloutEnabled = riskControls.phase3_rollout_enabled ?? false;
+  const phase3SafetyGuardEnabled = riskControls.phase3_safety_guard_enabled ?? true;
+  const requestedIntermittentAnalytics = riskControls.intermittent_analytics_enabled ?? false;
+  const requestedSelectionShadow = riskControls.intermittent_selection_shadow_enabled ?? false;
+  const requestedSelectionLive = riskControls.intermittent_selection_live_enabled ?? false;
+  const requestedProfitThresholds = riskControls.intermittent_profit_threshold_enabled ?? false;
+  const selectionShadowEnabled =
+    phase3RolloutEnabled &&
+    (requestedSelectionShadow || (phase3SafetyGuardEnabled && requestedSelectionLive));
+  const selectionLiveEnabled =
+    phase3RolloutEnabled && !phase3SafetyGuardEnabled && requestedSelectionLive;
+  const profitThresholdsEnabled = phase3RolloutEnabled && requestedProfitThresholds;
+  const profitThresholdsEnforced =
+    phase3RolloutEnabled && !phase3SafetyGuardEnabled && requestedProfitThresholds;
   const intermittentConfig = {
-    analytics: riskControls.intermittent_analytics_enabled ?? false,
-    selectionShadow: riskControls.intermittent_selection_shadow_enabled ?? false,
-    selectionLive: riskControls.intermittent_selection_live_enabled ?? false,
-    profitThresholds: riskControls.intermittent_profit_threshold_enabled ?? false,
+    rolloutEnabled: phase3RolloutEnabled,
+    safetyGuardEnabled: phase3SafetyGuardEnabled,
+    analytics: phase3RolloutEnabled && requestedIntermittentAnalytics,
+    selectionShadow: selectionShadowEnabled,
+    selectionLive: selectionLiveEnabled,
+    profitThresholdsEnabled,
+    profitThresholdsEnforced,
     profitMinImprovementUsdc: riskControls.intermittent_profit_min_improvement_usdc ?? 0,
     profitMinImprovementRatio: riskControls.intermittent_profit_min_improvement_ratio ?? 0,
     profitCriticalBufferPct: riskControls.intermittent_profit_critical_buffer_pct ?? 0
@@ -6362,7 +6381,7 @@ app.post("/loop/tick", async (req) => {
       const shouldComputeCandidate =
         intermittentConfig.selectionShadow ||
         intermittentConfig.selectionLive ||
-        intermittentConfig.profitThresholds ||
+        intermittentConfig.profitThresholdsEnabled ||
         intermittentConfig.analytics;
       if (shouldComputeCandidate) {
         selectionMode = intermittentConfig.selectionLive
@@ -6492,7 +6511,7 @@ app.post("/loop/tick", async (req) => {
           selectionError = "position_unavailable";
         }
       }
-      if (intermittentConfig.profitThresholds) {
+      if (intermittentConfig.profitThresholdsEnabled) {
         const critical = new Decimal(intermittentConfig.profitCriticalBufferPct || 0);
         if (critical.gt(0) && bufferPct.lte(critical)) {
           profitCheck = { allowed: true, reason: "critical_buffer" };
@@ -6520,19 +6539,23 @@ app.post("/loop/tick", async (req) => {
           hysteresisPct: body.hysteresisPct,
           decision: decision.hedgeAction,
           reason: decision.reason,
+          phase3RolloutEnabled: intermittentConfig.rolloutEnabled,
+          phase3SafetyGuardEnabled: intermittentConfig.safetyGuardEnabled,
           selectionMode,
           selectionError,
           quoteStatus: candidateQuoteStatus,
           candidatePlan,
           expectedImprovementUsdc: expectedImprovementUsdc ?? null,
           expectedCostUsdc: expectedCostUsdc ?? null,
-          profitCheck: intermittentConfig.profitThresholds ? profitCheck : { allowed: true, reason: "disabled" }
+          profitCheck: intermittentConfig.profitThresholdsEnabled
+            ? profitCheck
+            : { allowed: true, reason: "disabled" }
         });
       }
       if (intermittentConfig.selectionLive && candidatePlan?.instrument) {
         executionInstrument = candidatePlan.instrument;
       }
-      if (intermittentConfig.profitThresholds && !profitCheck.allowed) {
+      if (intermittentConfig.profitThresholdsEnforced && !profitCheck.allowed) {
         await audit("hedge_action_skipped", {
           action: "increase",
           reason: `profit_threshold_${profitCheck.reason}`,

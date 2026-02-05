@@ -21,6 +21,8 @@ echo
 if [ -f "${CONFIG_PATH}" ]; then
   echo "Flags (from ${CONFIG_PATH}):"
   jq -r '{
+    phase3_rollout_enabled,
+    phase3_safety_guard_enabled,
     intermittent_analytics_enabled,
     intermittent_selection_shadow_enabled,
     intermittent_selection_live_enabled,
