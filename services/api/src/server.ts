@@ -671,29 +671,51 @@ async function computeUnrealizedHedgeMetrics(): Promise<{
     if (!entry.size || entry.size.eq(0)) continue;
     let markPriceUsdc: Decimal | null = null;
     try {
-      const ticker = await deribit.getTicker(instrument);
-      const result = (ticker as any)?.result || {};
-      if (instrument.includes("PERPETUAL")) {
-        const mark = Number(result?.mark_price ?? result?.last_price ?? 0);
-        if (Number.isFinite(mark) && mark > 0) {
-          markPriceUsdc = new Decimal(mark);
+      if (instrument.endsWith("-USDT")) {
+        if (instrument.includes("PERPETUAL")) {
+          const asset = parseInstrumentAsset(instrument);
+          const spot = asset ? await fetchSpotPrice(asset) : null;
+          if (spot) {
+            markPriceUsdc = spot;
+          }
+        } else {
+          markPriceUsdc = await fetchBybitOptionMarkUsdc(instrument);
         }
       } else {
-        const markUsd = Number(result?.mark_price_usd ?? 0);
-        if (Number.isFinite(markUsd) && markUsd > 0) {
-          markPriceUsdc = new Decimal(markUsd);
+        const ticker = await deribit.getTicker(instrument);
+        const result = (ticker as any)?.result || {};
+        if (instrument.includes("PERPETUAL")) {
+          const mark = Number(result?.mark_price ?? result?.last_price ?? 0);
+          if (Number.isFinite(mark) && mark > 0) {
+            markPriceUsdc = new Decimal(mark);
+          }
         } else {
-          const markBtc = Number(result?.mark_price ?? 0);
-          const underlying = Number(result?.underlying_price ?? 0);
-          if (Number.isFinite(markBtc) && markBtc > 0 && Number.isFinite(underlying) && underlying > 0) {
-            markPriceUsdc = new Decimal(markBtc).mul(new Decimal(underlying));
+          const markUsd = Number(result?.mark_price_usd ?? 0);
+          if (Number.isFinite(markUsd) && markUsd > 0) {
+            markPriceUsdc = new Decimal(markUsd);
           } else {
-            const asset = parseInstrumentAsset(instrument);
-            if (asset) {
-              const index = await deribit.getIndexPrice(`${asset.toLowerCase()}_usd`);
-              const spot = Number((index as any)?.result?.index_price ?? 0);
-              if (Number.isFinite(markBtc) && markBtc > 0 && Number.isFinite(spot) && spot > 0) {
-                markPriceUsdc = new Decimal(markBtc).mul(new Decimal(spot));
+            const markBtc = Number(result?.mark_price ?? 0);
+            const underlying = Number(result?.underlying_price ?? 0);
+            if (
+              Number.isFinite(markBtc) &&
+              markBtc > 0 &&
+              Number.isFinite(underlying) &&
+              underlying > 0
+            ) {
+              markPriceUsdc = new Decimal(markBtc).mul(new Decimal(underlying));
+            } else {
+              const asset = parseInstrumentAsset(instrument);
+              if (asset) {
+                const index = await deribit.getIndexPrice(`${asset.toLowerCase()}_usd`);
+                const spot = Number((index as any)?.result?.index_price ?? 0);
+                if (
+                  Number.isFinite(markBtc) &&
+                  markBtc > 0 &&
+                  Number.isFinite(spot) &&
+                  spot > 0
+                ) {
+                  markPriceUsdc = new Decimal(markBtc).mul(new Decimal(spot));
+                }
               }
             }
           }
@@ -6640,6 +6662,7 @@ app.post("/loop/tick", async (req) => {
         !executionInstrument.endsWith("-USDT")
           ? `${executionInstrument}-USDT`
           : executionInstrument;
+      const inferredAsset = parseInstrumentAsset(hedgeInstrument) || "BTC";
       const orderResult = await executionRegistry.placeOrder(hedgeVenue, {
         instrument: hedgeInstrument,
         amount: executionSize,
@@ -6648,6 +6671,7 @@ app.post("/loop/tick", async (req) => {
         spotPrice: body.spotPrice
       });
       let executedSize = Number(executionSize ?? 0);
+      const orderStatus = String((orderResult as any)?.status || "");
       if (orderResult && typeof orderResult === "object") {
         const filled =
           (orderResult as any).filledAmount ??
@@ -6655,6 +6679,40 @@ app.post("/loop/tick", async (req) => {
           (orderResult as any).filled_amount;
         if (Number.isFinite(filled)) {
           executedSize = Number(filled);
+        }
+      }
+      const fillPrice =
+        (orderResult as any)?.result?.average_price ??
+        (orderResult as any)?.result?.price ??
+        (orderResult as any)?.fillPrice ??
+        null;
+      const executed =
+        orderStatus === "paper_filled" || orderStatus === "filled" || orderStatus === "ok";
+      if (executed && fillPrice && executedSize > 0) {
+        const isBybitExec = hedgeVenue === "bybit";
+        let spotPriceNumber = Number(body.spotByAsset?.[inferredAsset] ?? body.spotPrice ?? 0);
+        if (!spotPriceNumber && !isBybitExec) {
+          const spot = await fetchSpotPrice(inferredAsset);
+          spotPriceNumber = spot ? spot.toNumber() : 0;
+        }
+        const fillPriceUsdc =
+          inferredHedgeType === "option"
+            ? isBybitExec
+              ? new Decimal(fillPrice)
+              : spotPriceNumber
+                ? new Decimal(fillPrice).mul(new Decimal(spotPriceNumber))
+                : null
+            : new Decimal(fillPrice);
+        if (fillPriceUsdc) {
+          const sizeDelta = new Decimal(executedSize).mul(
+            decision.recommendedSide === "buy" ? 1 : -1
+          );
+          updateHedgeLedger({
+            instrument: hedgeInstrument,
+            sizeDelta,
+            fillPriceUsdc
+          });
+          await saveHedgeLedger();
         }
       }
       if (body.coverageId && typeof hedgeInstrument === "string" && executedSize > 0) {

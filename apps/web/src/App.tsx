@@ -1432,6 +1432,16 @@ export function App() {
     }
     setToast("Protection activated.");
     setTimeout(() => setToast(null), 2500);
+    setSelectedIds([]);
+    setPreviewQuote(null);
+    setPreviewQuoteRaw(null);
+    setPreviewState("idle");
+    setPreviewGate("idle");
+    setPreviewLastError(null);
+    setPreviewLoading(false);
+    previewLastRequestAtRef.current = 0;
+    previewKeyRef.current = null;
+    setLockedQuote(null);
     setIsActivating(false);
   };
 
