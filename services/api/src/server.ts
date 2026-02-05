@@ -3500,6 +3500,7 @@ app.post("/put/quote", async (req) => {
   const body = req.body as PutQuoteRequest;
   const requestStart = Date.now();
   const requestTimestamp = new Date().toISOString();
+  Object.assign(riskControls, await loadRiskControls(RISK_CONTROLS_PATH));
   if (body.fixedPriceUsdc === undefined || body.fixedPriceUsdc === null) {
     body.fixedPriceUsdc = 0;
   }
