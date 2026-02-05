@@ -190,14 +190,18 @@ sleep "${POST_LOG_DELAY_SECONDS}"
 echo
 
 logs="$(curl -s "${API_BASE}/audit/logs?limit=${LOG_LIMIT}&showAll=true")"
-phase1_count="$(echo "${logs}" | jq --arg cid "${TEST_COVERAGE_ID}" --argjson since "${start_epoch}" \
-  '[.entries[] | select(.ts != null) | select((.ts | fromdateiso8601) >= $since) | select(.event=="coverage_activated") | select((.payload.coverageId // "") == $cid)] | length')"
-phase2_count="$(echo "${logs}" | jq --argjson since "${start_epoch}" \
-  '[.entries[] | select(.ts != null) | select((.ts | fromdateiso8601) >= $since) | select(.event=="pass_through_gate" or .event=="premium_pass_through")] | length')"
-phase3_count="$(echo "${logs}" | jq --arg cid "${TEST_COVERAGE_ID}" --argjson since "${start_epoch}" \
-  '[.entries[] | select(.ts != null) | select((.ts | fromdateiso8601) >= $since) | select(.event=="intermittent_hedge_eval") | select((.payload.coverageId // "") == $cid) | select(.payload.selectionMode=="live")] | length')"
-phase4_count="$(echo "${logs}" | jq --argjson since "${start_epoch}" \
-  '[.entries[] | select(.ts != null) | select((.ts | fromdateiso8601) >= $since) | select(.event=="hedge_action") | select(.payload.action=="net_exposure" or .payload.reason=="net_exposure_hedge")] | length')"
+phase1_count="$(echo "${logs}" | jq --arg cid "${TEST_COVERAGE_ID}" --argjson since "${start_epoch}" '
+  def ts_epoch: (.ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601);
+  [.entries[] | select(.ts != null) | select(ts_epoch >= $since) | select(.event=="coverage_activated") | select((.payload.coverageId // "") == $cid)] | length')"
+phase2_count="$(echo "${logs}" | jq --argjson since "${start_epoch}" '
+  def ts_epoch: (.ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601);
+  [.entries[] | select(.ts != null) | select(ts_epoch >= $since) | select(.event=="pass_through_gate" or .event=="premium_pass_through")] | length')"
+phase3_count="$(echo "${logs}" | jq --arg cid "${TEST_COVERAGE_ID}" --argjson since "${start_epoch}" '
+  def ts_epoch: (.ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601);
+  [.entries[] | select(.ts != null) | select(ts_epoch >= $since) | select(.event=="intermittent_hedge_eval") | select((.payload.coverageId // "") == $cid) | select(.payload.selectionMode=="live")] | length')"
+phase4_count="$(echo "${logs}" | jq --argjson since "${start_epoch}" '
+  def ts_epoch: (.ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601);
+  [.entries[] | select(.ts != null) | select(ts_epoch >= $since) | select(.event=="hedge_action") | select(.payload.action=="net_exposure" or .payload.reason=="net_exposure_hedge")] | length')"
 
 echo "Phase checks (events since test start):"
 if [ "${phase1_count}" -gt 0 ]; then
