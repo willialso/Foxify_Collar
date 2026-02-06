@@ -66,6 +66,7 @@ export function AuditDashboard({
   const [showNetExposure, setShowNetExposure] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showGlossary, setShowGlossary] = useState(false);
+  const [showHedgeOrdersOnly, setShowHedgeOrdersOnly] = useState(true);
 
   const load = useCallback(async () => {
     const [summaryRes, entriesRes] = await Promise.all([
@@ -189,9 +190,12 @@ export function AuditDashboard({
     }
     return false;
   };
+  const baseEntries = showHedgeOrdersOnly
+    ? visibleEntries.filter((entry) => entry.event === "hedge_order")
+    : visibleEntries;
   const scopedEntries = showNetExposure
-    ? visibleEntries
-    : visibleEntries.filter((entry) => !isNetExposure(entry));
+    ? baseEntries
+    : baseEntries.filter((entry) => !isNetExposure(entry));
   const filteredEntries = coverageFilter
     ? scopedEntries.filter((entry) => String(entry.payload?.coverageId || "") === coverageFilter)
     : scopedEntries;
@@ -414,6 +418,12 @@ export function AuditDashboard({
               {showNetExposure ? "Net Exposure: On" : "Net Exposure: Off"}
             </button>
             <button
+              className={showHedgeOrdersOnly ? "btn active" : "btn"}
+              onClick={() => setShowHedgeOrdersOnly((prev) => !prev)}
+            >
+              {showHedgeOrdersOnly ? "Hedge Orders: On" : "Hedge Orders: Off"}
+            </button>
+            <button
               className={showAdvanced ? "btn active" : "btn"}
               onClick={() => setShowAdvanced((prev) => !prev)}
             >
@@ -473,14 +483,21 @@ export function AuditDashboard({
             const statusRaw = String(extractField(entry, "status") || "—");
             const status =
               statusRaw === "—" && entry.event === "hedge_order" ? "filled" : statusRaw;
+            const isHedgeOrder = entry.event === "hedge_order";
             const premiumRaw =
               extractField(entry, "executedPremiumUsdc") ?? extractField(entry, "premiumUsdc");
             const estimatedPremium = extractField(entry, "estimatedPremiumUsdc");
-            const premium = premiumRaw ?? estimatedPremium;
+            const premiumValue = premiumRaw ?? estimatedPremium;
+            const premium =
+              !isHedgeOrder &&
+              (premiumValue === null || premiumValue === undefined || Number(premiumValue) === 0)
+                ? null
+                : premiumValue;
             const premiumEstimated =
               (premiumRaw === null || premiumRaw === undefined) &&
               estimatedPremium !== null &&
-              estimatedPremium !== undefined;
+              estimatedPremium !== undefined &&
+              isHedgeOrder;
             const feeIn =
               extractField(entry, "totalFeeUsd") ??
               extractField(entry, "feeUsd") ??
@@ -488,17 +505,22 @@ export function AuditDashboard({
             const hedgeSize = extractField(entry, "hedgeSize") ?? extractField(entry, "amount");
             const hedgeType = extractField(entry, "hedgeType") || extractField(entry, "optionType");
             const notional = extractField(entry, "notionalUsdc");
-            const hedgeSpend =
-              extractField(entry, "hedgeMarginUsdc") ??
-              premium ??
-              extractField(entry, "hedgeNotionalUsdc");
-            const hedgeSpendEstimated =
+            const cashflowRaw = extractField(entry, "cashflowUsdc");
+            const hedgeCashflow =
+              cashflowRaw !== null && cashflowRaw !== undefined
+                ? Number(cashflowRaw)
+                : isHedgeOrder && premium !== null && premium !== undefined
+                  ? String(side).toLowerCase() === "sell"
+                    ? -Number(premium)
+                    : Number(premium)
+                  : null;
+            const hedgeCashflowEstimated =
               premiumEstimated &&
-              hedgeSpend !== null &&
-              hedgeSpend !== undefined &&
+              hedgeCashflow !== null &&
+              hedgeCashflow !== undefined &&
               premium !== null &&
               premium !== undefined &&
-              Number(hedgeSpend) === Number(premium);
+              Math.abs(Number(hedgeCashflow)) === Math.abs(Number(premium));
             const mtmEquity = extractField(entry, "equityUsdc");
             const positionPnl = extractField(entry, "positionPnlUsdc");
             const hedgeMtm = extractField(entry, "hedgeMtmUsdc");
@@ -583,15 +605,15 @@ export function AuditDashboard({
                 </span>
                 <span
                   title={
-                    hedgeSpend !== null && hedgeSpend !== undefined
-                      ? `${Number(hedgeSpend) < 0 ? "credit" : "spend"} $${Math.abs(
-                          Number(hedgeSpend)
-                        ).toFixed(2)}${hedgeSpendEstimated ? " (est)" : ""}`
+                    hedgeCashflow !== null && hedgeCashflow !== undefined
+                      ? `${Number(hedgeCashflow) < 0 ? "credit" : "spend"} $${Math.abs(
+                          Number(hedgeCashflow)
+                        ).toFixed(2)}${hedgeCashflowEstimated ? " (est)" : ""}`
                       : "—"
                   }
                 >
-                  {hedgeSpend !== null && hedgeSpend !== undefined
-                    ? formatCashflow(Number(hedgeSpend), hedgeSpendEstimated)
+                  {hedgeCashflow !== null && hedgeCashflow !== undefined
+                    ? formatCashflow(Number(hedgeCashflow), hedgeCashflowEstimated)
                     : "—"}
                 </span>
                 <span title={mtmEquity !== null && mtmEquity !== undefined ? `$${mtmEquity}` : "—"}>
