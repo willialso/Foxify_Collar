@@ -948,6 +948,16 @@ select.input {
   margin-left: 8px;
 }
 
+.premium-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.quote-refresh-inline {
+  margin-left: 0;
+}
+
   .input {
     width: 100%;
     text-align: left;

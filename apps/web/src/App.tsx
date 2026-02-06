@@ -1756,8 +1756,17 @@ export function App() {
                   />
                 </div>
                 <div className="row row-align">
-                  <span>
+                  <span className="premium-label">
                     Premium
+                    {!isFetchingQuote && (
+                      <button
+                        className="btn btn-secondary quote-refresh quote-refresh-inline"
+                        onClick={forcePreviewQuote}
+                        disabled={previewLoading}
+                      >
+                        {previewLoading ? "Refreshing..." : "Refresh"}
+                      </button>
+                    )}
                     {isFetchingQuote && (
                       <span className="fetching-status">
                         <em>
@@ -1770,15 +1779,6 @@ export function App() {
                   <div className="row-inline row-inline-fee">
                     {pricingStatusLabel && (
                       <span className="vol-status">{pricingStatusLabel}</span>
-                    )}
-                    {!isFetchingQuote && (
-                      <button
-                        className="btn btn-secondary quote-refresh"
-                        onClick={forcePreviewQuote}
-                        disabled={previewLoading}
-                      >
-                        {previewLoading ? "Refreshing..." : "Refresh"}
-                      </button>
                     )}
                     <strong className="fee-amount">{feeDisplayLabel}</strong>
                   </div>

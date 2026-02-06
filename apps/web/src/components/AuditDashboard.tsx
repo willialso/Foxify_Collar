@@ -114,16 +114,6 @@ export function AuditDashboard({
   const liquidity = summary.liquidity;
   const profitability = summary.profitability;
   const mtmExposure = profitability?.unrealizedHedgePnlUsdc ?? profitability?.hedgeMtmUsdc ?? 0;
-  const stats = {
-    coverageCount: summary.totals?.coverage_activated || 0,
-    hedgeCount: summary.totals?.hedge_action || 0,
-    liquidity: liquidity?.liquidityBalanceUsdc ?? 0,
-    revenue: liquidity?.revenueUsdc ?? 0,
-    coverageSpend: perUserHedgeCost ?? 0,
-    mtmExposure
-  };
-  const mtmClass =
-    stats.mtmExposure >= 0 ? "audit-metric-value-positive" : "audit-metric-value-warn";
   const baseColumnWidths = [
     "80px",
     "120px",
@@ -273,6 +263,16 @@ export function AuditDashboard({
     const totalFee = (payload as any).totalFeeUsd ?? (payload as any).feeUsd ?? 0;
     return sum + Number(totalFee || 0);
   }, 0);
+  const stats = {
+    coverageCount: summary.totals?.coverage_activated || 0,
+    hedgeCount: summary.totals?.hedge_action || 0,
+    liquidity: liquidity?.liquidityBalanceUsdc ?? 0,
+    revenue: liquidity?.revenueUsdc ?? 0,
+    coverageSpend: perUserHedgeCost ?? 0,
+    mtmExposure
+  };
+  const mtmClass =
+    stats.mtmExposure >= 0 ? "audit-metric-value-positive" : "audit-metric-value-warn";
 
   return (
     <div>
