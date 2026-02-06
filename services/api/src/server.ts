@@ -3465,6 +3465,7 @@ type PutQuoteRequest = {
   allowPartialCoverage?: boolean;
   _cacheBust?: boolean;
   _fastPreview?: boolean;
+  _debugPassThrough?: boolean;
 };
 
 function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Record<string, unknown>> {
@@ -4125,9 +4126,10 @@ app.post("/put/quote", async (req) => {
       : false;
     const uncappedBronzeEnabled = riskControls.pass_through_allow_uncapped_bronze === true;
     const uncappedMaxRatioRaw = riskControls.pass_through_uncapped_max_ratio ?? 0;
+    const uncappedMaxRatioValue = Number(uncappedMaxRatioRaw);
     const uncappedMaxRatio =
-      Number.isFinite(uncappedMaxRatioRaw) && uncappedMaxRatioRaw > 0
-        ? new Decimal(uncappedMaxRatioRaw)
+      Number.isFinite(uncappedMaxRatioValue) && uncappedMaxRatioValue > 0
+        ? new Decimal(uncappedMaxRatioValue)
         : null;
     const allowBronzeCapOverride =
       uncappedBronzeEnabled &&
@@ -5095,9 +5097,10 @@ app.post("/put/quote", async (req) => {
     : false;
   const uncappedBronzeEnabled = riskControls.pass_through_allow_uncapped_bronze === true;
   const uncappedMaxRatioRaw = riskControls.pass_through_uncapped_max_ratio ?? 0;
+  const uncappedMaxRatioValue = Number(uncappedMaxRatioRaw);
   const uncappedMaxRatio =
-    Number.isFinite(uncappedMaxRatioRaw) && uncappedMaxRatioRaw > 0
-      ? new Decimal(uncappedMaxRatioRaw)
+    Number.isFinite(uncappedMaxRatioValue) && uncappedMaxRatioValue > 0
+      ? new Decimal(uncappedMaxRatioValue)
       : null;
   const allowBronzeCapOverride =
     uncappedBronzeEnabled &&
@@ -5133,6 +5136,17 @@ app.post("/put/quote", async (req) => {
       quote.strike.toFixed(0),
       optionSymbol
     );
+    const passThroughDebug = body._debugPassThrough
+      ? {
+          tierName,
+          canPassThrough,
+          passThroughCapped,
+          premiumRatio: premiumFloor.ratio.toFixed(4),
+          uncappedBronzeEnabled,
+          uncappedMaxRatio: uncappedMaxRatio ? uncappedMaxRatio.toFixed(4) : null,
+          allowBronzeCapOverride
+        }
+      : undefined;
     if (allowBronzeCapOverride) {
       const venueInfo = attachVenueMetadata({
         selectionSnapshot: bestSnapshots
@@ -5225,7 +5239,8 @@ app.post("/put/quote", async (req) => {
           threshold: premiumFloor.threshold.toFixed(4),
           message: explanation
         },
-        reason: "premium_floor_pass_through_override"
+        reason: "premium_floor_pass_through_override",
+        debugPassThrough: passThroughDebug
       });
     }
     const subsidyNeededFull = allInPremium.minus(cappedFee);
@@ -5330,7 +5345,8 @@ app.post("/put/quote", async (req) => {
           message:
             `Premium exceeds tier cap. Fee capped at $${cappedFee.toFixed(2)}. ` +
             `You're fully protected (100% hedge). Platform covers excess.`
-        }
+        },
+        debugPassThrough: passThroughDebug
       });
     }
     if (!allowPartialCoverage) {
@@ -5413,6 +5429,7 @@ app.post("/put/quote", async (req) => {
           message:
             "Premium too high for Bronze tier. Reduce leverage, duration, or widen the floor."
         },
+        debugPassThrough: passThroughDebug,
         suggestions: [
           `Reduce leverage from ${leverage}× to ${Math.max(1, Math.floor(leverage / 2))}×`,
           `Reduce protection duration from ${quote.targetDays || 0} days to ${Math.max(
