@@ -1,9 +1,11 @@
+![Atticus Logo](https://i.ibb.co/KpbRyd7w/atticus-copy.png)
+
 # Atticus Platform Technical Documentation (Foxify CTO Edition)
 
 | Field | Value |
 | --- | --- |
-| Version | 2026-02-05 |
-| Status | MVP Integration Package |
+| Version | 2026-02-06 |
+| Status | MVP Integration Package (v3) |
 | Audience | Foxify CTO, Engineering, Security, Ops |
 | Confidentiality | Partner-Confidential (see Section 16) |
 | Repository | /workspace (legacy name: foxify_collar) |
@@ -39,12 +41,15 @@ The current codebase is implemented in TypeScript/Node using Fastify for the API
 The MVP is intentionally focused on BTC protection and operational transparency:
 - BTC-only asset validation at the API boundary.
 - Fixed-fee protection with liquidity gating and fixed-floor alignment.
-- Rolling hedge control loop with buffer targets and hysteresis.
+- Rolling hedge control loop with buffer targets and hysteresis (increase/decrease).
 - Auto-renew flow to maintain continuous protection.
 - Premium pass-through with tier/leverage caps and premium-floor enforcement; Bronze supports put and call protection when floor constraints are satisfied.
+- Bronze pass-through override (configurable) to reduce rejections when premiums spike, with explicit warning messaging.
+- Quote locks with drift checks and configurable TTL to minimize preview vs execution gaps.
 - Append-only audit logging and file-based state snapshots for portability.
 - MTM audit trail includes per-position MTM events and coverage ratio tracking.
 - Paper mode for safe simulation and QA.
+- Liquidity state persistence for continuity across restarts.
 
 MVP deployment is designed to run inside the Foxify environment behind a trusted API gateway. Authentication, rate limiting, and network access controls are expected at the edge, while the Atticus API remains private to Foxify infrastructure.
 
@@ -53,6 +58,7 @@ MVP deployment is designed to run inside the Foxify environment behind a trusted
 - Liquidity gates (spread, slippage, minimum size) and leverage caps by tier.
 - Risk controls and fee floors loaded from external configuration.
 - Cache-aware quote pipeline with fuzzy buckets and TTL for deterministic latency.
+- Quote lock and drift gating to reduce pricing surprises.
 - Clear audit trail for coverage activation, hedge actions, and renewals.
 - Defensive failure behavior: invalid inputs or unsafe conditions return `no_quote`.
 
@@ -73,6 +79,7 @@ Atticus is structured to align with Foxify operational needs:
 - Rolling hedge control loop and auto-renew.
 - Audit logging, coverage tracking, and operator dashboards.
 - Integration endpoints for portfolio ingestion and coverage reporting.
+- Coverage spend tracking separated from net exposure spend for executive reporting.
 
 ### 2.2 External or Partner Responsibilities
 These are intentionally outside Atticus scope and handled by Foxify or existing partner systems:
@@ -108,8 +115,8 @@ These are intentionally outside Atticus scope and handled by Foxify or existing 
 **Frontend (React Widget)**
 - Path: `apps/web/`
 - `App.tsx` orchestrates portfolio fetching, quote preview, activation, and audit modal display.
-- `AuditDashboard.tsx` renders audit summary data from `/audit/summary`.
-- `positionSource.ts` provides adapters for demo and partner position sources.
+- Quote refresh button (manual) allows re-pricing while maintaining quote lock safety.
+- `AuditDashboard.tsx` renders audit summary data from `/audit/summary` and live active coverage count.
 
 **API Service (Fastify)**
 - Path: `services/api/src/server.ts`
@@ -139,6 +146,7 @@ Runtime state is held in memory for low latency. Persistent artifacts are writte
 - `logs/coverages.json`
 - `logs/coverage-ledger.json`
 - `logs/hedge-ledger.json`
+- `logs/liquidity-state.json` (liquidity + coverage spend persistence)
 
 This structure is intentionally modular to enable a future migration to a dedicated database without redesigning the API contract.
 
@@ -163,7 +171,12 @@ This structure is intentionally modular to enable a future migration to a dedica
 **Caching**
 - Quote responses are cached across all status types.
 - Cache keys use fuzzy buckets (spot rounded to $500, drawdown rounded to 5%, days rounded to whole days).
-- TTL is env-configurable and can be tuned for demo or production latency targets.
+- TTL is env-configurable and tuned for demo stability (60s default in v3).
+
+**Quote Lock**
+- Quotes include `quoteId` and expiry time.
+- `/deribit/order` enforces drift tolerance against the locked quote.
+- UI provides manual refresh to reprice when markets move.
 
 ### 4.2 Hedge Control Loop
 **Flow**
@@ -199,25 +212,10 @@ Intermittent selection modes (shadow/live) can be enabled via risk controls and 
 - `mtm_credit`
 - `mtm_position` (per-position MTM snapshot with coverage ratio)
 - `demo_credit` (demo-only margin credit events)
-- `option_payout`
 - `coverage_expired`
 
-**Internal audit view (operator)**
-- `put_quote`
-- `pass_through_gate`
-- `premium_pass_through`
-- `risk_budget_update`
-- `liquidity_update`
-- `execution_quality`
-- `renewal_decision`
-- `intermittent_hedge_eval` (shadow/live selection diagnostics)
-- `hedge_action_skipped`
-- `close_blocked`
-
-Executive view is intentionally minimal and omits platform profitability; internal view includes liquidity and execution analytics.
-Key MTM payload fields:
-- `mtm_position`: `coverageId`, `positionId`, `positionPnlUsdc`, `hedgeMtmUsdc`, `equityUsdc`, `drawdownBufferUsdc`, `coverageRatio`
-- `demo_credit`: `coverageId`, `positionId`, `creditUsdc`, `bufferUsdc` (demo-only)
+**Key audit fields**
+- `hedge_order` includes `premiumUsdc`, `estimatedPremiumUsdc`, and `cashflowUsdc` for clear buy vs sell spend.
 
 ### 4.5 Failure Modes and Safe Behavior
 The system prioritizes safe, explicit failure modes:
@@ -230,7 +228,7 @@ The system prioritizes safe, explicit failure modes:
 ## 5. API Reference
 
 ### 5.1 API Architecture
-- **Base URL**: `http://<host>:4100`
+- **Base URL**: `http://<host>:8000`
 - **Auth**: API is designed for private network access. Foxify edge gateway is expected to enforce auth and rate limiting.
 - **Error format**: `{ status: "error"|"no_quote", reason: "..." }`
 
@@ -328,7 +326,7 @@ Request body includes:
 ```
 Notes:
 - `intent=close` requires drawdown inputs; closes are blocked if buffer is positive.
-- Side effects update hedge ledger and audit events.
+- PERP instruments are forced to `hedgeType=perp` to prevent option-style premium math.
 
 #### GET /deribit/positions
 Purpose: Return Deribit positions (BTC)
@@ -362,7 +360,7 @@ Response:
 ```
 
 #### GET /risk/mtm
-Purpose: Return MTM components computed from Deribit positions
+Purpose: Return MTM components computed from Deribit positions  
 Notes:
 - When `ALLOW_DERIBIT_PRIVATE_MTM=true`, MTM can use authenticated Deribit positions; otherwise the API operates in public/paper mode.
 
@@ -378,9 +376,9 @@ Behavior notes:
 - Leverage limit via `normalizeLeverage`.
 - Spread/slippage thresholds from `risk_controls.json`.
 - Bronze tier supports put and call protection when premium-floor constraints are satisfied.
-- Premium pass-through can be enabled per request (`allowPremiumPassThrough`) and gated by tier/leverage caps; responses may return `pass_through`, `pass_through_capped`, or `premium_floor` status variants.
-- Responses are cached for all status types using fuzzy buckets; cache hit/miss logging includes a live hit-rate.
-- Dual-venue pricing uses a hybrid fast path (Bybit may respond first); Deribit comparison is logged asynchronously via `hybrid_comparison`.
+- Premium pass-through can be enabled per request (`allowPremiumPassThrough`) and gated by tier/leverage caps; responses may return `pass_through`, `pass_through_capped`, `premium_floor` status variants.
+- Bronze pass-through override (configurable) reduces rejections during extreme premium spikes.
+- Dual-venue pricing uses a hybrid fast path (Bybit may respond first).
 - All responses are cached and logged with a hit-rate indicator.
 
 Status variants (observed):
@@ -408,7 +406,7 @@ Purpose: Single-step risk + hedge control loop
 Request includes account info, hedge settings, and exposure list.
 
 #### POST /audit/export
-Purpose: Persist audit payload and activate coverage
+Purpose: Persist audit payload and activate coverage  
 Side effects: emits `coverage_activated` with `coverageLegs` and seeds `coverage-ledger.json` for MTM attribution.
 
 #### POST /admin/reset
@@ -421,6 +419,9 @@ Query: `limit`, `showAll`
 #### GET /audit/summary
 Purpose: Return audit summary for dashboards  
 Query: `mode=exec|internal`
+
+#### GET /debug/risk-controls
+Purpose: Diagnostics for live risk control values (non-production)
 
 #### POST /hedge/roll
 Purpose: Rolling hedge decision + execute
@@ -486,7 +487,12 @@ File: `logs/hedge-ledger.json`
 }
 ```
 
-### 6.6 Migration Path
+### 6.6 Liquidity State (Persistent)
+File: `logs/liquidity-state.json`  
+Tracks liquidity balance, coverage spend, net exposure spend, and revenue.  
+Used by the Audit Modal for persistent reporting across restarts.
+
+### 6.7 Migration Path
 The data contract is intentionally explicit to support migration to Postgres or another durable store without breaking API semantics. Audit events remain append-only to support forensic review.
 
 ---
@@ -515,11 +521,10 @@ The system supports premium pass-through when `allowPremiumPassThrough=true` and
 - `pass_through`: premium accepted within cap.
 - `pass_through_capped`: premium capped and remaining portion treated as subsidy.
 - `premium_floor`: rejected because the premium is below the configured floor.
+- Bronze override allows pass-through when premiums exceed caps, with explicit warning messaging.
 
-Premium-floor enforcement uses `premium_floor_ratio` and `min_fee_usdc_by_tier` to avoid under-priced protection, especially in low IV regimes.
-
-### 7.4 CTC Fee (Coverage-to-Coverage)
-`POST /pricing/ctc` computes a safety fee based on tier and volatility regime, adding a margin for operational buffer.
+### 7.4 Quote Lock and Drift Tolerance
+Quotes are locked with `quoteId` and validated at execution time. Drift tolerance is applied to reject stale quotes while minimizing rejections in stable markets.
 
 ### 7.5 Rolling Hedge Logic
 Rolling hedges maintain the drawdown buffer with hysteresis:
@@ -533,12 +538,14 @@ Risk controls are loaded from `configs/risk_controls.json` and merged with defau
 - **Subsidy limits**: `subsidy_daily_cap_usdc`, `subsidy_account_daily_cap_usdc`
 - **Premium floors and minimum fees**: `premium_floor_ratio`, `min_fee_usdc_by_tier`
 - **Premium markups**: `premium_markup_pct_by_tier`, `leverage_markup_pct_by_x`
-- **Pass-through controls**: `enable_premium_pass_through`, `require_user_opt_in_for_pass_through`, `pass_through_cap_by_leverage`, `pass_through_cap_by_tier`, `pass_through_min_notification_ratio`
+- **Pass-through controls**: `enable_premium_pass_through`, `require_user_opt_in_for_pass_through`, `pass_through_cap_by_leverage`, `pass_through_cap_by_tier`, `pass_through_min_notification_ratio`, `pass_through_allow_uncapped_bronze`, `pass_through_uncapped_max_ratio`
 - **Drift tolerances**: `drift_tolerance_pct_by_tier`, `drift_tolerance_usdc_by_tier`
 - **CTC controls**: `ctc_enabled`, `ctc_margin_by_tier`, `ctc_ops_buffer_usdc_by_tier`, `ctc_max_snapshot_age_ms`, `ctc_price_buffer_pct`
 - **IV regime thresholds**: `fee_iv_regime_thresholds` (`low`, `high`)
 - **Dynamic cap uplift**: `dynamic_cap_enabled`, `dynamic_cap_max_uplift_pct`, `dynamic_cap_liquidity_ratio_low`, `dynamic_cap_liquidity_ratio_high`, `dynamic_cap_iv_uplift_pct_normal`, `dynamic_cap_iv_uplift_pct_high`
 - **Intermittent hedge controls**: `phase3_rollout_enabled`, `phase3_safety_guard_enabled`, `intermittent_analytics_enabled`, `intermittent_selection_shadow_enabled`, `intermittent_selection_live_enabled`, `intermittent_selection_size_tolerance_pct`, `intermittent_profit_threshold_enabled`, `intermittent_profit_min_improvement_usdc`, `intermittent_profit_min_improvement_ratio`, `intermittent_profit_critical_buffer_pct`
+- **Slippage controls**: `slippage_tracking_enabled`, `slippage_guard_enabled`, `slippage_soft_pct`, `slippage_soft_usdc`, `slippage_hard_pct`, `slippage_hard_usdc`, `slippage_reject_hard`, `slippage_adjust_subsidy_enabled`, `slippage_subsidy_cap_usdc`
+- **MTM loop controls**: `loop_use_mtm_buffer`, `loop_mtm_max_age_ms`, `loop_block_on_stale_mtm`, `loop_stale_mtm_cooldown_ms`
 
 ### 7.7 Financial Precision
 All monetary calculations in the hedging engine use Decimal.js to avoid float rounding errors and ensure deterministic results.
@@ -562,9 +569,6 @@ All monetary calculations in the hedging engine use Decimal.js to avoid float ro
 
 ### 8.4 Notifications
 - Webhook alerts via `sendWebhookAlert()` for critical events or loop actions.
-
-### 8.5 Optional On-Chain Hooks (Phase 3)
-The repository contains placeholder contract interfaces for future settlement hooks. These are optional and not required for the MVP integration.
 
 ---
 
@@ -595,19 +599,14 @@ Venue credentials are provisioned via the Foxify secrets manager and injected at
 | Venue downtime | Fallback to safe fail, alerting via webhook |
 | Data tampering | Append-only audit log, explicit export events |
 
-### 9.6 Compliance Scope
-Atticus does not perform KYC/AML, custody, or settlement. Those remain the responsibility of Foxify or partner infrastructure.
-
 ---
 
 ## 10. Observability and Operations
 
 ### 10.1 Logging
 - Audit log: `logs/audit.log` (JSONL)
+- Liquidity state: `logs/liquidity-state.json`
 - Console logs via Fastify logger and `console.log`
-Audit event taxonomy is defined in Section 4.4 and includes MTM attribution and intermittent hedging diagnostics.
-- Console logs via `console.log` and `app.log.error` in `server.ts`
-Audit event taxonomy is defined in Section 4.4 and includes MTM attribution and intermittent hedging diagnostics.
 
 ### 10.2 Metrics
 MVP uses audit logs as the primary telemetry source. Production hardening includes a metrics exporter (Prometheus/OpenTelemetry) and SLO dashboards.
@@ -623,7 +622,7 @@ Webhook alerts via `ALERT_WEBHOOK_URL` are triggered in the control loop.
 ## 11. Deployment and Infrastructure
 
 ### 11.1 Runtime
-- Node.js LTS (current toolchain is TypeScript/ES modules)
+- Node.js 20.19.1+ (pinned via `.nvmrc` and `package.json` engines)
 - Single-instance MVP deployment with file-based state
 - Dockerfile and docker-compose supported
 
@@ -632,22 +631,24 @@ From `.env.example`:
 ```bash
 PORT=8000
 HOST=0.0.0.0
-DERIBIT_ENV=testnet
+DERIBIT_ENV=live
 DERIBIT_PAPER=true
 ALLOW_DERIBIT_PRIVATE_MTM=false
-QUOTE_CACHE_TTL_MS=4000
+QUOTE_CACHE_TTL_MS=60000
 QUOTE_CACHE_STALE_MS=20000
 QUOTE_CACHE_HARD_MS=120000
+MTM_INTERVAL_MS=120000
+LOOP_INTERVAL_MS=300000
 AUDIT_LOG_PATH=./logs/audit.log
 RISK_CONTROLS_PATH=./configs/risk_controls.json
 ```
 Additional runtime env used in code:
-- `LOOP_INTERVAL_MS`, `MTM_INTERVAL_MS`, `APP_MODE`, `FOXIFY_APPROVED`, `ACCOUNTS_CONFIG_PATH`
+- `APP_MODE`, `FOXIFY_APPROVED`, `ACCOUNTS_CONFIG_PATH`
 
 Sensitive credential variables are provisioned by the Foxify deployment environment (secrets manager or equivalent) and are intentionally omitted here. Bybit pricing uses public endpoints unless authenticated execution is explicitly enabled.
 
 ### 11.3 Scaling Strategy
-The API is designed to be stateless at the request boundary. Scaling to multiple instances requires an external database for coverages, audit logs, and hedge ledger persistence.
+The API is designed to be stateless at the request boundary. Scaling to multiple instances requires an external database for coverages, audit logs, hedge ledger persistence, and liquidity state.
 
 ### 11.4 Disaster Recovery
 For MVP, recovery is achieved by reloading file-based snapshots. Production hardening should include scheduled backups and replication of audit logs.
@@ -667,17 +668,14 @@ npm run test
 
 ### 12.2 Operational Readiness Scripts
 The integration pack includes shell-based readiness scripts (require `jq`):
-- `run_phase1_4_tests.sh`: Phase 1-4 smoke test. Validates `coverage_activated`, pass-through events, intermittent selection (live), and net exposure hedge actions.
-- `run_intermittent_tests.sh`: Exercises intermittent hedging selection with optional exposures; inspects `intermittent_hedge_eval`, `hedge_action_skipped`, and `hedge_order` logs.
-- `run_phase3_readiness.sh`: Audits MTM and coverage ratio health, highlights `close_blocked`, `mtm_credit`, `mtm_position`, and `demo_credit` events.
-- `run_phase3_tests.sh`: Applies Phase 3 flags (shadow/live), runs readiness and intermittent tests, and restores config on exit.
+- `run_phase1_4_tests.sh`
+- `run_intermittent_tests.sh`
+- `run_phase3_readiness.sh`
+- `run_phase3_tests.sh`
 
 These scripts are intended for demo or staging environments and use `/admin/reset` where applicable.
 
-### 12.3 Integration and E2E Tests
-Planned for production hardening. The current focus is deterministic unit tests for risk and pricing logic.
-
-### 12.4 Manual QA
+### 12.3 Manual QA
 Paper mode allows safe validation of quote and execution flows without live trading.
 
 ---

@@ -134,35 +134,32 @@ For $30k premium scenario:
 ### 1.3 TIER VALIDATION LOGIC
 
 **What it does:** Enforces tier-specific constraints  
-**Function:** Blocks unsupported scenarios (Bronze calls, excess leverage)  
+**Function:** Blocks unsupported scenarios (excess leverage)  
 **Location:** `services/api/src/server.ts` (early in handler, before pricing)
 
 **How to find it:**
 ```bash
-grep -n "option_type_not_supported\|leverage_exceeded\|Bronze.*call" services/api/src/server.ts
+grep -n "leverage_exceeded\|max_leverage_by_tier" services/api/src/server.ts
 ```
 
 **Logic flow:**
 
 text
 1. Determine option type: side="short" → call, side="long" → put
-2. If Bronze tier + call → REJECT immediately
-3. Check leverage against tier limits
-4. If leverage > max → REJECT with suggestions
-5. Continue to pricing
+2. Check leverage against tier limits
+3. If leverage > max → REJECT with suggestions
+4. Continue to pricing
 
 **Code snippet (search for this pattern):**
 
 ```typescript
-// Pattern to search for:
 const optionType = side === "long" ? "put" : "call";
-
-if (tierName === "Pro (Bronze)" && optionType === "call") {
-  return res.status(400).json({
-    status: "error",
-    error: "option_type_not_supported",
-    message: "Bronze tier supports put protection (long positions) only"
-  });
+const tierLeverageLimits = riskControls.max_leverage_by_tier?.[tierName];
+if (tierLeverageLimits) {
+  const maxLeverageForOption = tierLeverageLimits[optionType];
+  if (Number.isFinite(maxLeverageForOption) && leverage > maxLeverageForOption) {
+    // reject with leverage_exceeded
+  }
 }
 ```
 
@@ -171,19 +168,18 @@ if (tierName === "Pro (Bronze)" && optionType === "call") {
 text
 ┌──────────────┐
 │ User Request │
-│ Bronze tier  │
-│ Short (call) │
 └──────┬───────┘
        │
        ▼
-   Is Bronze?     YES
-       │          ───▶ Is call? ───▶ YES ───▶ ❌ REJECT
-       │                   │
-       NO                  NO
-       │                   │
-       ▼                   ▼
-   Continue            Continue
-   to pricing          to pricing
+ Determine option type
+       │
+       ▼
+ Check leverage limits
+       │
+       ├── Exceeds max ──▶ ❌ REJECT
+       │
+       ▼
+ Continue to pricing
 
 ### 1.4 CACHE SYSTEM
 
@@ -259,10 +255,10 @@ Request 1                Request 2 (identical)
 ```json
 {
   "max_leverage_by_tier": {
-    "Pro (Bronze)": { "put": 10, "call": 0 },
-    "Pro (Silver)": { "put": 20, "call": 20 },
-    "Pro (Gold)": { "put": 20, "call": 20 },
-    "Pro (Platinum)": { "put": 20, "call": 20 }
+    "Pro (Bronze)": { "put": 10, "call": 10 },
+    "Pro (Silver)": { "put": 10, "call": 10 },
+    "Pro (Gold)": { "put": 10, "call": 10 },
+    "Pro (Platinum)": { "put": 10, "call": 10 }
   },
   "tier_premium_caps": {
     "Pro (Bronze)": { "2x": { "put": 0.02 }, "4x": { "put": 0.04 } },
@@ -456,7 +452,7 @@ Expected:
 - Second identical request: <1 second (cached)
 - Response: status: "pass_through", hedgeSize: "1.0000"
 
-**Test 2: Bronze Call Rejection**
+**Test 2: Bronze Call Quote (allowed)**
 ```bash
 curl -X POST http://localhost:4100/put/quote \
   -H "Content-Type: application/json" \
@@ -477,7 +473,7 @@ curl -X POST http://localhost:4100/put/quote \
 Expected:
 
 - Response time: <500ms (instant validation)
-- Response: status: "error", error: "option_type_not_supported"
+- Response: status "ok", "pass_through", or "premium_floor" depending on market conditions
 
 **Test 3: Monitor Logs**
 ```bash
@@ -486,7 +482,6 @@ tail -f logs/audit.log
 
 Look for:
 
-- bronze_call_not_supported events
 - premium_pass_through events
 - Any error events
 
@@ -549,7 +544,7 @@ text
             ▼                             ▼
     ┌──────────────┐            ┌─────────────────┐
     │ Return       │            │ Tier Validation │
-    │ cached (2ms) │            │ Bronze + call?  │
+    │ cached (2ms) │            │ Leverage check  │
     └──────────────┘            └────────┬────────┘
                                          │
                                     ┌────┴────┐

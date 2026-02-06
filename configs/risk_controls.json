@@ -51,11 +51,11 @@
   },
   "pass_through_cap_by_tier": {
     "Pro (Bronze)": {
-      "1": 4.0,
-      "2": 3.5,
-      "3": 3.0,
-      "5": 2.5,
-      "10": 2.0
+      "1": 6.0,
+      "2": 5.0,
+      "3": 4.0,
+      "5": 3.5,
+      "10": 3.0
     },
     "Pro (Silver)": {
       "1": 6.0,
@@ -82,7 +82,7 @@
   "max_leverage_by_tier": {
     "Pro (Bronze)": {
       "put": 10,
-      "call": 0
+      "call": 10
     },
     "Pro (Silver)": {
       "put": 10,
@@ -99,9 +99,58 @@
   },
   "subsidy_daily_cap_usdc": 500,
   "subsidy_account_daily_cap_usdc": 100,
+  "hedge_action_cooldown_ms": 600000,
+  "min_hedge_notional_usdc": 1000,
+  "net_exposure_min_notional_usdc": 2000,
+  "net_exposure_cooldown_ms": 600000,
+  "net_exposure_budget_guard_enabled": true,
+  "net_exposure_min_budget_usdc": 1000,
+  "net_exposure_force_coverage_id": true,
+  "slippage_tracking_enabled": true,
+  "slippage_guard_enabled": true,
+  "slippage_soft_pct": 0.15,
+  "slippage_soft_usdc": 100,
+  "slippage_hard_pct": 0.5,
+  "slippage_hard_usdc": 500,
+  "slippage_reject_hard": false,
+  "slippage_adjust_subsidy_enabled": true,
+  "slippage_subsidy_cap_usdc": 500,
+  "estimate_premium_on_missing": true,
+  "loop_use_mtm_buffer": true,
+  "loop_mtm_max_age_ms": 900000,
+  "loop_block_on_stale_mtm": true,
+  "loop_stale_mtm_cooldown_ms": 900000,
+  "loop_enable_decrease": true,
+  "loop_require_notional_usdc": false,
+  "loop_accounting_enabled": true,
+  "net_exposure_perp_accounting_enabled": true,
+  "enable_hedge_reduction": true,
   "ctc_max_snapshot_age_ms": 10000,
   "ctc_price_buffer_pct": 0.02,
   "enable_premium_pass_through": true,
   "require_user_opt_in_for_pass_through": false,
-  "pass_through_min_notification_ratio": 1.5
+  "pass_through_min_notification_ratio": 1.5,
+  "pass_through_allow_uncapped_bronze": true,
+  "pass_through_uncapped_max_ratio": 1000,
+  "phase3_rollout_enabled": true,
+  "phase3_safety_guard_enabled": true,
+  "intermittent_analytics_enabled": true,
+  "intermittent_selection_shadow_enabled": true,
+  "intermittent_selection_live_enabled": false,
+  "intermittent_selection_size_tolerance_pct": 0.1,
+  "intermittent_profit_threshold_enabled": true,
+  "intermittent_profit_enforce_override": true,
+  "intermittent_profit_min_improvement_usdc": 20,
+  "intermittent_profit_min_improvement_ratio": 1.1,
+  "intermittent_profit_critical_buffer_pct": 0.02,
+  "fee_iv_regime_thresholds": {
+    "low": 0.5,
+    "high": 0.8
+  },
+  "dynamic_cap_enabled": true,
+  "dynamic_cap_max_uplift_pct": 0.25,
+  "dynamic_cap_liquidity_ratio_low": 1.0,
+  "dynamic_cap_liquidity_ratio_high": 1.5,
+  "dynamic_cap_iv_uplift_pct_normal": 0.1,
+  "dynamic_cap_iv_uplift_pct_high": 0.25
 }

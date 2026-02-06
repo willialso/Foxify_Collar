@@ -2,6 +2,9 @@
   "name": "foxify_collar",
   "private": true,
   "version": "0.1.0",
+  "engines": {
+    "node": "20.19.1"
+  },
   "workspaces": [
     "apps/*",
     "services/*",

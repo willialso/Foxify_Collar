@@ -379,8 +379,7 @@ Behavior notes:
 - Spread/slippage thresholds from `risk_controls.json`.
 - Bronze tier supports put and call protection when premium-floor constraints are satisfied.
 - Premium pass-through can be enabled per request (`allowPremiumPassThrough`) and gated by tier/leverage caps; responses may return `pass_through`, `pass_through_capped`, or `premium_floor` status variants.
-- Responses are cached for all status types using fuzzy buckets; cache hit/miss logging includes a live hit-rate.
-- Dual-venue pricing uses a hybrid fast path (Bybit may respond first); Deribit comparison is logged asynchronously via `hybrid_comparison`.
+- Dual-venue pricing uses a hybrid fast path (Bybit may respond first).
 - All responses are cached and logged with a hit-rate indicator.
 
 Status variants (observed):
@@ -605,8 +604,6 @@ Atticus does not perform KYC/AML, custody, or settlement. Those remain the respo
 ### 10.1 Logging
 - Audit log: `logs/audit.log` (JSONL)
 - Console logs via Fastify logger and `console.log`
-Audit event taxonomy is defined in Section 4.4 and includes MTM attribution and intermittent hedging diagnostics.
-- Console logs via `console.log` and `app.log.error` in `server.ts`
 Audit event taxonomy is defined in Section 4.4 and includes MTM attribution and intermittent hedging diagnostics.
 
 ### 10.2 Metrics
