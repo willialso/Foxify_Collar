@@ -3179,6 +3179,13 @@ app.post("/deribit/order", async (req) => {
     });
     await saveCoverageLedger();
   }
+  const premiumForAudit = premiumUsdcFromOrder ?? estimatedPremiumUsdc ?? body.premiumUsdc ?? null;
+  const cashflowUsdc =
+    premiumForAudit !== null && premiumForAudit !== undefined
+      ? String(body.side).toLowerCase() === "sell"
+        ? -Number(premiumForAudit)
+        : Number(premiumForAudit)
+      : null;
   await audit("hedge_order", {
     instrument: body.instrument,
     side: body.side,
@@ -3192,6 +3199,7 @@ app.post("/deribit/order", async (req) => {
     fillPrice,
     premiumUsdc: premiumUsdcFromOrder ?? body.premiumUsdc ?? null,
     estimatedPremiumUsdc,
+    cashflowUsdc,
     feeUsdc: body.feeUsdc ?? null,
     subsidyUsdc: effectiveSubsidyUsdc || null,
     slippageUsdc,
@@ -6535,6 +6543,9 @@ app.post("/put/auto-renew", async (req) => {
     },
     orders: { buyOption }
   };
+  const renewPremiumValueRaw = renewPremiumUsdc ?? effectivePremiumUsdc.toFixed(2);
+  const renewPremiumValue = Number(renewPremiumValueRaw);
+  const renewCashflowUsdc = Number.isFinite(renewPremiumValue) ? renewPremiumValue : null;
   await audit("hedge_order", {
     instrument: optionInstrument,
     side: "buy",
@@ -6546,6 +6557,7 @@ app.post("/put/auto-renew", async (req) => {
     status: renewStatus || "submitted",
     fillPrice: renewFill,
     premiumUsdc: renewPremiumUsdc ?? effectivePremiumUsdc.toFixed(2),
+    cashflowUsdc: renewCashflowUsdc,
     feeUsdc,
     subsidyUsdc: subsidyUsdc.toFixed(2),
     reason: renewReason,
@@ -7251,6 +7263,13 @@ app.post("/loop/tick", async (req) => {
           estimatedPremiumUsdc = null;
         }
       }
+      const loopPremiumForAudit = executedPremiumUsdc ?? estimatedPremiumUsdc;
+      const loopCashflowUsdc =
+        loopPremiumForAudit !== null && loopPremiumForAudit !== undefined
+          ? decision.recommendedSide === "sell"
+            ? -Number(loopPremiumForAudit)
+            : Number(loopPremiumForAudit)
+          : null;
       await audit("hedge_order", {
         instrument: executionInstrument,
         side: decision.recommendedSide,
@@ -7262,6 +7281,7 @@ app.post("/loop/tick", async (req) => {
         positionSide: inferredPositionSide,
         premiumUsdc: executedPremiumUsdc ?? null,
         estimatedPremiumUsdc,
+        cashflowUsdc: loopCashflowUsdc,
         fillPrice: fillPrice ?? null,
         venue: hedgeVenue
       });
@@ -7460,6 +7480,7 @@ app.post("/loop/tick", async (req) => {
           positionSide: inferredPositionSide,
           premiumUsdc: signedPremiumUsdc ?? null,
           estimatedPremiumUsdc: estimatedPremiumUsdc ?? null,
+          cashflowUsdc: signedPremiumUsdc ?? null,
           fillPrice: fillPrice ?? null,
           venue: hedgeVenue
         });
