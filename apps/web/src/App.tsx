@@ -1771,7 +1771,6 @@ export function App() {
                     {pricingStatusLabel && (
                       <span className="vol-status">{pricingStatusLabel}</span>
                     )}
-                    <strong className="fee-amount">{feeDisplayLabel}</strong>
                     {!isFetchingQuote && (
                       <button
                         className="btn btn-secondary quote-refresh"
@@ -1781,6 +1780,7 @@ export function App() {
                         {previewLoading ? "Refreshing..." : "Refresh"}
                       </button>
                     )}
+                    <strong className="fee-amount">{feeDisplayLabel}</strong>
                   </div>
                 </div>
               </div>
