@@ -11,6 +11,8 @@ type AuditSummary = {
   liquidity?: {
     liquidityBalanceUsdc: number;
     hedgeSpendUsdc: number;
+    coverageHedgeSpendUsdc?: number;
+    netHedgeSpendUsdc?: number;
     hedgeMarginUsdc: number;
     revenueUsdc: number;
     profitUsdc: number;
@@ -60,6 +62,7 @@ export function AuditDashboard({
   const [entries, setEntries] = useState<AuditEntry[]>(
     (initialEntries as AuditEntry[]) ?? []
   );
+  const [activeCoverageCount, setActiveCoverageCount] = useState<number | null>(null);
   const [coverageFilter, setCoverageFilter] = useState<string | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [resetBusy, setResetBusy] = useState(false);
@@ -80,6 +83,18 @@ export function AuditDashboard({
       console.log(
         `✓ Loaded ${entriesData.count} CEO-relevant events (${entriesData.totalEvents || 0} total)`
       );
+    }
+    try {
+      const coverageRes = await fetch(`${API_BASE}/coverage/active?accountId=demo`);
+      if (coverageRes.ok) {
+        const coverageData = await coverageRes.json();
+        const count = Array.isArray(coverageData?.coverages) ? coverageData.coverages.length : 0;
+        setActiveCoverageCount(count);
+      } else {
+        setActiveCoverageCount(null);
+      }
+    } catch {
+      setActiveCoverageCount(null);
     }
   }, []);
 
@@ -264,11 +279,11 @@ export function AuditDashboard({
     return sum + Number(totalFee || 0);
   }, 0);
   const stats = {
-    coverageCount: summary.totals?.coverage_activated || 0,
+    coverageCount: activeCoverageCount ?? summary.totals?.coverage_activated || 0,
     hedgeCount: summary.totals?.hedge_action || 0,
     liquidity: liquidity?.liquidityBalanceUsdc ?? 0,
     revenue: liquidity?.revenueUsdc ?? 0,
-    coverageSpend: perUserHedgeCost ?? 0,
+    coverageSpend: liquidity?.coverageHedgeSpendUsdc ?? perUserHedgeCost ?? 0,
     mtmExposure
   };
   const mtmClass =
