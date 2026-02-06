@@ -61,9 +61,8 @@ export function AuditDashboard({
     (initialEntries as AuditEntry[]) ?? []
   );
   const [coverageFilter, setCoverageFilter] = useState<string | null>(null);
-  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(true);
   const [resetBusy, setResetBusy] = useState(false);
-  const [showNetExposure, setShowNetExposure] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showGlossary, setShowGlossary] = useState(false);
   const [showHedgeOrdersOnly, setShowHedgeOrdersOnly] = useState(true);
@@ -114,20 +113,17 @@ export function AuditDashboard({
 
   const liquidity = summary.liquidity;
   const profitability = summary.profitability;
+  const mtmExposure = profitability?.unrealizedHedgePnlUsdc ?? profitability?.hedgeMtmUsdc ?? 0;
   const stats = {
     coverageCount: summary.totals?.coverage_activated || 0,
     hedgeCount: summary.totals?.hedge_action || 0,
     liquidity: liquidity?.liquidityBalanceUsdc ?? 0,
     revenue: liquidity?.revenueUsdc ?? 0,
-    hedgeSpend: liquidity?.hedgeSpendUsdc ?? 0,
-    projectedProfit:
-      profitability?.expectedProfitUsdc ?? profitability?.unrealizedHedgePnlUsdc ?? 0,
-    netProfit: profitability?.netProfitUsdc ?? 0
+    coverageSpend: perUserHedgeCost ?? 0,
+    mtmExposure
   };
-  const projectedClass =
-    stats.projectedProfit >= 0 ? "audit-metric-value-positive" : "audit-metric-value-warn";
-  const netProfitClass =
-    stats.netProfit >= 0 ? "audit-metric-value-positive" : "audit-metric-value-negative";
+  const mtmClass =
+    stats.mtmExposure >= 0 ? "audit-metric-value-positive" : "audit-metric-value-warn";
   const baseColumnWidths = [
     "80px",
     "120px",
@@ -190,12 +186,10 @@ export function AuditDashboard({
     }
     return false;
   };
-  const baseEntries = showHedgeOrdersOnly
-    ? visibleEntries.filter((entry) => entry.event === "hedge_order")
-    : visibleEntries;
-  const scopedEntries = showNetExposure
-    ? baseEntries
-    : baseEntries.filter((entry) => !isNetExposure(entry));
+  const baseEntries = visibleEntries.filter((entry) => !isNetExposure(entry));
+  const scopedEntries = showHedgeOrdersOnly
+    ? baseEntries.filter((entry) => entry.event === "hedge_order")
+    : baseEntries;
   const filteredEntries = coverageFilter
     ? scopedEntries.filter((entry) => String(entry.payload?.coverageId || "") === coverageFilter)
     : scopedEntries;
@@ -262,6 +256,7 @@ export function AuditDashboard({
     return { asset: "", expiryTag: "", strike: null, optionType: "" };
   };
   const hedgeOrders = scopedEntries.filter((entry) => entry.event === "hedge_order");
+  const coverageHedgeOrders = baseEntries.filter((entry) => entry.event === "hedge_order");
   const coverageEntries = scopedEntries.filter((entry) => entry.event === "coverage_activated");
   const sumPremium = (list: AuditEntry[]) =>
     list.reduce((sum, entry) => {
@@ -271,7 +266,7 @@ export function AuditDashboard({
       const resolved = premium ?? estimated;
       return sum + (resolved !== null && resolved !== undefined ? Number(resolved) : 0);
     }, 0);
-  const perUserHedgeCost = sumPremium(hedgeOrders.filter((entry) => !isNetExposure(entry)));
+  const perUserHedgeCost = sumPremium(coverageHedgeOrders);
   const poolHedgeCost = sumPremium(hedgeOrders.filter((entry) => isNetExposure(entry)));
   const feeCollected = coverageEntries.reduce((sum, entry) => {
     const payload = entry.payload || {};
@@ -315,28 +310,6 @@ export function AuditDashboard({
             </div>
 
             <div className="audit-metric">
-              <span className="audit-metric-label">Hedge Actions</span>
-              <span className="audit-metric-value">{stats.hedgeCount || 0}</span>
-              <span className="audit-metric-sub">executed (24h)</span>
-            </div>
-
-            <div className="audit-metric">
-              <span className="audit-metric-label">Available Reserves</span>
-              <span className="audit-metric-value audit-metric-value-blue">
-                ${(stats.liquidity || 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
-              </span>
-              <span className="audit-metric-sub">capital available</span>
-            </div>
-
-            <div className="audit-metric">
-              <span className="audit-metric-label">Projected Profit</span>
-              <span className={`audit-metric-value ${projectedClass}`}>
-                ${formatCsvMoney(Number(stats.projectedProfit || 0))}
-              </span>
-              <span className="audit-metric-sub">booked + MTM</span>
-            </div>
-
-            <div className="audit-metric">
               <span className="audit-metric-label">Premium Collected</span>
               <span className="audit-metric-value audit-metric-value-positive">
                 ${formatCsvMoney(Number(stats.revenue || 0))}
@@ -345,35 +318,45 @@ export function AuditDashboard({
             </div>
 
             <div className="audit-metric">
-              <span className="audit-metric-label">Hedging Spend</span>
+              <span className="audit-metric-label">Coverage Spend</span>
               <span className="audit-metric-value audit-metric-value-warn">
-                ${formatCsvMoney(Number(stats.hedgeSpend || 0))}
+                ${formatCsvMoney(Number(stats.coverageSpend || 0))}
               </span>
-              <span className="audit-metric-sub">premiums paid</span>
+              <span className="audit-metric-sub">protection hedges</span>
             </div>
 
             <div className="audit-metric">
               <span className="audit-metric-label">Protocol Margin</span>
               <span
                 className={`audit-metric-value ${
-                  stats.revenue - stats.hedgeSpend >= 0
+                  stats.revenue - stats.coverageSpend >= 0
                     ? "audit-metric-value-positive"
                     : "audit-metric-value-warn"
                 }`}
               >
-                ${formatCsvMoney(Number(stats.revenue - stats.hedgeSpend))}
+                ${formatCsvMoney(Number(stats.revenue - stats.coverageSpend))}
               </span>
               <span className="audit-metric-sub">
-                {(stats.revenue - stats.hedgeSpend) >= 0 ? "operating profit" : "coverage cost"}
+                {(stats.revenue - stats.coverageSpend) >= 0
+                  ? "operating profit"
+                  : "coverage cost"}
               </span>
             </div>
 
             <div className="audit-metric">
-              <span className="audit-metric-label">Net Profit</span>
-              <span className={`audit-metric-value ${netProfitClass}`}>
-                ${formatCsvMoney(Number(stats.netProfit || 0))}
+              <span className="audit-metric-label">MTM Exposure</span>
+              <span className={`audit-metric-value ${mtmClass}`}>
+                ${formatCsvMoney(Number(stats.mtmExposure || 0))}
               </span>
-              <span className="audit-metric-sub">after hedging & subsidy</span>
+              <span className="audit-metric-sub">hedge MTM exposure</span>
+            </div>
+
+            <div className="audit-metric">
+              <span className="audit-metric-label">Available Reserves</span>
+              <span className="audit-metric-value audit-metric-value-blue">
+                ${(stats.liquidity || 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              </span>
+              <span className="audit-metric-sub">capital available</span>
             </div>
           </div>
         </div>
@@ -408,15 +391,6 @@ export function AuditDashboard({
             >
               {autoRefresh ? "Auto Refresh: On" : "Auto Refresh: Off"}
             </button>
-            <button className="btn danger" onClick={resetAllData} disabled={resetBusy}>
-              {resetBusy ? "Clearing..." : "Clear History"}
-            </button>
-            <button
-              className={showNetExposure ? "btn active" : "btn"}
-              onClick={() => setShowNetExposure((prev) => !prev)}
-            >
-              {showNetExposure ? "Net Exposure: On" : "Net Exposure: Off"}
-            </button>
             <button
               className={showHedgeOrdersOnly ? "btn active" : "btn"}
               onClick={() => setShowHedgeOrdersOnly((prev) => !prev)}
@@ -429,7 +403,9 @@ export function AuditDashboard({
             >
               {showAdvanced ? "Advanced: On" : "Advanced: Off"}
             </button>
-            <span className="muted">Showing latest {MAX_AUDIT_ROWS}</span>
+            <button className="btn danger" onClick={resetAllData} disabled={resetBusy}>
+              {resetBusy ? "Clearing..." : "Clear History"}
+            </button>
           </div>
         </div>
         <div className="audit-table-wrap">
@@ -667,6 +643,9 @@ export function AuditDashboard({
               </div>
             );
           })}
+          </div>
+          <div className="muted audit-footer-note">
+            Showing latest {MAX_AUDIT_ROWS} entries
           </div>
         </div>
       </div>
