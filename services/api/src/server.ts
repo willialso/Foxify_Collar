@@ -5093,6 +5093,16 @@ app.post("/put/quote", async (req) => {
   const passThroughCapped = passThroughCapInfo.maxFee
     ? passThroughFee.gt(passThroughCapInfo.maxFee)
     : false;
+  const uncappedBronzeEnabled = riskControls.pass_through_allow_uncapped_bronze === true;
+  const uncappedMaxRatioRaw = riskControls.pass_through_uncapped_max_ratio ?? 0;
+  const uncappedMaxRatio =
+    Number.isFinite(uncappedMaxRatioRaw) && uncappedMaxRatioRaw > 0
+      ? new Decimal(uncappedMaxRatioRaw)
+      : null;
+  const allowBronzeCapOverride =
+    uncappedBronzeEnabled &&
+    tierName === "Pro (Bronze)" &&
+    (uncappedMaxRatio ? premiumFloor.ratio.lte(uncappedMaxRatio) : true);
   if (!premiumFloor.breached) {
     if (passThroughFee.gt(baseFeeUsdc)) {
       feeUsdc = passThroughFee;
@@ -5123,6 +5133,101 @@ app.post("/put/quote", async (req) => {
       quote.strike.toFixed(0),
       optionSymbol
     );
+    if (allowBronzeCapOverride) {
+      const venueInfo = attachVenueMetadata({
+        selectionSnapshot: bestSnapshots
+          ? {
+              expiryTag: quote.expiryTag,
+              targetDays: quote.targetDays,
+              strike: quote.strike.toFixed(0),
+              books: bestSnapshots
+            }
+          : null,
+        hedgeSize: hedgeSizeForQuote.toFixed(4)
+      } as Record<string, unknown>);
+      await audit("premium_pass_through", {
+        type: "cap_override",
+        baseFee: baseFeeUsdc.toFixed(2),
+        allInPremium: allInPremium.toFixed(2),
+        capMultiplier: passThroughCapInfo.capMultiplier
+          ? formatCapMultiplier(passThroughCapInfo)
+          : null,
+        ratio: premiumFloor.ratio.toFixed(4),
+        tierName,
+        leverage,
+        optionType,
+        instrument: optionInstrument,
+        optionVenue: (venueInfo as any).optionVenue ?? null,
+        venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
+      });
+      const explanation =
+        `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
+        `of ${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}×. ` +
+        `Charging the full hedge premium to keep protection active.`;
+      return cacheAndReturn({
+        status: "pass_through",
+        expiryTag: quote.expiryTag || "",
+        targetDays: quote.targetDays || 0,
+        optionType,
+        strike: quote.strike.toFixed(0),
+        instrument: optionInstrument,
+        premiumUsdc: quote.premiumTotal.toFixed(2),
+        premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
+        hedgeSize: hedgeSizeForQuote.toFixed(4),
+        sizingMethod: body.optionDelta ? "delta" : "notional",
+        bufferTargetPct: bufferTargetPctCapped.toFixed(4),
+        markIv: feeIv.raw,
+        feeUsdc: passThroughFee.toFixed(2),
+        subsidyUsdc: "0.00",
+        feeRegime: feeRegime.regime,
+        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
+        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
+        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
+        passThroughCapped: true,
+        liquidityOverride: liquidityOverrideUsed,
+        replication: replicationMeta,
+        survivalCheck: buildSurvivalCheck({
+          spotPrice,
+          drawdownFloorPct,
+          optionType,
+          strike: quote.strike,
+          hedgeSize: hedgeSizeForQuote,
+          requiredSize,
+          tolerancePct: survivalTolerance
+        }),
+        selectionSnapshot: bestSnapshots
+          ? {
+              expiryTag: quote.expiryTag,
+              targetDays: quote.targetDays,
+              strike: quote.strike.toFixed(0),
+              books: bestSnapshots
+            }
+          : null,
+        rollMultiplier: quote.rollMultiplier,
+        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+        pricing: {
+          type: "pass_through_override",
+          baseFee: baseFeeUsdc.toFixed(2),
+          hedgePremium: allInPremium.toFixed(2),
+          totalFee: passThroughFee.toFixed(2),
+          markupPct: markupPct.mul(100).toFixed(2),
+          markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4),
+          capMultiplier: passThroughCapInfo.capMultiplier
+            ? formatCapMultiplier(passThroughCapInfo, 2)
+            : "N/A",
+          explanation
+        },
+        warning: {
+          type: "premium_pass_through_override",
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4),
+          message: explanation
+        },
+        reason: "premium_floor_pass_through_override"
+      });
+    }
     const subsidyNeededFull = allInPremium.minus(cappedFee);
     if (isPremiumTier) {
       const venueInfo = attachVenueMetadata({
