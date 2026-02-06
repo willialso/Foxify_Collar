@@ -2867,7 +2867,7 @@ app.post("/deribit/order", async (req) => {
     }
     const requestedInstrument = String(body.instrument || "");
     const isPerp =
-      body.hedgeType === "perp" || requestedInstrument.toUpperCase().includes("PERPETUAL");
+      body.hedgeType === "perp" || requestedInstrument.toUpperCase().includes("PERP");
     if (!isPerp && lock.instruments.length > 0) {
       const normalized = requestedInstrument.replace(/-USDT$/, "");
       const matches =
@@ -2944,8 +2944,9 @@ app.post("/deribit/order", async (req) => {
     }
   }
   const venue = body.venue || (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
-  const inferredHedgeType =
-    body.hedgeType || (body.instrument.includes("PERPETUAL") ? "perp" : "option");
+  const instrumentHint = String(body.instrument || "").toUpperCase();
+  const instrumentIsPerp = instrumentHint.includes("PERP");
+  const inferredHedgeType = instrumentIsPerp ? "perp" : body.hedgeType || "option";
   const instrument =
     venue === "bybit" && typeof body.instrument === "string" && !body.instrument.endsWith("-USDT")
       ? `${body.instrument}-USDT`
