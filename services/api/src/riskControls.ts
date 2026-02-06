@@ -130,6 +130,8 @@ export interface RiskState {
 export interface LiquidityState {
   liquidityBalanceUsdc: number;
   hedgeSpendUsdc: number;
+  coverageHedgeSpendUsdc: number;
+  netHedgeSpendUsdc: number;
   hedgeMarginUsdc: number;
   revenueUsdc: number;
   profitUsdc: number;
@@ -271,6 +273,8 @@ let stateByTier: Record<string, RiskState> = {};
 let liquidityState: LiquidityState = {
   liquidityBalanceUsdc: DEFAULTS.initial_liquidity_usdc || 0,
   hedgeSpendUsdc: 0,
+  coverageHedgeSpendUsdc: 0,
+  netHedgeSpendUsdc: 0,
   hedgeMarginUsdc: 0,
   revenueUsdc: 0,
   profitUsdc: 0,
@@ -377,7 +381,8 @@ export function applyRiskAccounting(
   feeUsdc: number,
   premiumUsdc: number,
   notionalUsdc: number,
-  hedgeMarginUsdc = 0
+  hedgeMarginUsdc = 0,
+  hedgeCategory: "coverage" | "net" | "unknown" = "coverage"
 ): { state: RiskState; liquidityDelta: LiquidityState } {
   const state = getRiskState(tier);
   const before = { ...liquidityState };
@@ -387,6 +392,11 @@ export function applyRiskAccounting(
   const profit = feeUsdc - premiumUsdc;
   liquidityState.revenueUsdc += feeUsdc;
   liquidityState.hedgeSpendUsdc += premiumUsdc;
+  if (hedgeCategory === "coverage") {
+    liquidityState.coverageHedgeSpendUsdc += premiumUsdc;
+  } else if (hedgeCategory === "net") {
+    liquidityState.netHedgeSpendUsdc += premiumUsdc;
+  }
   liquidityState.hedgeMarginUsdc += hedgeMarginUsdc;
   liquidityState.profitUsdc += profit;
   const reinvestPct = cachedConfig?.reinvest_pct ?? DEFAULTS.reinvest_pct ?? 0;
@@ -399,6 +409,9 @@ export function applyRiskAccounting(
   const liquidityDelta = {
     liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc - before.liquidityBalanceUsdc,
     hedgeSpendUsdc: liquidityState.hedgeSpendUsdc - before.hedgeSpendUsdc,
+    coverageHedgeSpendUsdc:
+      liquidityState.coverageHedgeSpendUsdc - before.coverageHedgeSpendUsdc,
+    netHedgeSpendUsdc: liquidityState.netHedgeSpendUsdc - before.netHedgeSpendUsdc,
     hedgeMarginUsdc: liquidityState.hedgeMarginUsdc - before.hedgeMarginUsdc,
     revenueUsdc: liquidityState.revenueUsdc - before.revenueUsdc,
     profitUsdc: liquidityState.profitUsdc - before.profitUsdc,
@@ -427,6 +440,9 @@ export function recordRevenue(
   const liquidityDelta = {
     liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc - before.liquidityBalanceUsdc,
     hedgeSpendUsdc: liquidityState.hedgeSpendUsdc - before.hedgeSpendUsdc,
+    coverageHedgeSpendUsdc:
+      liquidityState.coverageHedgeSpendUsdc - before.coverageHedgeSpendUsdc,
+    netHedgeSpendUsdc: liquidityState.netHedgeSpendUsdc - before.netHedgeSpendUsdc,
     hedgeMarginUsdc: liquidityState.hedgeMarginUsdc - before.hedgeMarginUsdc,
     revenueUsdc: liquidityState.revenueUsdc - before.revenueUsdc,
     profitUsdc: liquidityState.profitUsdc - before.profitUsdc,
@@ -450,6 +466,8 @@ export function resetRiskState(): void {
   liquidityState = {
     liquidityBalanceUsdc: baseLiquidity,
     hedgeSpendUsdc: 0,
+    coverageHedgeSpendUsdc: 0,
+    netHedgeSpendUsdc: 0,
     hedgeMarginUsdc: 0,
     revenueUsdc: 0,
     profitUsdc: 0,

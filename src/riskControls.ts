@@ -119,6 +119,8 @@ export interface RiskState {
 export interface LiquidityState {
   liquidityBalanceUsdc: Decimal;
   hedgeSpendUsdc: Decimal;
+  coverageHedgeSpendUsdc: Decimal;
+  netHedgeSpendUsdc: Decimal;
   hedgeMarginUsdc: Decimal;
   revenueUsdc: Decimal;
   profitUsdc: Decimal;
@@ -250,6 +252,8 @@ let stateByTier: Record<string, RiskState> = {};
 let liquidityState: LiquidityState = {
   liquidityBalanceUsdc: new Decimal(DEFAULTS.initial_liquidity_usdc ?? 0),
   hedgeSpendUsdc: new Decimal(0),
+  coverageHedgeSpendUsdc: new Decimal(0),
+  netHedgeSpendUsdc: new Decimal(0),
   hedgeMarginUsdc: new Decimal(0),
   revenueUsdc: new Decimal(0),
   profitUsdc: new Decimal(0),
@@ -377,7 +381,8 @@ export function applyRiskAccounting(
   feeUsdc: Decimal,
   premiumUsdc: Decimal,
   notionalUsdc: Decimal,
-  hedgeMarginUsdc: Decimal = new Decimal(0)
+  hedgeMarginUsdc: Decimal = new Decimal(0),
+  hedgeCategory: "coverage" | "net" | "unknown" = "coverage"
 ): { state: RiskState; liquidityDelta: LiquidityState } {
   const state = getRiskState(tier);
   const before = { ...liquidityState };
@@ -392,6 +397,12 @@ export function applyRiskAccounting(
   const profit = fee.sub(premium);
   liquidityState.revenueUsdc = liquidityState.revenueUsdc.add(fee);
   liquidityState.hedgeSpendUsdc = liquidityState.hedgeSpendUsdc.add(premium);
+  if (hedgeCategory === "coverage") {
+    liquidityState.coverageHedgeSpendUsdc =
+      liquidityState.coverageHedgeSpendUsdc.add(premium);
+  } else if (hedgeCategory === "net") {
+    liquidityState.netHedgeSpendUsdc = liquidityState.netHedgeSpendUsdc.add(premium);
+  }
   liquidityState.hedgeMarginUsdc = liquidityState.hedgeMarginUsdc.add(hedgeMargin);
   liquidityState.profitUsdc = liquidityState.profitUsdc.add(profit);
 
@@ -410,6 +421,10 @@ export function applyRiskAccounting(
   const liquidityDelta = {
     liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc.minus(before.liquidityBalanceUsdc),
     hedgeSpendUsdc: liquidityState.hedgeSpendUsdc.minus(before.hedgeSpendUsdc),
+    coverageHedgeSpendUsdc: liquidityState.coverageHedgeSpendUsdc.minus(
+      before.coverageHedgeSpendUsdc
+    ),
+    netHedgeSpendUsdc: liquidityState.netHedgeSpendUsdc.minus(before.netHedgeSpendUsdc),
     hedgeMarginUsdc: liquidityState.hedgeMarginUsdc.minus(before.hedgeMarginUsdc),
     revenueUsdc: liquidityState.revenueUsdc.minus(before.revenueUsdc),
     profitUsdc: liquidityState.profitUsdc.minus(before.profitUsdc),
@@ -443,6 +458,10 @@ export function recordRevenue(
   const liquidityDelta = {
     liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc.minus(before.liquidityBalanceUsdc),
     hedgeSpendUsdc: liquidityState.hedgeSpendUsdc.minus(before.hedgeSpendUsdc),
+    coverageHedgeSpendUsdc: liquidityState.coverageHedgeSpendUsdc.minus(
+      before.coverageHedgeSpendUsdc
+    ),
+    netHedgeSpendUsdc: liquidityState.netHedgeSpendUsdc.minus(before.netHedgeSpendUsdc),
     hedgeMarginUsdc: liquidityState.hedgeMarginUsdc.minus(before.hedgeMarginUsdc),
     revenueUsdc: liquidityState.revenueUsdc.minus(before.revenueUsdc),
     profitUsdc: liquidityState.profitUsdc.minus(before.profitUsdc),
@@ -469,6 +488,8 @@ export function resetRiskState(): void {
   liquidityState = {
     liquidityBalanceUsdc: baseLiquidity,
     hedgeSpendUsdc: new Decimal(0),
+    coverageHedgeSpendUsdc: new Decimal(0),
+    netHedgeSpendUsdc: new Decimal(0),
     hedgeMarginUsdc: new Decimal(0),
     revenueUsdc: new Decimal(0),
     profitUsdc: new Decimal(0),
@@ -485,6 +506,8 @@ export function serializeLiquidityState(state: LiquidityState): Record<string, s
   return {
     liquidityBalanceUsdc: state.liquidityBalanceUsdc.toFixed(2),
     hedgeSpendUsdc: state.hedgeSpendUsdc.toFixed(2),
+    coverageHedgeSpendUsdc: state.coverageHedgeSpendUsdc.toFixed(2),
+    netHedgeSpendUsdc: state.netHedgeSpendUsdc.toFixed(2),
     hedgeMarginUsdc: state.hedgeMarginUsdc.toFixed(2),
     revenueUsdc: state.revenueUsdc.toFixed(2),
     profitUsdc: state.profitUsdc.toFixed(2),

@@ -648,6 +648,18 @@ function inferVenueFromInstrument(instrument?: string | null): "bybit" | "deribi
   return "deribit";
 }
 
+function isNetCoverageId(
+  coverageId?: string | null,
+  coverageIds?: Array<string> | null
+): boolean {
+  const id = coverageId ? String(coverageId) : "";
+  if (id.startsWith("net-") || id === "platform-risk") return true;
+  if (Array.isArray(coverageIds)) {
+    return coverageIds.some((entry) => entry.startsWith("net-") || entry === "platform-risk");
+  }
+  return false;
+}
+
 function parseOptionInstrument(
   instrument?: string | null
 ): { strike: number | null; optionType: "put" | "call" | null } {
@@ -3222,12 +3234,16 @@ app.post("/deribit/order", async (req) => {
         ? Number(premiumUsdcFromOrder ?? estimatedPremiumUsdc ?? body.premiumUsdc ?? 0)
         : 0;
     const feeForAccounting = body.feeRecognized ? 0 : Number(body.feeUsdc);
+    const hedgeCategory = isNetCoverageId(body.coverageId ?? null, (body as any).coverageIds ?? null)
+      ? "net"
+      : "coverage";
     const accounting = applyRiskAccounting(
       body.tierName,
       feeForAccounting,
       premiumForAccounting,
       Number(body.notionalUsdc ?? 0),
-      hedgeMarginUsdc
+      hedgeMarginUsdc,
+      hedgeCategory
     );
     await audit("liquidity_update", {
       coverageId: body.coverageId || null,
@@ -6569,7 +6585,9 @@ app.post("/put/auto-renew", async (req) => {
       tierName,
       feeUsdc,
       Number(renewPremiumUsdc ?? effectivePremiumUsdc.toFixed(2)),
-      notionalUsdc
+      notionalUsdc,
+      0,
+      "coverage"
     );
     await audit("liquidity_update", {
       coverageId: body.coverageId || null,
@@ -7293,7 +7311,9 @@ app.post("/loop/tick", async (req) => {
           body.tierName,
           0,
           Number(loopPremiumForAccounting),
-          Number(notionalUsdc)
+          Number(notionalUsdc),
+          0,
+          "coverage"
         );
         await audit("liquidity_update", {
           coverageId: body.coverageId || null,
@@ -7490,7 +7510,9 @@ app.post("/loop/tick", async (req) => {
             body.tierName,
             0,
             Number(signedPremiumUsdc),
-            Number(notionalUsdc)
+            Number(notionalUsdc),
+            0,
+            "coverage"
           );
           await audit("liquidity_update", {
             coverageId: body.coverageId || null,
