@@ -942,6 +942,12 @@ select.input {
     text-align: right;
   }
 
+.quote-refresh {
+  padding: 6px 10px;
+  font-size: 11px;
+  margin-left: 8px;
+}
+
   .input {
     width: 100%;
     text-align: left;

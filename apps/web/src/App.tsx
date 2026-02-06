@@ -662,7 +662,7 @@ export function App() {
       primary.entryPrice
     ].join("|");
   }, [level, selectedPositions, expiryDays, drawdownPct]);
-  const QUOTE_LOCK_TTL_MS = 6000;
+  const QUOTE_LOCK_TTL_MS = 60000;
   const baseFeeUsdRaw = level ? Number(level.fixed_price_usdc) : 0;
   const baseFeeUsd = Number.isFinite(baseFeeUsdRaw) ? baseFeeUsdRaw : 0;
   const perAssetFeeUsd = level
@@ -742,7 +742,8 @@ export function App() {
           side: primary.side,
           coverageId: "preview",
           targetDays: expiryDays,
-          allowPremiumPassThrough: FOXIFY_APPROVED
+          allowPremiumPassThrough: FOXIFY_APPROVED,
+          _cacheBust: true
         })
       });
       if (!res.ok) throw new Error("force_quote_failed");
@@ -1771,6 +1772,15 @@ export function App() {
                       <span className="vol-status">{pricingStatusLabel}</span>
                     )}
                     <strong className="fee-amount">{feeDisplayLabel}</strong>
+                    {!isFetchingQuote && (
+                      <button
+                        className="btn btn-secondary quote-refresh"
+                        onClick={forcePreviewQuote}
+                        disabled={previewLoading}
+                      >
+                        {previewLoading ? "Refreshing..." : "Refresh"}
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
