@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
 
 export interface RiskControlsConfig {
   risk_budget_pct_min: number;
@@ -285,19 +285,81 @@ let subsidyDailyTotal = 0;
 let subsidyByTier: Record<string, number> = {};
 let subsidyByAccount: Record<string, number> = {};
 let subsidyDateKey = dayKey();
+const LIQUIDITY_STATE_PATH = new URL("../../../logs/liquidity-state.json", import.meta.url);
+const LIQUIDITY_STATE_DIR = new URL("../../../logs/", import.meta.url);
+const LIQUIDITY_PERSIST_DEBOUNCE_MS = 250;
+let liquidityStateLoaded = false;
+let liquidityStateLoadedFromFile = false;
+let liquidityPersistTimer: ReturnType<typeof setTimeout> | null = null;
 
 function dayKey(): string {
   const now = new Date();
   return now.toISOString().slice(0, 10);
 }
 
+async function loadLiquidityState(): Promise<boolean> {
+  try {
+    const raw = await readFile(LIQUIDITY_STATE_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    const liquidity = parsed?.liquidity ?? parsed;
+    if (!liquidity || typeof liquidity !== "object") return false;
+    liquidityState = {
+      ...liquidityState,
+      liquidityBalanceUsdc: Number(liquidity.liquidityBalanceUsdc ?? liquidityState.liquidityBalanceUsdc),
+      hedgeSpendUsdc: Number(liquidity.hedgeSpendUsdc ?? liquidityState.hedgeSpendUsdc),
+      coverageHedgeSpendUsdc: Number(
+        liquidity.coverageHedgeSpendUsdc ?? liquidityState.coverageHedgeSpendUsdc
+      ),
+      netHedgeSpendUsdc: Number(liquidity.netHedgeSpendUsdc ?? liquidityState.netHedgeSpendUsdc),
+      hedgeMarginUsdc: Number(liquidity.hedgeMarginUsdc ?? liquidityState.hedgeMarginUsdc),
+      revenueUsdc: Number(liquidity.revenueUsdc ?? liquidityState.revenueUsdc),
+      profitUsdc: Number(liquidity.profitUsdc ?? liquidityState.profitUsdc),
+      reinvestUsdc: Number(liquidity.reinvestUsdc ?? liquidityState.reinvestUsdc),
+      reserveUsdc: Number(liquidity.reserveUsdc ?? liquidityState.reserveUsdc)
+    };
+    return true;
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return false;
+    console.warn("[Liquidity] Failed to load liquidity state:", error?.message ?? error);
+    return false;
+  }
+}
+
+async function ensureLiquidityStateLoaded(): Promise<void> {
+  if (liquidityStateLoaded) return;
+  liquidityStateLoaded = true;
+  liquidityStateLoadedFromFile = await loadLiquidityState();
+}
+
+async function persistLiquidityState(): Promise<void> {
+  liquidityPersistTimer = null;
+  try {
+    await mkdir(LIQUIDITY_STATE_DIR, { recursive: true });
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      liquidity: liquidityState
+    };
+    await writeFile(LIQUIDITY_STATE_PATH, JSON.stringify(payload, null, 2), "utf-8");
+  } catch (error: any) {
+    console.warn("[Liquidity] Failed to persist liquidity state:", error?.message ?? error);
+  }
+}
+
+function scheduleLiquidityPersist(): void {
+  if (liquidityPersistTimer) return;
+  liquidityPersistTimer = setTimeout(() => {
+    void persistLiquidityState();
+  }, LIQUIDITY_PERSIST_DEBOUNCE_MS);
+}
+
 export async function loadRiskControls(path: URL): Promise<RiskControlsConfig> {
-  const stat = await (await import("node:fs/promises")).stat(path);
+  const statInfo = await stat(path);
   if (cachedConfig && stat.mtimeMs === cachedConfigMtime) return cachedConfig;
   const raw = await readFile(path, "utf-8");
   cachedConfig = { ...DEFAULTS, ...JSON.parse(raw) };
-  cachedConfigMtime = stat.mtimeMs;
-  if (cachedConfig.initial_liquidity_usdc !== undefined) {
+  cachedConfigMtime = statInfo.mtimeMs;
+  await ensureLiquidityStateLoaded();
+  if (!liquidityStateLoadedFromFile && cachedConfig.initial_liquidity_usdc !== undefined) {
     liquidityState.liquidityBalanceUsdc = cachedConfig.initial_liquidity_usdc;
   }
   return cachedConfig;
@@ -418,6 +480,7 @@ export function applyRiskAccounting(
     reinvestUsdc: liquidityState.reinvestUsdc - before.reinvestUsdc,
     reserveUsdc: liquidityState.reserveUsdc - before.reserveUsdc
   };
+  scheduleLiquidityPersist();
   return { state, liquidityDelta };
 }
 
@@ -449,6 +512,7 @@ export function recordRevenue(
     reinvestUsdc: liquidityState.reinvestUsdc - before.reinvestUsdc,
     reserveUsdc: liquidityState.reserveUsdc - before.reserveUsdc
   };
+  scheduleLiquidityPersist();
   return { state, liquidityDelta };
 }
 
@@ -478,4 +542,5 @@ export function resetRiskState(): void {
   subsidyByTier = {};
   subsidyByAccount = {};
   subsidyDateKey = dayKey();
+  scheduleLiquidityPersist();
 }
