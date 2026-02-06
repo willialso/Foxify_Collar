@@ -2184,7 +2184,7 @@ function PortfolioForm({
           disabled={disabled}
         />
       </div>
-      <div className="row">
+      <div className="row row-align">
         <span>Entry</span>
         <strong>{spot ? `$${formatSpotPrice(spot)}` : "—"}</strong>
       </div>
