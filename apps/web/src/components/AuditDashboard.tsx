@@ -279,7 +279,8 @@ export function AuditDashboard({
     return sum + Number(totalFee || 0);
   }, 0);
   const stats = {
-    coverageCount: activeCoverageCount ?? summary.totals?.coverage_activated || 0,
+    coverageCount:
+      activeCoverageCount ?? (summary.totals?.coverage_activated ?? 0),
     hedgeCount: summary.totals?.hedge_action || 0,
     liquidity: liquidity?.liquidityBalanceUsdc ?? 0,
     revenue: liquidity?.revenueUsdc ?? 0,
