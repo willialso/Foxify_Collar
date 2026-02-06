@@ -1,3 +1,5 @@
+![Atticus Logo](https://i.ibb.co/KpbRyd7w/atticus-copy.png)
+
 # Atticus Platform Technical Documentation (Foxify CTO Edition)
 
 | Field | Value |
