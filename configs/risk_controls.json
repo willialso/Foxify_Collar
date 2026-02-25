@@ -42,43 +42,8 @@
     "Pro (Gold)": 2,
     "Pro (Platinum)": 3
   },
-  "pass_through_cap_by_leverage": {
-    "1": 6.0,
-    "2": 5.0,
-    "3": 4.0,
-    "5": 3.5,
-    "10": 3.0
-  },
-  "pass_through_cap_by_tier": {
-    "Pro (Bronze)": {
-      "1": 6.0,
-      "2": 5.0,
-      "3": 4.0,
-      "5": 3.5,
-      "10": 3.0
-    },
-    "Pro (Silver)": {
-      "1": 6.0,
-      "2": 5.0,
-      "3": 4.0,
-      "5": 3.5,
-      "10": 3.0
-    },
-    "Pro (Gold)": {
-      "1": 8.0,
-      "2": 6.5,
-      "3": 5.5,
-      "5": 4.5,
-      "10": 4.0
-    },
-    "Pro (Platinum)": {
-      "1": 10.0,
-      "2": 8.0,
-      "3": 7.0,
-      "5": 6.0,
-      "10": 5.0
-    }
-  },
+  "pass_through_cap_by_leverage": {},
+  "pass_through_cap_by_tier": {},
   "max_leverage_by_tier": {
     "Pro (Bronze)": {
       "put": 10,

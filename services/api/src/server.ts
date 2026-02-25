@@ -1337,18 +1337,8 @@ function normalizeLeverage(rawLeverage?: number): { ok: boolean; value: number; 
 }
 
 function resolvePassThroughCapMultiplier(leverage?: number, tierName?: string): Decimal | null {
-  if (tierName && riskControls.pass_through_cap_by_tier) {
-    const tierCaps = riskControls.pass_through_cap_by_tier[tierName];
-    if (tierCaps) {
-      const selected = findLeverageMultiplier(leverage, tierCaps);
-      if (Number.isFinite(selected) && selected && selected > 0) {
-        return new Decimal(selected);
-      }
-    }
-  }
-  const selected = findLeverageMultiplier(leverage, riskControls.pass_through_cap_by_leverage);
-  if (!Number.isFinite(selected) || !selected || selected <= 0) return null;
-  return new Decimal(selected);
+  // Caps intentionally disabled: pass-through is uncapped by policy.
+  return null;
 }
 
 function resolveDynamicCapMultiplier(ivScaled: number, liquidity: LiquidityState): Decimal {
@@ -4289,13 +4279,13 @@ app.post("/put/quote", async (req) => {
             baseFee: baseFeeUsdc.toFixed(2),
             hedgePremium: allInPremium.toFixed(2),
             totalFee: passThroughFee.toFixed(2),
-            markupPct: markupPct.mul(100).toFixed(2),
-            markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
             ratio,
             threshold,
+            markupPct: markupPct.mul(100).toFixed(2),
+            markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
             explanation:
               `Market volatility requires premium ${premiumFloor.ratio.toFixed(2)}× base fee. ` +
-              `Charging hedge premium plus markup for full protection.`
+              `Charging premium + markup = $${passThroughFee.toFixed(2)} for full protection.`
           },
           warning: shouldNotify
             ? {
@@ -4304,7 +4294,7 @@ app.post("/put/quote", async (req) => {
                 threshold,
                 message:
                   `Premium is ${premiumFloor.ratio.toFixed(2)}× the base fee due to market conditions. ` +
-                  `You'll be charged the actual hedge cost of $${allInPremium.toFixed(2)}.`
+                  `You'll be charged premium + markup = $${passThroughFee.toFixed(2)}.`
               }
             : undefined
         });
@@ -4813,6 +4803,57 @@ app.post("/put/quote", async (req) => {
             : `Premium ${premiumFloor.ratio.toFixed(2)}× base fee cannot be accommodated.`
         },
         suggestions: dynamicSuggestions
+      });
+    }
+
+    if (canPassThrough && passThroughFee.gt(feeUsdc)) {
+      const optionSymbol = optionType === "put" ? "P" : "C";
+      const optionInstrument = buildVenueInstrumentName(
+        asset,
+        bestCandidate.expiryTag,
+        bestCandidate.strike.toFixed(0),
+        optionSymbol
+      );
+      return cacheAndReturn({
+        status: "pass_through",
+        expiryTag: bestCandidate.expiryTag,
+        targetDays: bestCandidate.targetDays,
+        optionType,
+        strike: bestCandidate.strike.toFixed(0),
+        instrument: optionInstrument,
+        premiumUsdc: premiumTotal.toFixed(2),
+        premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
+        hedgeSize: requiredSize.toFixed(4),
+        sizingMethod: body.optionDelta ? "delta" : "notional",
+        bufferTargetPct: "0.00",
+        markIv: feeIv.raw,
+        subsidyUsdc: "0.00",
+        baseFeeUsdc: baseFeeUsdc.toFixed(2),
+        feeUsdc: passThroughFee.toFixed(2),
+        feeRegime: feeRegime.regime,
+        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
+        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
+        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
+          ? passThroughCapInfo.capMultiplier.toFixed(4)
+          : null,
+        passThroughCapped: false,
+        reason: "pass_through",
+        liquidityOverride: liquidityOverrideUsed,
+        replication: fallbackReplication,
+        survivalCheck,
+        selectionSnapshot: fallbackSnapshot,
+        rollMultiplier: bestCandidate.rollMultiplier,
+        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+        pricing: {
+          type: "pass_through",
+          baseFee: baseFeeUsdc.toFixed(2),
+          hedgePremium: allInPremium.toFixed(2),
+          totalFee: passThroughFee.toFixed(2),
+          markupPct: markupPct.mul(100).toFixed(2),
+          markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4)
+        }
       });
     }
 
@@ -5813,62 +5854,35 @@ app.post("/put/quote", async (req) => {
     riskControls.pass_through_min_notification_ratio ?? 1.5
   );
   const shouldNotify = premiumFloor.ratio.gte(minNotificationRatio);
-  if (premiumFloor.breached) {
-    if (canPassThrough && !passThroughCapped) {
-      response["status"] = "pass_through";
-      response["feeUsdc"] = passThroughFee.toFixed(2);
-      response["reason"] = "premium_floor_pass_through";
-      response["pricing"] = {
-        type: "pass_through",
-        baseFee: feeBase.feeUsdc.toFixed(2),
-        hedgePremium: allInPremium.toFixed(2),
-        totalFee: passThroughFee.toFixed(2),
-        markupPct: markupPct.mul(100).toFixed(2),
-        markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
-        ratio: premiumFloor.ratio.toFixed(4),
-        threshold: premiumFloor.threshold.toFixed(4)
-      };
-      response["warning"] = shouldNotify
-        ? {
-            type: "premium_pass_through",
-            ratio: premiumFloor.ratio.toFixed(4),
-            threshold: premiumFloor.threshold.toFixed(4)
-          }
-        : undefined;
-    } else if (canPassThrough && passThroughCapped && passThroughCapInfo.maxFee) {
-      response["status"] = "pass_through_capped";
-      response["feeUsdc"] = passThroughCapInfo.maxFee.toFixed(2);
-      response["reason"] = "premium_floor_pass_through_capped";
-      response["pricing"] = {
-        type: "pass_through_capped",
-        baseFee: feeBase.feeUsdc.toFixed(2),
-        hedgePremium: allInPremium.toFixed(2),
-        cappedFee: passThroughCapInfo.maxFee.toFixed(2),
-        capMultiplier: passThroughCapInfo.capMultiplier
-          ? formatCapMultiplier(passThroughCapInfo, 2)
-          : null,
-        markupPct: markupPct.mul(100).toFixed(2),
-        ratio: premiumFloor.ratio.toFixed(4),
-        threshold: premiumFloor.threshold.toFixed(4)
-      };
-      response["warning"] = shouldNotify
-        ? {
-            type: "premium_capped",
-            ratio: premiumFloor.ratio.toFixed(4),
-            threshold: premiumFloor.threshold.toFixed(4)
-          }
-        : undefined;
-    } else {
-      response["status"] = "premium_floor";
-      response["reason"] = passThroughCapped
-        ? "premium_floor_pass_through_capped"
-        : "premium_floor";
-      response["warning"] = {
-        type: "premium_floor",
-        ratio: premiumFloor.ratio.toFixed(4),
-        threshold: premiumFloor.threshold.toFixed(4)
-      };
-    }
+  if (canPassThrough && passThroughFee.gt(feeUsdc)) {
+    response["status"] = "pass_through";
+    response["feeUsdc"] = passThroughFee.toFixed(2);
+    response["reason"] = premiumFloor.breached ? "premium_floor_pass_through" : "pass_through";
+    response["pricing"] = {
+      type: "pass_through",
+      baseFee: feeBase.feeUsdc.toFixed(2),
+      hedgePremium: allInPremium.toFixed(2),
+      totalFee: passThroughFee.toFixed(2),
+      markupPct: markupPct.mul(100).toFixed(2),
+      markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
+      ratio: premiumFloor.ratio.toFixed(4),
+      threshold: premiumFloor.threshold.toFixed(4)
+    };
+    response["warning"] = premiumFloor.breached && shouldNotify
+      ? {
+          type: "premium_pass_through",
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4)
+        }
+      : undefined;
+  } else if (premiumFloor.breached) {
+    response["status"] = "premium_floor";
+    response["reason"] = "premium_floor";
+    response["warning"] = {
+      type: "premium_floor",
+      ratio: premiumFloor.ratio.toFixed(4),
+      threshold: premiumFloor.threshold.toFixed(4)
+    };
   }
   await audit("put_quote", response);
   return cacheAndReturn(response);
@@ -6326,6 +6340,12 @@ app.post("/put/auto-renew", async (req) => {
   const renewPassThroughCapped = renewPassThroughCap.maxFee
     ? renewPassThroughFee.gt(renewPassThroughCap.maxFee)
     : false;
+  if (renewCanPassThrough && renewPassThroughFee.gt(effectiveFeeUsdc)) {
+    renewReason = "pass_through";
+    effectiveFeeUsdc = renewPassThroughFee;
+    subsidyNeeded = new Decimal(0);
+    subsidyCheck = { allowed: true, reason: "pass_through" };
+  }
   await audit("pass_through_gate", {
     passThroughEnabled: renewPassThroughEnabled,
     requiresUserOptIn: renewRequiresUserOptIn,
