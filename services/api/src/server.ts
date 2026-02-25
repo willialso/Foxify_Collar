@@ -4084,14 +4084,15 @@ app.post("/put/quote", async (req) => {
       const days = entry.targetDays;
       if (!expiryTag) continue;
       const snapshotsByStrike = new Map<string, QuoteBookSnapshot[]>();
-      const strikeCandidates =
+      const strikeLimit = fastPreview ? 6 : 40;
+      let strikeCandidates =
         venueConfig.mode === "bybit_only"
           ? await selectBybitStrikeCandidates(
               asset,
               expiryTag,
               optionType,
               targetStrike,
-              fastPreview ? 6 : 40
+              strikeLimit
             )
           : selectStrikeCandidates(
               results,
@@ -4099,8 +4100,22 @@ app.post("/put/quote", async (req) => {
               optionType,
               spotPrice,
               drawdownFloorPct,
-              fastPreview ? 6 : 40
+              strikeLimit
             );
+      if (
+        venueConfig.mode === "bybit_only" &&
+        strikeCandidates.length === 0 &&
+        venueConfig.deribit_enabled
+      ) {
+        strikeCandidates = selectStrikeCandidates(
+          results,
+          expiryTag,
+          optionType,
+          spotPrice,
+          drawdownFloorPct,
+          strikeLimit
+        );
+      }
       const { maxSpreadPct, maxSlippagePct } = resolveLiquidityThresholds(
         days,
         overridePass,
