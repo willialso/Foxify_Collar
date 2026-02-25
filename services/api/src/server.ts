@@ -117,11 +117,8 @@ async function ensureLogsDir(): Promise<void> {
 }
 const QUOTE_CACHE_STALE_MS = Number(process.env.QUOTE_CACHE_STALE_MS || "20000");
 const QUOTE_CACHE_HARD_MS = Number(process.env.QUOTE_CACHE_HARD_MS || "120000");
-const MTM_BUFFER_THRESHOLD_USDC = new Decimal(process.env.MTM_BUFFER_THRESHOLD_USDC || "50");
-const MTM_BUFFER_THRESHOLD_PCT = new Decimal(process.env.MTM_BUFFER_THRESHOLD_PCT || "0.005");
-const MTM_COVERAGE_RATIO_THRESHOLD = new Decimal(
-  process.env.MTM_COVERAGE_RATIO_THRESHOLD || "0.05"
-);
+const QUOTE_STRIKE_SCAN_LIMIT = Number(process.env.QUOTE_STRIKE_SCAN_LIMIT || "12");
+const QUOTE_STRIKE_CONCURRENCY = Number(process.env.QUOTE_STRIKE_CONCURRENCY || "4");
 
 type VenueMode = "bybit_only" | "deribit_only" | "dual_venue";
 type VenueConfig = {
@@ -299,6 +296,27 @@ function recordCacheMiss(elapsedMs: number): void {
     (cacheStats.avgMissTime * (cacheStats.misses - 1) + elapsedMs) / cacheStats.misses;
   const total = cacheStats.hits + cacheStats.misses;
   console.log(`[Cache] MISS - Hit rate: ${((cacheStats.hits / total) * 100).toFixed(1)}%`);
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (!items.length) return [];
+  const workerCount = Math.max(1, Math.min(items.length, concurrency));
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 async function audit(event: string, payload: Record<string, unknown>): Promise<void> {
@@ -2558,6 +2576,38 @@ async function getOptionVenueQuotes(
 
         return quotes;
       }
+
+      if (raceResult.venue === "deribit") {
+        const deribitOrderBook = (raceResult.data as any)?.result;
+        if (deribitOrderBook) {
+          console.log("[Hybrid] Fast path: returning Deribit price immediately");
+          addDeribitQuote(deribitOrderBook);
+          Promise.resolve()
+            .then(async () => {
+              try {
+                const bybit = await bybitPromise;
+                if (!bybit?.ask) return;
+                const { ask } = bestBidAsk(deribitOrderBook);
+                if (!ask) return;
+                const deribitAskUsd = new Decimal(ask).mul(spotPrice).toNumber();
+                const savings = deribitAskUsd - bybit.ask;
+                await audit("hybrid_comparison", {
+                  bybitPrice: bybit.ask,
+                  deribitPrice: deribitAskUsd,
+                  savings: savings.toFixed(2),
+                  bybitTimeMs: Date.now() - hybridStart,
+                  deribitTimeMs: raceTime,
+                  fastPathUsed: true,
+                  instrument
+                });
+              } catch (error: any) {
+                console.log(`[Hybrid] Background Bybit query failed: ${error?.message ?? "unknown"}`);
+              }
+            })
+            .catch(() => undefined);
+          return quotes;
+        }
+      }
     }
 
     const [deribitResult, bybitResult] = await Promise.allSettled([
@@ -2732,7 +2782,12 @@ async function buildExpirySearchOrder(
       let total = new Decimal(0);
       let count = 0;
       for (const inst of probes) {
-        const quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+        let quotes: Awaited<ReturnType<typeof getOptionVenueQuotes>> = [];
+        try {
+          quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+        } catch {
+          continue;
+        }
         if (!quotes.length) continue;
         const agg = aggregateOptionQuotes(quotes, "buy", requiredSize);
         if (!agg.bestAsk || !agg.bestBid) continue;
@@ -3477,12 +3532,47 @@ function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Rec
   const existing = quoteInflight.get(cacheKey);
   if (existing) return existing;
   const promise = (async () => {
-    const res = await app.inject({
-      method: "POST",
-      url: "/put/quote",
-      payload: body
-    });
-    return res.json() as Record<string, unknown>;
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/put/quote",
+        payload: body
+      });
+      let parsed: Record<string, unknown> | null = null;
+      try {
+        parsed = res.json() as Record<string, unknown>;
+      } catch {
+        parsed = null;
+      }
+      const statusCode = Number(res.statusCode || 0);
+      const response =
+        parsed && typeof parsed === "object"
+          ? { ...parsed }
+          : ({
+              status: statusCode >= 500 ? "error" : "no_quote",
+              reason: `quote_http_${statusCode || "unknown"}`
+            } as Record<string, unknown>);
+      if (statusCode >= 500) {
+        response["status"] = "error";
+        response["reason"] = String(response["reason"] || `quote_http_${statusCode}`);
+        response["message"] = String(
+          response["message"] || "Quote engine temporarily unavailable. Please retry."
+        );
+        response["retryable"] = true;
+      }
+      setQuoteCache(cacheKey, response);
+      return response;
+    } catch (error: any) {
+      const fallback = {
+        status: "error",
+        reason: "quote_compute_failed",
+        message: "Quote engine temporarily unavailable. Please retry.",
+        retryable: true,
+        detail: error?.message ?? "unknown_error"
+      } as Record<string, unknown>;
+      setQuoteCache(cacheKey, fallback);
+      return fallback;
+    }
   })();
   quoteInflight.set(cacheKey, promise);
   promise.finally(() => quoteInflight.delete(cacheKey));
@@ -3809,6 +3899,7 @@ app.post("/put/quote", async (req) => {
   let bestCandidate: {
     expiryTag: string;
     targetDays: number;
+    instrumentName: string;
     premiumPerUnit: Decimal;
     premiumTotal: Decimal;
     availableSize: Decimal;
@@ -3839,6 +3930,16 @@ app.post("/put/quote", async (req) => {
 
   const liquidityOverrideEnabled = riskControls.liquidity_override_enabled ?? false;
   let liquidityOverrideUsed = false;
+  const searchBudgetMs = Math.max(250, Number(riskControls.option_search_budget_ms ?? 1200));
+  const searchStartedAt = Date.now();
+  const strikeScanLimit = Math.max(
+    1,
+    Math.min(40, Number.isFinite(QUOTE_STRIKE_SCAN_LIMIT) ? QUOTE_STRIKE_SCAN_LIMIT : 12)
+  );
+  const strikeConcurrency = Math.max(
+    1,
+    Math.min(12, Number.isFinite(QUOTE_STRIKE_CONCURRENCY) ? QUOTE_STRIKE_CONCURRENCY : 4)
+  );
 
   const overridePasses = fastPreview ? [false] : [false, true];
   let fastPreviewHit = false;
@@ -3849,15 +3950,11 @@ app.post("/put/quote", async (req) => {
     chosenExecutionPlans = null;
     chosenSnapshots = null;
 
-    for (const entry of effectiveExpiryOrder) {
+    for (const entry of expirySearchOrder) {
+      if (Date.now() - searchStartedAt > searchBudgetMs) break;
       const expiryTag = entry.expiryTag;
       const days = entry.targetDays;
       if (!expiryTag) continue;
-
-      const plansByStrike = new Map<
-        string,
-        Array<{ venue: string; instrument: string; side: "buy" | "sell"; size: Decimal; price: Decimal }>
-      >();
       const snapshotsByStrike = new Map<string, QuoteBookSnapshot[]>();
       const strikeCandidates =
         venueConfig.mode === "bybit_only"
@@ -3884,137 +3981,106 @@ app.post("/put/quote", async (req) => {
         useBodySpread,
         useBodySlippage
       );
-
-      const floorPrice = computeFloorPrice(spotPrice, drawdownFloorPct, optionType);
-      let remainingCredit = spotPrice.sub(floorPrice).abs().mul(requiredSize);
-      const planExecutionPlans: Array<{
-        venue: string;
-        instrument: string;
-        side: "buy" | "sell";
-        size: Decimal;
-        price: Decimal;
-      }> = [];
-      const planSnapshots: Array<{ strike: string; books: QuoteBookSnapshot[] }> = [];
-      let planPremium = new Decimal(0);
-      let planSize = new Decimal(0);
-      let firstLegIv: number | null = null;
-      let firstLegSpread: Decimal | null = null;
-
-      for (const inst of strikeCandidates) {
-        if (remainingCredit.lte(0)) break;
-        let quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
-        if (!quotes.length) {
-          rejected.missingBook += 1;
-          continue;
-        }
-        const strike = new Decimal(inst.strike);
-        const intrinsic = computeIntrinsicAtFloor({
-          spotPrice,
-          drawdownFloorPct,
-          optionType,
-          strike
-        });
-        if (intrinsic.lte(0)) {
-          rejected.sizeTooSmall += 1;
-          continue;
-        }
-        const sizeNeeded = remainingCredit.div(intrinsic);
-        const targetSize = Decimal.max(minSize, sizeNeeded);
-        let agg = aggregateOptionQuotes(quotes, "buy", targetSize);
-        if (
-          venueConfig.mode === "bybit_only" &&
-          agg.filledSize.lt(targetSize) &&
-          venueConfig.deribit_enabled
-        ) {
-          const deribitQuote = await fetchDeribitQuoteForInstrument(inst.instrument_name, spotPrice);
-          if (deribitQuote) {
-            quotes = [...quotes, deribitQuote];
-            agg = aggregateOptionQuotes(quotes, "buy", targetSize);
-          }
-        }
-        if (!agg.bestBid || !agg.bestAsk) {
-          rejected.noBidAsk += 1;
-          continue;
-        }
-        if (agg.spread.gt(maxSpreadPct)) {
-          rejected.spreadTooWide += 1;
-          continue;
-        }
-        if (!agg.avgPrice || agg.filledSize.lte(0)) {
-          rejected.sizeTooSmall += 1;
-          continue;
-        }
-        const slippagePct = agg.avgPrice.minus(agg.bestAsk).div(agg.bestAsk);
-        if (slippagePct.gt(maxSlippagePct)) {
-          rejected.slippageTooHigh += 1;
-          continue;
-        }
-        const availableSize = agg.totalAskSize;
-        const sizeToTake = Decimal.min(targetSize, availableSize);
-        if (sizeToTake.lte(0)) {
-          rejected.sizeTooSmall += 1;
-          continue;
-        }
-        const sizedAgg = aggregateOptionQuotes(quotes, "buy", sizeToTake);
-        if (!sizedAgg.avgPrice || sizedAgg.filledSize.lte(0) || sizedAgg.filledSize.lt(sizeToTake)) {
-          rejected.sizeTooSmall += 1;
-          continue;
-        }
-        const legPremiumTotal = sizedAgg.avgPrice.mul(sizeToTake);
-        planPremium = planPremium.add(legPremiumTotal);
-        planSize = planSize.add(sizeToTake);
-        remainingCredit = remainingCredit.sub(intrinsic.mul(sizeToTake));
-        planExecutionPlans.push(...sizedAgg.plans);
-
-        const snapshots = quotes.map((quote) => ({
-          venue: quote.venue,
-          instrument: quote.instrument,
-          bidUsd: serializeDecimal(quote.book.bid, 6),
-          askUsd: serializeDecimal(quote.book.ask, 6),
-          bidSize: serializeDecimal(quote.book.bidSize, 6) ?? "0",
-          askSize: serializeDecimal(quote.book.askSize, 6) ?? "0",
-          spreadPct: serializeDecimal(quote.book.spreadPct, 6) ?? "0",
-          timestampMs: quote.book.timestampMs ?? null,
-          markPriceUsd: serializeDecimal(quote.book.markPriceUsd, 6)
-        }));
-        snapshotsByStrike.set(strike.toFixed(0), snapshots);
-        planSnapshots.push({ strike: strike.toFixed(0), books: snapshots });
-
-        if (firstLegIv === null) {
-          const ticker = await deribit.getTicker(inst.instrument_name);
-          firstLegIv = Number((ticker as any)?.result?.mark_iv ?? 0);
-        }
-        if (firstLegSpread === null) {
-          firstLegSpread = sizedAgg.spread;
-        }
-
-        if (remainingCredit.lte(0)) {
-          const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
-          const allInPremium = planPremium.mul(new Decimal(rollMultiplier));
-          if (!bestCandidate || (!fastPreview && allInPremium.lt(bestCandidate.allInPremium))) {
-            const avgPremiumPerUnit = planSize.gt(0) ? planPremium.div(planSize) : new Decimal(0);
-            bestCandidate = {
-              expiryTag,
-              targetDays: days,
-              premiumPerUnit: avgPremiumPerUnit,
-              premiumTotal: planPremium,
-              availableSize: planSize,
-              strike,
-              iv: firstLegIv ?? 0,
-              spreadPct: firstLegSpread ?? sizedAgg.spread,
-              rollMultiplier,
-              allInPremium,
-              hedgeSize: planSize
+      const limitedCandidates = strikeCandidates.slice(0, strikeScanLimit);
+      const evaluations = await mapWithConcurrency(
+        limitedCandidates,
+        strikeConcurrency,
+        async (inst) => {
+          try {
+            if (Date.now() - searchStartedAt > searchBudgetMs) {
+              return { kind: "budget" as const };
+            }
+            let quotes: Awaited<ReturnType<typeof getOptionVenueQuotes>> = [];
+            try {
+              quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+            } catch {
+              return { kind: "rejected" as const, reason: "missingBook" as const };
+            }
+            if (!quotes.length) {
+              return { kind: "rejected" as const, reason: "missingBook" as const };
+            }
+            const snapshots = quotes.map((quote) => ({
+              venue: quote.venue,
+              instrument: quote.instrument,
+              bidUsd: serializeDecimal(quote.book.bid, 6),
+              askUsd: serializeDecimal(quote.book.ask, 6),
+              bidSize: serializeDecimal(quote.book.bidSize, 6) ?? "0",
+              askSize: serializeDecimal(quote.book.askSize, 6) ?? "0",
+              spreadPct: serializeDecimal(quote.book.spreadPct, 6) ?? "0",
+              timestampMs: quote.book.timestampMs ?? null,
+              markPriceUsd: serializeDecimal(quote.book.markPriceUsd, 6)
+            }));
+            const agg = aggregateOptionQuotes(quotes, "buy", requiredSize);
+            if (!agg.bestBid || !agg.bestAsk) {
+              return { kind: "rejected" as const, reason: "noBidAsk" as const };
+            }
+            if (agg.spread.gt(maxSpreadPct)) {
+              return { kind: "rejected" as const, reason: "spreadTooWide" as const };
+            }
+            if (!agg.avgPrice || agg.filledSize.lte(0)) {
+              return { kind: "rejected" as const, reason: "sizeTooSmall" as const };
+            }
+            const slippagePct = agg.avgPrice.minus(agg.bestAsk).div(agg.bestAsk);
+            if (slippagePct.gt(maxSlippagePct)) {
+              return { kind: "rejected" as const, reason: "slippageTooHigh" as const };
+            }
+            const premiumPerUnit = agg.avgPrice;
+            const premiumTotal = premiumPerUnit.mul(requiredSize);
+            const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
+            const allInPremium = premiumTotal.mul(new Decimal(rollMultiplier));
+            return {
+              kind: "candidate" as const,
+              strikeKey: new Decimal(inst.strike).toFixed(0),
+              snapshots,
+              plans: agg.plans,
+              candidate: {
+                expiryTag,
+                targetDays: days,
+                instrumentName: inst.instrument_name,
+                premiumPerUnit,
+                premiumTotal,
+                availableSize: agg.totalAskSize,
+                strike: new Decimal(inst.strike),
+                iv: Number.isFinite(body.ivSnapshot ?? NaN) ? Number(body.ivSnapshot) : 0,
+                spreadPct: agg.spread,
+                rollMultiplier,
+                allInPremium
+              }
             };
-            bestSnapshots = planSnapshots[0]?.books ?? snapshots;
-            chosenExecutionPlans = planExecutionPlans;
-            chosenSnapshots = snapshotsByStrike;
-            bestPlanLegs = buildCoverageLegsFromPlans(planExecutionPlans);
+          } catch {
+            return { kind: "rejected" as const, reason: "missingBook" as const };
           }
-          if (fastPreview && bestCandidate) {
-            fastPreviewHit = true;
-            break;
+        }
+      );
+
+      for (const result of evaluations) {
+        if (result.kind === "budget") continue;
+        if (result.kind === "rejected") {
+          switch (result.reason) {
+            case "noBidAsk":
+              rejected.noBidAsk += 1;
+              break;
+            case "spreadTooWide":
+              rejected.spreadTooWide += 1;
+              break;
+            case "sizeTooSmall":
+              rejected.sizeTooSmall += 1;
+              break;
+            case "slippageTooHigh":
+              rejected.slippageTooHigh += 1;
+              break;
+            default:
+              rejected.missingBook += 1;
+              break;
           }
+          continue;
+        }
+        snapshotsByStrike.set(result.strikeKey, result.snapshots);
+        if (!bestCandidate || result.candidate.allInPremium.lt(bestCandidate.allInPremium)) {
+          bestCandidate = result.candidate;
+          bestSnapshots = result.snapshots;
+          chosenExecutionPlans = result.plans;
+          chosenSnapshots = snapshotsByStrike;
         }
       }
       if (fastPreviewHit) break;
@@ -4878,6 +4944,7 @@ app.post("/put/auto-renew", async (req) => {
   let bestCandidate: {
     expiryTag: string;
     targetDays: number;
+    instrumentName: string;
     premiumPerUnit: Decimal;
     premiumTotal: Decimal;
     availableSize: Decimal;
@@ -4891,6 +4958,12 @@ app.post("/put/auto-renew", async (req) => {
   let bestSnapshots: QuoteBookSnapshot[] | null = null;
   const liquidityOverrideEnabled = riskControls.liquidity_override_enabled ?? false;
   let liquidityOverrideUsed = false;
+  const renewSearchBudgetMs = Math.max(250, Number(riskControls.option_search_budget_ms ?? 1200));
+  const renewSearchStartedAt = Date.now();
+  const renewStrikeScanLimit = Math.max(
+    1,
+    Math.min(30, Number.isFinite(QUOTE_STRIKE_SCAN_LIMIT) ? QUOTE_STRIKE_SCAN_LIMIT : 12)
+  );
 
   for (const overridePass of [false, true]) {
     if (overridePass && !liquidityOverrideEnabled) break;
@@ -4900,13 +4973,10 @@ app.post("/put/auto-renew", async (req) => {
     chosenSnapshots = null;
 
     for (const entry of expirySearchOrder) {
+      if (Date.now() - renewSearchStartedAt > renewSearchBudgetMs) break;
       const expiryTag = entry.expiryTag;
       const days = entry.targetDays;
       if (!expiryTag) continue;
-      const plansByStrike = new Map<
-        string,
-        Array<{ venue: string; instrument: string; side: "buy" | "sell"; size: Decimal; price: Decimal }>
-      >();
       const snapshotsByStrike = new Map<string, QuoteBookSnapshot[]>();
       const strikeCandidates = selectStrikeCandidates(
         results,
@@ -4925,8 +4995,14 @@ app.post("/put/auto-renew", async (req) => {
         useBodySlippage
       );
 
-      for (const inst of strikeCandidates) {
-        let quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+      for (const inst of strikeCandidates.slice(0, renewStrikeScanLimit)) {
+        if (Date.now() - renewSearchStartedAt > renewSearchBudgetMs) break;
+        let quotes: Awaited<ReturnType<typeof getOptionVenueQuotes>> = [];
+        try {
+          quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+        } catch {
+          continue;
+        }
         if (!quotes.length) continue;
         const strike = new Decimal(inst.strike);
         const coverageSize = requiredHedgeSizeForFullCoverage({
@@ -4968,8 +5044,6 @@ app.post("/put/auto-renew", async (req) => {
         }));
         snapshotsByStrike.set(strike.toFixed(0), snapshots);
 
-        const ticker = await deribit.getTicker(inst.instrument_name);
-        const iv = Number((ticker as any)?.result?.mark_iv ?? 0);
         const premiumPerUnit = agg.avgPrice;
         const premiumTotal = premiumPerUnit.mul(targetSize);
         const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
@@ -4978,11 +5052,12 @@ app.post("/put/auto-renew", async (req) => {
           bestCandidate = {
             expiryTag,
             targetDays: days,
+            instrumentName: inst.instrument_name,
             premiumPerUnit,
             premiumTotal,
             availableSize: agg.totalAskSize,
-            strike,
-            iv,
+            strike: new Decimal(inst.strike),
+            iv: Number.isFinite(body.ivSnapshot ?? NaN) ? Number(body.ivSnapshot) : 0,
             spreadPct: agg.spread,
             rollMultiplier,
             allInPremium,
@@ -4992,7 +5067,6 @@ app.post("/put/auto-renew", async (req) => {
           chosenExecutionPlans = agg.plans;
           chosenSnapshots = snapshotsByStrike;
         }
-        plansByStrike.set(strike.toFixed(0), agg.plans);
       }
     }
 
