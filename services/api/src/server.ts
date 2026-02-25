@@ -3002,6 +3002,8 @@ app.post("/deribit/order", async (req) => {
     venue === "bybit" && typeof body.instrument === "string" && !body.instrument.endsWith("-USDT")
       ? `${body.instrument}-USDT`
       : body.instrument;
+  let executionVenue = venue;
+  let executionInstrument = instrument;
   const estimatePremiumEnabled = riskControls.estimate_premium_on_missing === true;
   let quotedPremiumPerUnit: Decimal | null = null;
   let quotedPremiumTotal: Decimal | null = null;
@@ -3110,8 +3112,8 @@ app.post("/deribit/order", async (req) => {
   }
   let response: any;
   try {
-    response = await executionRegistry.placeOrder(venue, {
-      instrument,
+    response = await executionRegistry.placeOrder(executionVenue, {
+      instrument: executionInstrument,
       amount: body.amount,
       side: body.side,
       type: body.type,
@@ -3119,30 +3121,104 @@ app.post("/deribit/order", async (req) => {
       spotPrice: body.spotPrice
     });
   } catch (error: any) {
-    const failure = {
-      status: "execution_error",
-      reason: "venue_unavailable",
-      message: "Order execution failed before liquidity validation.",
-      retryable: true,
-      diagnostic: {
-        category: "execution_error",
-        venue,
-        instrument: body.instrument,
-        amount: body.amount,
-        side: body.side,
-        type: body.type ?? "market",
-        detail: error?.message ?? "unknown_error"
+    const primaryError = error?.message ?? "unknown_error";
+    const canFallbackToDeribit =
+      executionVenue === "bybit" &&
+      venueConfig.deribit_enabled === true &&
+      typeof executionInstrument === "string" &&
+      executionInstrument.length > 0;
+    if (canFallbackToDeribit) {
+      const deribitInstrument = executionInstrument.replace(/-USDT$/, "");
+      try {
+        response = await executionRegistry.placeOrder("deribit", {
+          instrument: deribitInstrument,
+          amount: body.amount,
+          side: body.side,
+          type: body.type,
+          price: body.price,
+          spotPrice: body.spotPrice
+        });
+        executionVenue = "deribit";
+        executionInstrument = deribitInstrument;
+        (response as any).diagnostic = {
+          category: "execution_fallback",
+          requestedVenue: venue,
+          executedVenue: executionVenue,
+          requestedInstrument: body.instrument,
+          executedInstrument: executionInstrument,
+          primaryError
+        };
+        await audit("hedge_order_fallback", {
+          coverageId: body.coverageId || null,
+          quoteId: body.quoteId ?? null,
+          tierName: body.tierName ?? null,
+          accountId: body.accountId ?? null,
+          requestedVenue: venue,
+          executedVenue: executionVenue,
+          requestedInstrument: body.instrument,
+          executedInstrument: executionInstrument,
+          reason: "bybit_unavailable",
+          primaryError
+        });
+      } catch (fallbackError: any) {
+        const failure = {
+          status: "execution_error",
+          reason: "venue_unavailable",
+          message: "Order execution failed before liquidity validation.",
+          retryable: true,
+          diagnostic: {
+            category: "execution_error",
+            requestedVenue: venue,
+            attemptedVenue: executionVenue,
+            fallbackVenue: "deribit",
+            requestedInstrument: body.instrument,
+            attemptedInstrument: instrument,
+            amount: body.amount,
+            side: body.side,
+            type: body.type ?? "market",
+            detail: primaryError,
+            fallbackDetail: fallbackError?.message ?? "unknown_fallback_error"
+          }
+        };
+        await audit("hedge_order_failed", {
+          coverageId: body.coverageId || null,
+          quoteId: body.quoteId ?? null,
+          tierName: body.tierName ?? null,
+          accountId: body.accountId ?? null,
+          ...failure.diagnostic
+        });
+        return failure;
       }
-    };
-    await audit("hedge_order_failed", {
-      coverageId: body.coverageId || null,
-      quoteId: body.quoteId ?? null,
-      tierName: body.tierName ?? null,
-      accountId: body.accountId ?? null,
-      ...failure.diagnostic
-    });
-    return failure;
+    } else {
+      const failure = {
+        status: "execution_error",
+        reason: "venue_unavailable",
+        message: "Order execution failed before liquidity validation.",
+        retryable: true,
+        diagnostic: {
+          category: "execution_error",
+          venue,
+          instrument: body.instrument,
+          amount: body.amount,
+          side: body.side,
+          type: body.type ?? "market",
+          detail: primaryError
+        }
+      };
+      await audit("hedge_order_failed", {
+        coverageId: body.coverageId || null,
+        quoteId: body.quoteId ?? null,
+        tierName: body.tierName ?? null,
+        accountId: body.accountId ?? null,
+        ...failure.diagnostic
+      });
+      return failure;
+    }
   }
+  (response as any).executionVenue = executionVenue;
+  (response as any).requestedVenue = venue;
+  (response as any).requestedInstrument = body.instrument;
+  (response as any).executedInstrument = executionInstrument;
   const status = String((response as any)?.status || "");
   const orderReason = String((response as any)?.reason || "");
   const liquidityRejected =
@@ -3150,9 +3226,10 @@ app.post("/deribit/order", async (req) => {
     (orderReason === "no_top_of_book" || orderReason === "insufficient_liquidity");
   if (liquidityRejected) {
     (response as any).diagnostic = {
+      ...((response as any).diagnostic || {}),
       category: "liquidity_rejected",
-      venue,
-      instrument: body.instrument,
+      venue: executionVenue,
+      instrument: executionInstrument,
       requestedAmount: body.amount,
       availableSize: (response as any)?.availableSize ?? null,
       bestBid: (response as any)?.bestBid ?? null,
@@ -3168,7 +3245,7 @@ app.post("/deribit/order", async (req) => {
     (response as any)?.fillPrice ??
     null;
   const spotPrice = body.spotPrice ?? null;
-  const isBybitExec = venue === "bybit";
+  const isBybitExec = executionVenue === "bybit";
   const premiumUsdcFromOrder =
     inferredHedgeType === "option" && fillPrice
       ? isBybitExec
@@ -3234,7 +3311,7 @@ app.post("/deribit/order", async (req) => {
     inferredHedgeType === "perp" && hedgeNotionalUsdc && body.leverage
       ? hedgeNotionalUsdc / Number(body.leverage)
       : 0;
-  const optionMeta = parseOptionInstrument(instrument);
+  const optionMeta = parseOptionInstrument(executionInstrument);
   const resolvedOptionType =
     (body as any).optionType ?? optionMeta.optionType ?? null;
   const resolvedStrike = optionMeta.strike ?? null;
@@ -3242,7 +3319,7 @@ app.post("/deribit/order", async (req) => {
   if (executed && fillPriceUsdc) {
     const sizeDelta = new Decimal(filledAmount).mul(body.side === "buy" ? 1 : -1);
     updateHedgeLedger({
-      instrument: body.instrument,
+      instrument: executionInstrument,
       sizeDelta,
       fillPriceUsdc
     });
@@ -3254,22 +3331,23 @@ app.post("/deribit/order", async (req) => {
     const coverageLegs =
       inferredHedgeType === "option"
         ? mergeCoverageLegs(existing?.coverageLegs, {
-            instrument,
+            instrument: executionInstrument,
             size: legSize,
-            venue,
+            venue: executionVenue,
             optionType: resolvedOptionType,
             strike: resolvedStrike
           })
         : existing?.coverageLegs;
     upsertCoverageLedger({
       coverageId: body.coverageId,
-      hedgeInstrument: instrument,
+      hedgeInstrument: executionInstrument,
       hedgeSize: legSize,
       hedgeType: inferredHedgeType === "option" ? "option" : "perp",
       optionType: resolvedOptionType,
       strike: resolvedStrike,
-      selectedVenue: venue,
-      markSource: venue === "bybit" || venue === "deribit" ? venue : null,
+      selectedVenue: executionVenue,
+      markSource:
+        executionVenue === "bybit" || executionVenue === "deribit" ? executionVenue : null,
       notionalUsdc: body.notionalUsdc ?? null,
       coverageLegs
     });
@@ -3283,7 +3361,8 @@ app.post("/deribit/order", async (req) => {
         : Number(premiumForAudit)
       : null;
   await audit("hedge_order", {
-    instrument: body.instrument,
+    instrument: executionInstrument,
+    requestedInstrument: body.instrument,
     side: body.side,
     amount: filledAmount,
     type: body.type ?? "market",
@@ -3306,7 +3385,8 @@ app.post("/deribit/order", async (req) => {
     floorPrice: body.floorPrice ?? null,
     hedgeNotionalUsdc,
     hedgeMarginUsdc,
-    venue,
+    venue: executionVenue,
+    requestedVenue: venue,
     bestBid: (response as any)?.bestBid ?? null,
     bestAsk: (response as any)?.bestAsk ?? null,
     availableSize: (response as any)?.availableSize ?? null,
