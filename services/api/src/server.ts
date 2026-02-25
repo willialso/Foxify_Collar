@@ -179,7 +179,7 @@ if (venueConfig.mode === "bybit_only") {
 }
 console.log("════════════════════════════════════════════════════════");
 
-type QuoteCacheEntry = { ts: number; response: Record<string, unknown> };
+type QuoteCacheEntry = { ts: number; response: Record<string, unknown>; ttlMs?: number };
 const quoteCache = new Map<string, QuoteCacheEntry>();
 const quoteInflight = new Map<string, Promise<Record<string, unknown>>>();
 type QuoteLock = {
@@ -267,7 +267,8 @@ function getQuoteCache(key: string): QuoteCacheEntry | null {
 }
 
 function isQuoteCacheFresh(entry: QuoteCacheEntry): boolean {
-  return Date.now() - entry.ts <= QUOTE_CACHE_TTL_MS;
+  const ttlMs = entry.ttlMs ?? QUOTE_CACHE_TTL_MS;
+  return Date.now() - entry.ts <= ttlMs;
 }
 
 function isQuoteCacheStale(entry: QuoteCacheEntry): boolean {
@@ -278,8 +279,8 @@ function isQuoteCacheUsable(entry: QuoteCacheEntry): boolean {
   return Date.now() - entry.ts <= QUOTE_CACHE_HARD_MS;
 }
 
-function setQuoteCache(key: string, response: Record<string, unknown>): void {
-  quoteCache.set(key, { ts: Date.now(), response });
+function setQuoteCache(key: string, response: Record<string, unknown>, ttlMs?: number): void {
+  quoteCache.set(key, { ts: Date.now(), response, ttlMs });
 }
 
 function recordCacheHit(elapsedMs: number): void {
@@ -3560,7 +3561,9 @@ function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Rec
         );
         response["retryable"] = true;
       }
-      setQuoteCache(cacheKey, response);
+      const shortLivedErrorTtlMs = 5000;
+      const isErrorResponse = String(response["status"] || "") === "error";
+      setQuoteCache(cacheKey, response, isErrorResponse ? shortLivedErrorTtlMs : undefined);
       return response;
     } catch (error: any) {
       const fallback = {
@@ -3570,7 +3573,7 @@ function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Rec
         retryable: true,
         detail: error?.message ?? "unknown_error"
       } as Record<string, unknown>;
-      setQuoteCache(cacheKey, fallback);
+      setQuoteCache(cacheKey, fallback, 5000);
       return fallback;
     }
   })();
