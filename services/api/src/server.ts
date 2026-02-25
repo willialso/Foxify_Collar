@@ -3215,10 +3215,20 @@ app.post("/deribit/order", async (req) => {
       return failure;
     }
   }
-  (response as any).executionVenue = executionVenue;
+  const responseExecutionVenue =
+    typeof (response as any).executionVenue === "string" &&
+    String((response as any).executionVenue).length > 0
+      ? String((response as any).executionVenue)
+      : executionVenue;
+  const responseExecutedInstrument =
+    typeof (response as any).executedInstrument === "string" &&
+    String((response as any).executedInstrument).length > 0
+      ? String((response as any).executedInstrument)
+      : executionInstrument;
+  (response as any).executionVenue = responseExecutionVenue;
   (response as any).requestedVenue = venue;
   (response as any).requestedInstrument = body.instrument;
-  (response as any).executedInstrument = executionInstrument;
+  (response as any).executedInstrument = responseExecutedInstrument;
   const status = String((response as any)?.status || "");
   const orderReason = String((response as any)?.reason || "");
   const liquidityRejected =
@@ -3228,8 +3238,8 @@ app.post("/deribit/order", async (req) => {
     (response as any).diagnostic = {
       ...((response as any).diagnostic || {}),
       category: "liquidity_rejected",
-      venue: executionVenue,
-      instrument: executionInstrument,
+      venue: responseExecutionVenue,
+      instrument: responseExecutedInstrument,
       requestedAmount: body.amount,
       availableSize: (response as any)?.availableSize ?? null,
       bestBid: (response as any)?.bestBid ?? null,
@@ -3245,7 +3255,7 @@ app.post("/deribit/order", async (req) => {
     (response as any)?.fillPrice ??
     null;
   const spotPrice = body.spotPrice ?? null;
-  const isBybitExec = executionVenue === "bybit";
+  const isBybitExec = responseExecutionVenue === "bybit";
   const premiumUsdcFromOrder =
     inferredHedgeType === "option" && fillPrice
       ? isBybitExec
@@ -3311,7 +3321,7 @@ app.post("/deribit/order", async (req) => {
     inferredHedgeType === "perp" && hedgeNotionalUsdc && body.leverage
       ? hedgeNotionalUsdc / Number(body.leverage)
       : 0;
-  const optionMeta = parseOptionInstrument(executionInstrument);
+  const optionMeta = parseOptionInstrument(responseExecutedInstrument);
   const resolvedOptionType =
     (body as any).optionType ?? optionMeta.optionType ?? null;
   const resolvedStrike = optionMeta.strike ?? null;
@@ -3319,7 +3329,7 @@ app.post("/deribit/order", async (req) => {
   if (executed && fillPriceUsdc) {
     const sizeDelta = new Decimal(filledAmount).mul(body.side === "buy" ? 1 : -1);
     updateHedgeLedger({
-      instrument: executionInstrument,
+      instrument: responseExecutedInstrument,
       sizeDelta,
       fillPriceUsdc
     });
@@ -3331,23 +3341,25 @@ app.post("/deribit/order", async (req) => {
     const coverageLegs =
       inferredHedgeType === "option"
         ? mergeCoverageLegs(existing?.coverageLegs, {
-            instrument: executionInstrument,
+            instrument: responseExecutedInstrument,
             size: legSize,
-            venue: executionVenue,
+            venue: responseExecutionVenue,
             optionType: resolvedOptionType,
             strike: resolvedStrike
           })
         : existing?.coverageLegs;
     upsertCoverageLedger({
       coverageId: body.coverageId,
-      hedgeInstrument: executionInstrument,
+      hedgeInstrument: responseExecutedInstrument,
       hedgeSize: legSize,
       hedgeType: inferredHedgeType === "option" ? "option" : "perp",
       optionType: resolvedOptionType,
       strike: resolvedStrike,
-      selectedVenue: executionVenue,
+      selectedVenue: responseExecutionVenue,
       markSource:
-        executionVenue === "bybit" || executionVenue === "deribit" ? executionVenue : null,
+        responseExecutionVenue === "bybit" || responseExecutionVenue === "deribit"
+          ? responseExecutionVenue
+          : null,
       notionalUsdc: body.notionalUsdc ?? null,
       coverageLegs
     });
@@ -3361,7 +3373,7 @@ app.post("/deribit/order", async (req) => {
         : Number(premiumForAudit)
       : null;
   await audit("hedge_order", {
-    instrument: executionInstrument,
+    instrument: responseExecutedInstrument,
     requestedInstrument: body.instrument,
     side: body.side,
     amount: filledAmount,
@@ -3385,7 +3397,7 @@ app.post("/deribit/order", async (req) => {
     floorPrice: body.floorPrice ?? null,
     hedgeNotionalUsdc,
     hedgeMarginUsdc,
-    venue: executionVenue,
+    venue: responseExecutionVenue,
     requestedVenue: venue,
     bestBid: (response as any)?.bestBid ?? null,
     bestAsk: (response as any)?.bestAsk ?? null,

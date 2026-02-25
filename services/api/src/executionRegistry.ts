@@ -20,7 +20,42 @@ export class ExecutionRegistry {
     if (!executor) {
       throw new Error(`Missing executor for venue: ${venue}`);
     }
-    return executor.placeOrder(request);
+    try {
+      return await executor.placeOrder(request);
+    } catch (error: any) {
+      const canFallbackToDeribit =
+        venue === "bybit" && this.executors.has("deribit") && typeof request.instrument === "string";
+      if (!canFallbackToDeribit) {
+        throw error;
+      }
+      const deribitExecutor = this.executors.get("deribit");
+      if (!deribitExecutor) {
+        throw error;
+      }
+      const deribitInstrument = request.instrument.replace(/-USDT$/, "");
+      const fallbackResponse = await deribitExecutor.placeOrder({
+        ...request,
+        instrument: deribitInstrument
+      });
+      if (!fallbackResponse || typeof fallbackResponse !== "object") {
+        return fallbackResponse;
+      }
+      const fallbackObj = { ...(fallbackResponse as Record<string, unknown>) };
+      fallbackObj["diagnostic"] = {
+        ...((fallbackObj as any).diagnostic || {}),
+        category: "execution_fallback",
+        requestedVenue: venue,
+        executedVenue: "deribit",
+        requestedInstrument: request.instrument,
+        executedInstrument: deribitInstrument,
+        primaryError: error?.message ?? "unknown_error"
+      };
+      fallbackObj["executionVenue"] = "deribit";
+      fallbackObj["requestedVenue"] = venue;
+      fallbackObj["requestedInstrument"] = request.instrument;
+      fallbackObj["executedInstrument"] = deribitInstrument;
+      return fallbackObj;
+    }
   }
 }
 
