@@ -143,6 +143,7 @@ export function App() {
   const [lastCoverageId, setLastCoverageId] = useState<string | null>(null);
   const [portfolioError, setPortfolioError] = useState<string | null>(null);
   const [isActivating, setIsActivating] = useState(false);
+  const [lastExecution, setLastExecution] = useState<string | null>(null);
   const [fetchingDotCount, setFetchingDotCount] = useState(1);
   const [toast, setToast] = useState<string | null>(null);
   const [auditLoading, setAuditLoading] = useState(false);
@@ -1050,6 +1051,9 @@ export function App() {
     let feeUsd = totalFeeUsd;
     let reason = "flat_fee";
     let regimeLabel: string | null = null;
+    let markupUsd: number | null = null;
+    let premiumOutUsd: number | null = null;
+    let executedPremiumUsd: number | null = null;
     let selectedVenue: string | null = null;
     let cacheBust = false;
     const executionAttempts: Array<{
