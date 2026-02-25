@@ -1068,28 +1068,31 @@ export function App() {
           quote = previewQuoteRaw;
         }
         const maxAttempts = 3;
-        for (let attempt = 0; attempt < maxAttempts && !canUsePreviewQuote; attempt += 1) {
-          const quoteRes = await fetch(`${API_BASE}/put/quote`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              tierName: level.name,
-              asset: primaryAsset,
-              spotPrice: spot,
-              drawdownFloorPct: drawdownPct,
-              fixedPriceUsdc: totalFeeUsd,
-              positionSize,
-              contractSize: 1,
-              leverage: primary?.leverage ?? 1,
-              ivSnapshot: ivSnapshot.value,
-              side: netSide,
-              coverageId,
-              targetDays: expiryDays,
-              allowPremiumPassThrough: true,
-              _cacheBust: cacheBust
-            })
-          });
-          quote = await quoteRes.json();
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+          const usePreviewOnThisAttempt = canUsePreviewQuote && attempt === 0 && !cacheBust;
+          if (!usePreviewOnThisAttempt) {
+            const quoteRes = await fetch(`${API_BASE}/put/quote`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                tierName: level.name,
+                asset: primaryAsset,
+                spotPrice: spot,
+                drawdownFloorPct: drawdownPct,
+                fixedPriceUsdc: totalFeeUsd,
+                positionSize,
+                contractSize: 1,
+                leverage: primary?.leverage ?? 1,
+                ivSnapshot: ivSnapshot.value,
+                side: netSide,
+                coverageId,
+                targetDays: expiryDays,
+                allowPremiumPassThrough: true,
+                _cacheBust: cacheBust
+              })
+            });
+            quote = await quoteRes.json();
+          }
 
           if (quote?.status === "pass_through") {
             const pricing = quote?.pricing;
