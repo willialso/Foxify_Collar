@@ -11,6 +11,31 @@ export interface RiskControlsConfig {
   initial_liquidity_usdc?: number;
   reinvest_pct?: number;
   reserve_pct?: number;
+  hedge_action_cooldown_ms?: number;
+  min_hedge_notional_usdc?: number;
+  loop_use_mtm_buffer?: boolean;
+  loop_mtm_max_age_ms?: number;
+  loop_block_on_stale_mtm?: boolean;
+  loop_stale_mtm_cooldown_ms?: number;
+  loop_enable_decrease?: boolean;
+  loop_require_notional_usdc?: boolean;
+  loop_accounting_enabled?: boolean;
+  net_exposure_min_notional_usdc?: number;
+  net_exposure_cooldown_ms?: number;
+  net_exposure_perp_accounting_enabled?: boolean;
+  net_exposure_budget_guard_enabled?: boolean;
+  net_exposure_min_budget_usdc?: number;
+  net_exposure_force_coverage_id?: boolean;
+  slippage_tracking_enabled?: boolean;
+  slippage_guard_enabled?: boolean;
+  slippage_soft_pct?: number;
+  slippage_soft_usdc?: number;
+  slippage_hard_pct?: number;
+  slippage_hard_usdc?: number;
+  slippage_reject_hard?: boolean;
+  slippage_adjust_subsidy_enabled?: boolean;
+  slippage_subsidy_cap_usdc?: number;
+  estimate_premium_on_missing?: boolean;
   max_spread_pct?: number;
   max_slippage_pct?: number;
   max_spread_pct_by_days?: Record<string, number>;
@@ -57,6 +82,19 @@ export interface RiskControlsConfig {
   enable_premium_pass_through?: boolean;
   require_user_opt_in_for_pass_through?: boolean;
   pass_through_min_notification_ratio?: number;
+  pass_through_allow_uncapped_bronze?: boolean;
+  pass_through_uncapped_max_ratio?: number;
+  phase3_rollout_enabled?: boolean;
+  phase3_safety_guard_enabled?: boolean;
+  intermittent_analytics_enabled?: boolean;
+  intermittent_selection_shadow_enabled?: boolean;
+  intermittent_selection_live_enabled?: boolean;
+  intermittent_selection_size_tolerance_pct?: number;
+  intermittent_profit_threshold_enabled?: boolean;
+  intermittent_profit_enforce_override?: boolean;
+  intermittent_profit_min_improvement_usdc?: number;
+  intermittent_profit_min_improvement_ratio?: number;
+  intermittent_profit_critical_buffer_pct?: number;
   coverage_override_tiers?: string[];
   duration_fee_per_day_pct?: number;
   duration_fee_max_pct?: number;
@@ -81,6 +119,8 @@ export interface RiskState {
 export interface LiquidityState {
   liquidityBalanceUsdc: Decimal;
   hedgeSpendUsdc: Decimal;
+  coverageHedgeSpendUsdc: Decimal;
+  netHedgeSpendUsdc: Decimal;
   hedgeMarginUsdc: Decimal;
   revenueUsdc: Decimal;
   profitUsdc: Decimal;
@@ -102,9 +142,34 @@ const DEFAULTS: RiskControlsConfig = {
   hedge_reduction_factor: 0.7,
   max_leverage: 10,
   net_exposure_cap_usdc: {},
-  initial_liquidity_usdc: 20000,
+  initial_liquidity_usdc: 35000,
   reinvest_pct: 0.5,
   reserve_pct: 0.3,
+  hedge_action_cooldown_ms: 60000,
+  min_hedge_notional_usdc: 250,
+  loop_use_mtm_buffer: false,
+  loop_mtm_max_age_ms: 900000,
+  loop_block_on_stale_mtm: false,
+  loop_stale_mtm_cooldown_ms: 0,
+  loop_enable_decrease: false,
+  loop_require_notional_usdc: false,
+  loop_accounting_enabled: false,
+  net_exposure_min_notional_usdc: 500,
+  net_exposure_cooldown_ms: 120000,
+  net_exposure_perp_accounting_enabled: false,
+  net_exposure_budget_guard_enabled: false,
+  net_exposure_min_budget_usdc: 0,
+  net_exposure_force_coverage_id: false,
+  slippage_tracking_enabled: false,
+  slippage_guard_enabled: false,
+  slippage_soft_pct: 0,
+  slippage_soft_usdc: 0,
+  slippage_hard_pct: 0,
+  slippage_hard_usdc: 0,
+  slippage_reject_hard: false,
+  slippage_adjust_subsidy_enabled: false,
+  slippage_subsidy_cap_usdc: 0,
+  estimate_premium_on_missing: false,
   max_spread_pct: 0.05,
   max_slippage_pct: 0.01,
   max_spread_pct_by_days: {},
@@ -144,6 +209,19 @@ const DEFAULTS: RiskControlsConfig = {
   enable_premium_pass_through: true,
   require_user_opt_in_for_pass_through: false,
   pass_through_min_notification_ratio: 1.5,
+  pass_through_allow_uncapped_bronze: false,
+  pass_through_uncapped_max_ratio: 0,
+  phase3_rollout_enabled: false,
+  phase3_safety_guard_enabled: true,
+  intermittent_analytics_enabled: false,
+  intermittent_selection_shadow_enabled: false,
+  intermittent_selection_live_enabled: false,
+  intermittent_selection_size_tolerance_pct: 0.2,
+  intermittent_profit_threshold_enabled: false,
+  intermittent_profit_enforce_override: false,
+  intermittent_profit_min_improvement_usdc: 0,
+  intermittent_profit_min_improvement_ratio: 0,
+  intermittent_profit_critical_buffer_pct: 0.02,
   coverage_override_tiers: ["Pro (Gold)", "Pro (Platinum)"],
   duration_fee_per_day_pct: 0.04,
   duration_fee_max_pct: 0.6,
@@ -174,6 +252,8 @@ let stateByTier: Record<string, RiskState> = {};
 let liquidityState: LiquidityState = {
   liquidityBalanceUsdc: new Decimal(DEFAULTS.initial_liquidity_usdc ?? 0),
   hedgeSpendUsdc: new Decimal(0),
+  coverageHedgeSpendUsdc: new Decimal(0),
+  netHedgeSpendUsdc: new Decimal(0),
   hedgeMarginUsdc: new Decimal(0),
   revenueUsdc: new Decimal(0),
   profitUsdc: new Decimal(0),
@@ -301,7 +381,8 @@ export function applyRiskAccounting(
   feeUsdc: Decimal,
   premiumUsdc: Decimal,
   notionalUsdc: Decimal,
-  hedgeMarginUsdc: Decimal = new Decimal(0)
+  hedgeMarginUsdc: Decimal = new Decimal(0),
+  hedgeCategory: "coverage" | "net" | "unknown" = "coverage"
 ): { state: RiskState; liquidityDelta: LiquidityState } {
   const state = getRiskState(tier);
   const before = { ...liquidityState };
@@ -316,6 +397,12 @@ export function applyRiskAccounting(
   const profit = fee.sub(premium);
   liquidityState.revenueUsdc = liquidityState.revenueUsdc.add(fee);
   liquidityState.hedgeSpendUsdc = liquidityState.hedgeSpendUsdc.add(premium);
+  if (hedgeCategory === "coverage") {
+    liquidityState.coverageHedgeSpendUsdc =
+      liquidityState.coverageHedgeSpendUsdc.add(premium);
+  } else if (hedgeCategory === "net") {
+    liquidityState.netHedgeSpendUsdc = liquidityState.netHedgeSpendUsdc.add(premium);
+  }
   liquidityState.hedgeMarginUsdc = liquidityState.hedgeMarginUsdc.add(hedgeMargin);
   liquidityState.profitUsdc = liquidityState.profitUsdc.add(profit);
 
@@ -334,6 +421,10 @@ export function applyRiskAccounting(
   const liquidityDelta = {
     liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc.minus(before.liquidityBalanceUsdc),
     hedgeSpendUsdc: liquidityState.hedgeSpendUsdc.minus(before.hedgeSpendUsdc),
+    coverageHedgeSpendUsdc: liquidityState.coverageHedgeSpendUsdc.minus(
+      before.coverageHedgeSpendUsdc
+    ),
+    netHedgeSpendUsdc: liquidityState.netHedgeSpendUsdc.minus(before.netHedgeSpendUsdc),
     hedgeMarginUsdc: liquidityState.hedgeMarginUsdc.minus(before.hedgeMarginUsdc),
     revenueUsdc: liquidityState.revenueUsdc.minus(before.revenueUsdc),
     profitUsdc: liquidityState.profitUsdc.minus(before.profitUsdc),
@@ -367,6 +458,10 @@ export function recordRevenue(
   const liquidityDelta = {
     liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc.minus(before.liquidityBalanceUsdc),
     hedgeSpendUsdc: liquidityState.hedgeSpendUsdc.minus(before.hedgeSpendUsdc),
+    coverageHedgeSpendUsdc: liquidityState.coverageHedgeSpendUsdc.minus(
+      before.coverageHedgeSpendUsdc
+    ),
+    netHedgeSpendUsdc: liquidityState.netHedgeSpendUsdc.minus(before.netHedgeSpendUsdc),
     hedgeMarginUsdc: liquidityState.hedgeMarginUsdc.minus(before.hedgeMarginUsdc),
     revenueUsdc: liquidityState.revenueUsdc.minus(before.revenueUsdc),
     profitUsdc: liquidityState.profitUsdc.minus(before.profitUsdc),
@@ -393,6 +488,8 @@ export function resetRiskState(): void {
   liquidityState = {
     liquidityBalanceUsdc: baseLiquidity,
     hedgeSpendUsdc: new Decimal(0),
+    coverageHedgeSpendUsdc: new Decimal(0),
+    netHedgeSpendUsdc: new Decimal(0),
     hedgeMarginUsdc: new Decimal(0),
     revenueUsdc: new Decimal(0),
     profitUsdc: new Decimal(0),
@@ -409,6 +506,8 @@ export function serializeLiquidityState(state: LiquidityState): Record<string, s
   return {
     liquidityBalanceUsdc: state.liquidityBalanceUsdc.toFixed(2),
     hedgeSpendUsdc: state.hedgeSpendUsdc.toFixed(2),
+    coverageHedgeSpendUsdc: state.coverageHedgeSpendUsdc.toFixed(2),
+    netHedgeSpendUsdc: state.netHedgeSpendUsdc.toFixed(2),
     hedgeMarginUsdc: state.hedgeMarginUsdc.toFixed(2),
     revenueUsdc: state.revenueUsdc.toFixed(2),
     profitUsdc: state.profitUsdc.toFixed(2),

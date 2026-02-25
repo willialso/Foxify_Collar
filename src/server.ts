@@ -314,7 +314,7 @@ export async function createServer(overrides: ServerOverrides = {}) {
       );
 
       const finalFee =
-        ctcResult.feeUsdc && ctcResult.feeUsdc.gt(feeBase.feeUsdc)
+        body.tierName !== "Pro (Bronze)" && ctcResult.feeUsdc && ctcResult.feeUsdc.gt(feeBase.feeUsdc)
           ? ctcResult.feeUsdc
           : feeBase.feeUsdc;
 

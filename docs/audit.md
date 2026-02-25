@@ -28,6 +28,8 @@ These events are required for external validation of coverage:
 - `hedge_action` (increase/decrease, instrument, size)
 - `hedge_order` (order placed for hedge)
 - `mtm_credit` (equity update includes hedge MTM)
+- `mtm_position` (per-position MTM credit)
+- `demo_credit` (simulated margin credit in demo mode)
 - `option_payout` (option settlement or payout)
 - `coverage_expired`
 
@@ -50,7 +52,16 @@ Triggered when protection is activated.
   "assets": ["BTC"],
   "notionalUsdc": 25000,
   "floorUsdc": 2000,
-  "expiryIso": "2026-01-29T02:45:10.123Z"
+  "expiryIso": "2026-01-29T02:45:10.123Z",
+  "coverageLegs": [
+    {
+      "instrument": "BTC-29JAN26-82000-P",
+      "size": 0.5,
+      "venue": "deribit",
+      "optionType": "put",
+      "strike": 82000
+    }
+  ]
 }
 ```
 
@@ -93,6 +104,31 @@ Equity snapshot showing hedge MTM inclusion.
   "equityUsdc": 9750.21,
   "positionPnlUsdc": -220.5,
   "hedgeMtmUsdc": 315.0
+}
+```
+
+### mtm_position
+Per-position MTM snapshot for drawdown buffer verification.
+```json
+{
+  "coverageId": "cov_abc",
+  "positionId": "pos_1",
+  "positionPnlUsdc": -120.5,
+  "hedgeMtmUsdc": 220.1,
+  "equityUsdc": 9800.25,
+  "drawdownBufferUsdc": 150.75,
+  "coverageRatio": "1.0200"
+}
+```
+
+### demo_credit
+Simulated margin credit issued on drawdown breach (demo-only).
+```json
+{
+  "coverageId": "cov_abc",
+  "positionId": "pos_1",
+  "creditUsdc": "85.50",
+  "bufferUsdc": "-85.50"
 }
 ```
 

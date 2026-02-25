@@ -33,7 +33,7 @@
 ### Business Validation
 - Risk controls reviewed and approved
 - Tier fees approved
-- Subsidy caps confirmed
+- Pass-through policy confirmed (uncapped, markup-based)
 - Leverage limits validated
 - Premium floor ratios verified
 

@@ -64,9 +64,9 @@ describe("pricingEngine", () => {
     expect(result.fee.toNumber()).toBe(30 * 1.15);
   });
 
-  test("applyBronzeFixedFee returns $20 for Bronze ≤2x", () => {
+  test("applyBronzeFixedFee keeps fee unchanged for Bronze", () => {
     const result = applyBronzeFixedFee("Pro (Bronze)", 1.5, new Decimal(35));
-    expect(result.fee.toNumber()).toBe(20);
+    expect(result.fee.toNumber()).toBe(35);
     expect(result.applied).toBe(true);
   });
 

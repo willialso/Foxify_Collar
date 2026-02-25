@@ -5,11 +5,11 @@
   "type": "module",
   "main": "src/server.ts",
   "dependencies": {
-    "@fastify/cors": "^8.5.0",
+    "@fastify/cors": "^11.2.0",
     "@foxify/connectors": "0.1.0",
     "@foxify/hedging": "0.1.0",
     "decimal.js": "^10.4.3",
-    "fastify": "^4.28.1",
+    "fastify": "^5.7.4",
     "ws": "^8.19.0",
     "zod": "^3.23.8"
   },

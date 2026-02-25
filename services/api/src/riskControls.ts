@@ -1,15 +1,41 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
 
 export interface RiskControlsConfig {
   risk_budget_pct_min: number;
   risk_budget_pct_max: number;
   volatility_throttle_iv: number;
   hedge_reduction_factor: number;
+  enable_hedge_reduction?: boolean;
   max_leverage?: number;
   net_exposure_cap_usdc: Record<string, number>;
   initial_liquidity_usdc?: number;
   reinvest_pct?: number;
   reserve_pct?: number;
+  hedge_action_cooldown_ms?: number;
+  min_hedge_notional_usdc?: number;
+  loop_use_mtm_buffer?: boolean;
+  loop_mtm_max_age_ms?: number;
+  loop_block_on_stale_mtm?: boolean;
+  loop_stale_mtm_cooldown_ms?: number;
+  loop_enable_decrease?: boolean;
+  loop_require_notional_usdc?: boolean;
+  loop_accounting_enabled?: boolean;
+  net_exposure_min_notional_usdc?: number;
+  net_exposure_cooldown_ms?: number;
+  net_exposure_perp_accounting_enabled?: boolean;
+  net_exposure_budget_guard_enabled?: boolean;
+  net_exposure_min_budget_usdc?: number;
+  net_exposure_force_coverage_id?: boolean;
+  slippage_tracking_enabled?: boolean;
+  slippage_guard_enabled?: boolean;
+  slippage_soft_pct?: number;
+  slippage_soft_usdc?: number;
+  slippage_hard_pct?: number;
+  slippage_hard_usdc?: number;
+  slippage_reject_hard?: boolean;
+  slippage_adjust_subsidy_enabled?: boolean;
+  slippage_subsidy_cap_usdc?: number;
+  estimate_premium_on_missing?: boolean;
   max_spread_pct?: number;
   max_slippage_pct?: number;
   max_spread_pct_by_days?: Record<string, number>;
@@ -50,6 +76,12 @@ export interface RiskControlsConfig {
       high?: number;
     }
   >;
+  dynamic_cap_enabled?: boolean;
+  dynamic_cap_max_uplift_pct?: number;
+  dynamic_cap_liquidity_ratio_low?: number;
+  dynamic_cap_liquidity_ratio_high?: number;
+  dynamic_cap_iv_uplift_pct_normal?: number;
+  dynamic_cap_iv_uplift_pct_high?: number;
   fee_leverage_multipliers_by_x?: Record<string, number>;
   pass_through_cap_by_leverage?: Record<string, number>;
   pass_through_cap_by_tier?: Record<string, Record<string, number>>;
@@ -57,6 +89,19 @@ export interface RiskControlsConfig {
   enable_premium_pass_through?: boolean;
   require_user_opt_in_for_pass_through?: boolean;
   pass_through_min_notification_ratio?: number;
+  pass_through_allow_uncapped_bronze?: boolean;
+  pass_through_uncapped_max_ratio?: number;
+  phase3_rollout_enabled?: boolean;
+  phase3_safety_guard_enabled?: boolean;
+  intermittent_analytics_enabled?: boolean;
+  intermittent_selection_shadow_enabled?: boolean;
+  intermittent_selection_live_enabled?: boolean;
+  intermittent_selection_size_tolerance_pct?: number;
+  intermittent_profit_threshold_enabled?: boolean;
+  intermittent_profit_enforce_override?: boolean;
+  intermittent_profit_min_improvement_usdc?: number;
+  intermittent_profit_min_improvement_ratio?: number;
+  intermittent_profit_critical_buffer_pct?: number;
   premium_markup_pct_by_tier?: Record<string, number>;
   leverage_markup_pct_by_x?: Record<string, number>;
   drift_tolerance_pct_by_tier?: Record<string, number>;
@@ -85,6 +130,8 @@ export interface RiskState {
 export interface LiquidityState {
   liquidityBalanceUsdc: number;
   hedgeSpendUsdc: number;
+  coverageHedgeSpendUsdc: number;
+  netHedgeSpendUsdc: number;
   hedgeMarginUsdc: number;
   revenueUsdc: number;
   profitUsdc: number;
@@ -103,11 +150,37 @@ const DEFAULTS: RiskControlsConfig = {
   risk_budget_pct_max: 0.4,
   volatility_throttle_iv: 0.8,
   hedge_reduction_factor: 0.7,
+  enable_hedge_reduction: false,
   max_leverage: 10,
   net_exposure_cap_usdc: {},
-  initial_liquidity_usdc: 20000,
+  initial_liquidity_usdc: 35000,
   reinvest_pct: 0.5,
   reserve_pct: 0.3,
+  hedge_action_cooldown_ms: 60000,
+  min_hedge_notional_usdc: 250,
+  loop_use_mtm_buffer: false,
+  loop_mtm_max_age_ms: 900000,
+  loop_block_on_stale_mtm: false,
+  loop_stale_mtm_cooldown_ms: 0,
+  loop_enable_decrease: false,
+  loop_require_notional_usdc: false,
+  loop_accounting_enabled: false,
+  net_exposure_min_notional_usdc: 500,
+  net_exposure_cooldown_ms: 120000,
+  net_exposure_perp_accounting_enabled: false,
+  net_exposure_budget_guard_enabled: false,
+  net_exposure_min_budget_usdc: 0,
+  net_exposure_force_coverage_id: false,
+  slippage_tracking_enabled: false,
+  slippage_guard_enabled: false,
+  slippage_soft_pct: 0,
+  slippage_soft_usdc: 0,
+  slippage_hard_pct: 0,
+  slippage_hard_usdc: 0,
+  slippage_reject_hard: false,
+  slippage_adjust_subsidy_enabled: false,
+  slippage_subsidy_cap_usdc: 0,
+  estimate_premium_on_missing: false,
   max_spread_pct: 0.05,
   max_slippage_pct: 0.01,
   max_spread_pct_by_days: {},
@@ -141,12 +214,31 @@ const DEFAULTS: RiskControlsConfig = {
     high: 0.8
   },
   fee_iv_regime_multipliers_by_tier: {},
+  dynamic_cap_enabled: true,
+  dynamic_cap_max_uplift_pct: 0.25,
+  dynamic_cap_liquidity_ratio_low: 1.0,
+  dynamic_cap_liquidity_ratio_high: 1.5,
+  dynamic_cap_iv_uplift_pct_normal: 0.1,
+  dynamic_cap_iv_uplift_pct_high: 0.25,
   fee_leverage_multipliers_by_x: {},
   pass_through_cap_by_leverage: {},
   pass_through_cap_by_tier: {},
   enable_premium_pass_through: true,
   require_user_opt_in_for_pass_through: false,
   pass_through_min_notification_ratio: 1.5,
+  pass_through_allow_uncapped_bronze: false,
+  pass_through_uncapped_max_ratio: 0,
+  phase3_rollout_enabled: false,
+  phase3_safety_guard_enabled: true,
+  intermittent_analytics_enabled: false,
+  intermittent_selection_shadow_enabled: false,
+  intermittent_selection_live_enabled: false,
+  intermittent_selection_size_tolerance_pct: 0.2,
+  intermittent_profit_threshold_enabled: false,
+  intermittent_profit_enforce_override: false,
+  intermittent_profit_min_improvement_usdc: 0,
+  intermittent_profit_min_improvement_ratio: 0,
+  intermittent_profit_critical_buffer_pct: 0.02,
   premium_markup_pct_by_tier: {},
   leverage_markup_pct_by_x: {},
   drift_tolerance_pct_by_tier: {},
@@ -181,6 +273,8 @@ let stateByTier: Record<string, RiskState> = {};
 let liquidityState: LiquidityState = {
   liquidityBalanceUsdc: DEFAULTS.initial_liquidity_usdc || 0,
   hedgeSpendUsdc: 0,
+  coverageHedgeSpendUsdc: 0,
+  netHedgeSpendUsdc: 0,
   hedgeMarginUsdc: 0,
   revenueUsdc: 0,
   profitUsdc: 0,
@@ -191,19 +285,81 @@ let subsidyDailyTotal = 0;
 let subsidyByTier: Record<string, number> = {};
 let subsidyByAccount: Record<string, number> = {};
 let subsidyDateKey = dayKey();
+const LIQUIDITY_STATE_PATH = new URL("../../../logs/liquidity-state.json", import.meta.url);
+const LIQUIDITY_STATE_DIR = new URL("../../../logs/", import.meta.url);
+const LIQUIDITY_PERSIST_DEBOUNCE_MS = 250;
+let liquidityStateLoaded = false;
+let liquidityStateLoadedFromFile = false;
+let liquidityPersistTimer: ReturnType<typeof setTimeout> | null = null;
 
 function dayKey(): string {
   const now = new Date();
   return now.toISOString().slice(0, 10);
 }
 
+async function loadLiquidityState(): Promise<boolean> {
+  try {
+    const raw = await readFile(LIQUIDITY_STATE_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    const liquidity = parsed?.liquidity ?? parsed;
+    if (!liquidity || typeof liquidity !== "object") return false;
+    liquidityState = {
+      ...liquidityState,
+      liquidityBalanceUsdc: Number(liquidity.liquidityBalanceUsdc ?? liquidityState.liquidityBalanceUsdc),
+      hedgeSpendUsdc: Number(liquidity.hedgeSpendUsdc ?? liquidityState.hedgeSpendUsdc),
+      coverageHedgeSpendUsdc: Number(
+        liquidity.coverageHedgeSpendUsdc ?? liquidityState.coverageHedgeSpendUsdc
+      ),
+      netHedgeSpendUsdc: Number(liquidity.netHedgeSpendUsdc ?? liquidityState.netHedgeSpendUsdc),
+      hedgeMarginUsdc: Number(liquidity.hedgeMarginUsdc ?? liquidityState.hedgeMarginUsdc),
+      revenueUsdc: Number(liquidity.revenueUsdc ?? liquidityState.revenueUsdc),
+      profitUsdc: Number(liquidity.profitUsdc ?? liquidityState.profitUsdc),
+      reinvestUsdc: Number(liquidity.reinvestUsdc ?? liquidityState.reinvestUsdc),
+      reserveUsdc: Number(liquidity.reserveUsdc ?? liquidityState.reserveUsdc)
+    };
+    return true;
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return false;
+    console.warn("[Liquidity] Failed to load liquidity state:", error?.message ?? error);
+    return false;
+  }
+}
+
+async function ensureLiquidityStateLoaded(): Promise<void> {
+  if (liquidityStateLoaded) return;
+  liquidityStateLoaded = true;
+  liquidityStateLoadedFromFile = await loadLiquidityState();
+}
+
+async function persistLiquidityState(): Promise<void> {
+  liquidityPersistTimer = null;
+  try {
+    await mkdir(LIQUIDITY_STATE_DIR, { recursive: true });
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      liquidity: liquidityState
+    };
+    await writeFile(LIQUIDITY_STATE_PATH, JSON.stringify(payload, null, 2), "utf-8");
+  } catch (error: any) {
+    console.warn("[Liquidity] Failed to persist liquidity state:", error?.message ?? error);
+  }
+}
+
+function scheduleLiquidityPersist(): void {
+  if (liquidityPersistTimer) return;
+  liquidityPersistTimer = setTimeout(() => {
+    void persistLiquidityState();
+  }, LIQUIDITY_PERSIST_DEBOUNCE_MS);
+}
+
 export async function loadRiskControls(path: URL): Promise<RiskControlsConfig> {
-  const stat = await (await import("node:fs/promises")).stat(path);
+  const statInfo = await stat(path);
   if (cachedConfig && stat.mtimeMs === cachedConfigMtime) return cachedConfig;
   const raw = await readFile(path, "utf-8");
   cachedConfig = { ...DEFAULTS, ...JSON.parse(raw) };
-  cachedConfigMtime = stat.mtimeMs;
-  if (cachedConfig.initial_liquidity_usdc !== undefined) {
+  cachedConfigMtime = statInfo.mtimeMs;
+  await ensureLiquidityStateLoaded();
+  if (!liquidityStateLoadedFromFile && cachedConfig.initial_liquidity_usdc !== undefined) {
     liquidityState.liquidityBalanceUsdc = cachedConfig.initial_liquidity_usdc;
   }
   return cachedConfig;
@@ -287,7 +443,8 @@ export function applyRiskAccounting(
   feeUsdc: number,
   premiumUsdc: number,
   notionalUsdc: number,
-  hedgeMarginUsdc = 0
+  hedgeMarginUsdc = 0,
+  hedgeCategory: "coverage" | "net" | "unknown" = "coverage"
 ): { state: RiskState; liquidityDelta: LiquidityState } {
   const state = getRiskState(tier);
   const before = { ...liquidityState };
@@ -297,6 +454,11 @@ export function applyRiskAccounting(
   const profit = feeUsdc - premiumUsdc;
   liquidityState.revenueUsdc += feeUsdc;
   liquidityState.hedgeSpendUsdc += premiumUsdc;
+  if (hedgeCategory === "coverage") {
+    liquidityState.coverageHedgeSpendUsdc += premiumUsdc;
+  } else if (hedgeCategory === "net") {
+    liquidityState.netHedgeSpendUsdc += premiumUsdc;
+  }
   liquidityState.hedgeMarginUsdc += hedgeMarginUsdc;
   liquidityState.profitUsdc += profit;
   const reinvestPct = cachedConfig?.reinvest_pct ?? DEFAULTS.reinvest_pct ?? 0;
@@ -309,12 +471,16 @@ export function applyRiskAccounting(
   const liquidityDelta = {
     liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc - before.liquidityBalanceUsdc,
     hedgeSpendUsdc: liquidityState.hedgeSpendUsdc - before.hedgeSpendUsdc,
+    coverageHedgeSpendUsdc:
+      liquidityState.coverageHedgeSpendUsdc - before.coverageHedgeSpendUsdc,
+    netHedgeSpendUsdc: liquidityState.netHedgeSpendUsdc - before.netHedgeSpendUsdc,
     hedgeMarginUsdc: liquidityState.hedgeMarginUsdc - before.hedgeMarginUsdc,
     revenueUsdc: liquidityState.revenueUsdc - before.revenueUsdc,
     profitUsdc: liquidityState.profitUsdc - before.profitUsdc,
     reinvestUsdc: liquidityState.reinvestUsdc - before.reinvestUsdc,
     reserveUsdc: liquidityState.reserveUsdc - before.reserveUsdc
   };
+  scheduleLiquidityPersist();
   return { state, liquidityDelta };
 }
 
@@ -337,12 +503,16 @@ export function recordRevenue(
   const liquidityDelta = {
     liquidityBalanceUsdc: liquidityState.liquidityBalanceUsdc - before.liquidityBalanceUsdc,
     hedgeSpendUsdc: liquidityState.hedgeSpendUsdc - before.hedgeSpendUsdc,
+    coverageHedgeSpendUsdc:
+      liquidityState.coverageHedgeSpendUsdc - before.coverageHedgeSpendUsdc,
+    netHedgeSpendUsdc: liquidityState.netHedgeSpendUsdc - before.netHedgeSpendUsdc,
     hedgeMarginUsdc: liquidityState.hedgeMarginUsdc - before.hedgeMarginUsdc,
     revenueUsdc: liquidityState.revenueUsdc - before.revenueUsdc,
     profitUsdc: liquidityState.profitUsdc - before.profitUsdc,
     reinvestUsdc: liquidityState.reinvestUsdc - before.reinvestUsdc,
     reserveUsdc: liquidityState.reserveUsdc - before.reserveUsdc
   };
+  scheduleLiquidityPersist();
   return { state, liquidityDelta };
 }
 
@@ -360,6 +530,8 @@ export function resetRiskState(): void {
   liquidityState = {
     liquidityBalanceUsdc: baseLiquidity,
     hedgeSpendUsdc: 0,
+    coverageHedgeSpendUsdc: 0,
+    netHedgeSpendUsdc: 0,
     hedgeMarginUsdc: 0,
     revenueUsdc: 0,
     profitUsdc: 0,
@@ -370,4 +542,5 @@ export function resetRiskState(): void {
   subsidyByTier = {};
   subsidyByAccount = {};
   subsidyDateKey = dayKey();
+  scheduleLiquidityPersist();
 }
