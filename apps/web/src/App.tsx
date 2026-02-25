@@ -1051,6 +1051,15 @@ export function App() {
     let reason = "flat_fee";
     let regimeLabel: string | null = null;
     let selectedVenue: string | null = null;
+    let cacheBust = false;
+    const executionAttempts: Array<{
+      venue: string | null;
+      instrument: string | null;
+      status: string;
+      reason: string | null;
+      message: string | null;
+      diagnostic: any;
+    }> = [];
 
     let orderResponse: any = null;
     try {
@@ -1076,7 +1085,8 @@ export function App() {
               side: netSide,
               coverageId,
               targetDays: expiryDays,
-              allowPremiumPassThrough: true
+              allowPremiumPassThrough: true,
+              _cacheBust: cacheBust
             })
           });
           quote = await quoteRes.json();
@@ -1190,7 +1200,37 @@ export function App() {
                 reason
               })
             });
-            lastResponse = await orderRes.json();
+            let parsedOrder: any = null;
+            try {
+              parsedOrder = await orderRes.json();
+            } catch {
+              parsedOrder = null;
+            }
+            if (!parsedOrder || typeof parsedOrder !== "object") {
+              parsedOrder = {};
+            }
+            if (!orderRes.ok) {
+              parsedOrder.status = String(parsedOrder.status || "execution_error");
+              parsedOrder.reason = String(parsedOrder.reason || `http_${orderRes.status}`);
+              parsedOrder.message = String(
+                parsedOrder.message || `Execution request failed with HTTP ${orderRes.status}.`
+              );
+              parsedOrder.diagnostic = parsedOrder.diagnostic || {
+                category: "execution_error",
+                venue: planVenue ?? selectedVenue ?? null,
+                instrument: plan?.instrument ?? hedgeInstrument,
+                httpStatus: orderRes.status
+              };
+            }
+            lastResponse = parsedOrder;
+            executionAttempts.push({
+              venue: (planVenue ?? selectedVenue ?? null) as string | null,
+              instrument: String(plan?.instrument ?? hedgeInstrument ?? "") || null,
+              status: String(lastResponse?.status || "unknown"),
+              reason: lastResponse?.reason ? String(lastResponse.reason) : null,
+              message: lastResponse?.message ? String(lastResponse.message) : null,
+              diagnostic: lastResponse?.diagnostic ?? null
+            });
             const executed =
               lastResponse &&
               (lastResponse.status === "paper_filled" ||
@@ -1208,8 +1248,9 @@ export function App() {
             }
             const reasonText = String(lastResponse?.reason || "");
             const retryable =
-              lastResponse?.status === "paper_rejected" &&
-              (reasonText === "no_top_of_book" || reasonText === "insufficient_liquidity");
+              (lastResponse?.status === "paper_rejected" &&
+                (reasonText === "no_top_of_book" || reasonText === "insufficient_liquidity")) ||
+              (lastResponse?.status === "execution_error" && lastResponse?.retryable === true);
             if (!retryable) break;
           }
 
@@ -1236,8 +1277,9 @@ export function App() {
           }
           const reasonText = String(orderResponse?.reason || "");
           const retryable =
-            orderResponse?.status === "paper_rejected" &&
-            (reasonText === "no_top_of_book" || reasonText === "insufficient_liquidity");
+            (orderResponse?.status === "paper_rejected" &&
+              (reasonText === "no_top_of_book" || reasonText === "insufficient_liquidity")) ||
+            (orderResponse?.status === "execution_error" && orderResponse?.retryable === true);
           if (!retryable) break;
         }
 
@@ -1273,7 +1315,37 @@ export function App() {
                 reason
               })
             });
-            orderResponse = await fallbackRes.json();
+            let fallbackPayload: any = null;
+            try {
+              fallbackPayload = await fallbackRes.json();
+            } catch {
+              fallbackPayload = null;
+            }
+            if (!fallbackPayload || typeof fallbackPayload !== "object") {
+              fallbackPayload = {};
+            }
+            if (!fallbackRes.ok) {
+              fallbackPayload.status = String(fallbackPayload.status || "execution_error");
+              fallbackPayload.reason = String(fallbackPayload.reason || `http_${fallbackRes.status}`);
+              fallbackPayload.message = String(
+                fallbackPayload.message || `Fallback execution failed with HTTP ${fallbackRes.status}.`
+              );
+              fallbackPayload.diagnostic = fallbackPayload.diagnostic || {
+                category: "execution_error",
+                venue: "deribit",
+                instrument: hedgeInstrument,
+                httpStatus: fallbackRes.status
+              };
+            }
+            orderResponse = fallbackPayload;
+            executionAttempts.push({
+              venue: "deribit",
+              instrument: hedgeInstrument || null,
+              status: String(orderResponse?.status || "unknown"),
+              reason: orderResponse?.reason ? String(orderResponse.reason) : null,
+              message: orderResponse?.message ? String(orderResponse.message) : null,
+              diagnostic: orderResponse?.diagnostic ?? null
+            });
           }
         }
         if (quote && premiumOutUsd === null && markupUsd === null) {
@@ -1300,9 +1372,50 @@ export function App() {
     ) {
       const status = orderResponse?.status ? String(orderResponse.status) : "unknown";
       const reason = orderResponse?.reason ? String(orderResponse.reason) : "no_response";
-      setActivationNoticeTimed(
-        `No executable liquidity available. Protection not activated. (${status}: ${reason})`
-      );
+      const diagnostic = orderResponse?.diagnostic ?? null;
+      const diagnosticVenue = diagnostic?.venue ? String(diagnostic.venue) : null;
+      const diagnosticInstrument = diagnostic?.instrument ? String(diagnostic.instrument) : null;
+      const availableSize =
+        diagnostic?.availableSize ??
+        orderResponse?.availableSize ??
+        null;
+      const responseMessage = orderResponse?.message ? String(orderResponse.message) : null;
+      const attemptsSummary = executionAttempts
+        .slice(-3)
+        .map((attempt) => {
+          const venueSuffix = attempt.venue ? `@${attempt.venue}` : "";
+          return `${attempt.status}:${attempt.reason || "n/a"}${venueSuffix}`;
+        })
+        .join(" | ");
+      if (status === "execution_error" || diagnostic?.category === "execution_error") {
+        const venueText = diagnosticVenue ? ` on ${diagnosticVenue}` : "";
+        const instrumentText = diagnosticInstrument ? ` (${diagnosticInstrument})` : "";
+        setActivationNoticeTimed(
+          `Execution venue error${venueText}${instrumentText}. ${responseMessage || reason}.${
+            attemptsSummary ? ` Attempts: ${attemptsSummary}` : ""
+          }`
+        );
+      } else if (
+        status === "paper_rejected" ||
+        diagnostic?.category === "liquidity_rejected"
+      ) {
+        const venueText = diagnosticVenue ? ` on ${diagnosticVenue}` : "";
+        const availableText =
+          availableSize !== null && availableSize !== undefined
+            ? ` Available size: ${availableSize}.`
+            : "";
+        setActivationNoticeTimed(
+          `Liquidity rejected by venue${venueText} (${reason}).${availableText}${
+            attemptsSummary ? ` Attempts: ${attemptsSummary}` : ""
+          }`
+        );
+      } else {
+        setActivationNoticeTimed(
+          `Protection not activated. (${status}: ${reason})${
+            attemptsSummary ? ` Attempts: ${attemptsSummary}` : ""
+          }`
+        );
+      }
       setIsActivating(false);
       return;
     }
@@ -1348,6 +1461,7 @@ export function App() {
       selectedVenue,
       totalFeeUsd: feeUsd,
       subsidyUsd: 0,
+      executionAttempts: executionAttempts.slice(-10),
       reason,
       quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
       selectedIds,

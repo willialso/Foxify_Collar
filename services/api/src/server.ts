@@ -3108,15 +3108,59 @@ app.post("/deribit/order", async (req) => {
       });
     }
   }
-  const response = await executionRegistry.placeOrder(venue, {
-    instrument,
-    amount: body.amount,
-    side: body.side,
-    type: body.type,
-    price: body.price,
-    spotPrice: body.spotPrice
-  });
+  let response: any;
+  try {
+    response = await executionRegistry.placeOrder(venue, {
+      instrument,
+      amount: body.amount,
+      side: body.side,
+      type: body.type,
+      price: body.price,
+      spotPrice: body.spotPrice
+    });
+  } catch (error: any) {
+    const failure = {
+      status: "execution_error",
+      reason: "venue_unavailable",
+      message: "Order execution failed before liquidity validation.",
+      retryable: true,
+      diagnostic: {
+        category: "execution_error",
+        venue,
+        instrument: body.instrument,
+        amount: body.amount,
+        side: body.side,
+        type: body.type ?? "market",
+        detail: error?.message ?? "unknown_error"
+      }
+    };
+    await audit("hedge_order_failed", {
+      coverageId: body.coverageId || null,
+      quoteId: body.quoteId ?? null,
+      tierName: body.tierName ?? null,
+      accountId: body.accountId ?? null,
+      ...failure.diagnostic
+    });
+    return failure;
+  }
   const status = String((response as any)?.status || "");
+  const orderReason = String((response as any)?.reason || "");
+  const liquidityRejected =
+    status === "paper_rejected" &&
+    (orderReason === "no_top_of_book" || orderReason === "insufficient_liquidity");
+  if (liquidityRejected) {
+    (response as any).diagnostic = {
+      category: "liquidity_rejected",
+      venue,
+      instrument: body.instrument,
+      requestedAmount: body.amount,
+      availableSize: (response as any)?.availableSize ?? null,
+      bestBid: (response as any)?.bestBid ?? null,
+      bestAsk: (response as any)?.bestAsk ?? null,
+      bookTimestamp: (response as any)?.bookTimestamp ?? null
+    };
+    (response as any).retryable = true;
+  }
   const filledAmount = Number((response as any)?.filledAmount ?? body.amount);
   const fillPrice =
     (response as any)?.result?.average_price ??
@@ -3265,7 +3309,8 @@ app.post("/deribit/order", async (req) => {
     venue,
     bestBid: (response as any)?.bestBid ?? null,
     bestAsk: (response as any)?.bestAsk ?? null,
-    availableSize: (response as any)?.availableSize ?? null
+    availableSize: (response as any)?.availableSize ?? null,
+    diagnostic: (response as any)?.diagnostic ?? null
   });
   if (executed && body.tierName && body.feeUsdc !== undefined) {
     const premiumForAccounting =
