@@ -4784,7 +4784,7 @@ app.post("/put/quote", async (req) => {
   const response = {
     status: "ok",
     optionType,
-    venue: "deribit",
+    venue: chosenExecutionPlans?.[0]?.venue ?? null,
     strike: quote.strike.toFixed(0),
     premiumUsdc: quote.premiumTotal.toFixed(2),
     premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
