@@ -1029,17 +1029,13 @@ export function App() {
     const canUsePreviewQuote =
       previewFresh &&
       previewQuoteRaw &&
-      (previewStatus === "ok" || previewStatus === "pass_through" || previewStatus === "pass_through_capped");
+      (previewStatus === "ok" || previewStatus === "pass_through");
     let quote: any = canUsePreviewQuote ? previewQuoteRaw : null;
     let hedgeType: "option" | "perp" = "option";
     let hedgeInstrument = "";
     let hedgeSize = 0;
     let bufferTargetPct = 0.05;
     let feeUsd = totalFeeUsd;
-    let markupUsd: number | null = null;
-    let premiumOutUsd: number | null = null;
-    let executedPremiumUsd: number | null = null;
-    let subsidyUsd = 0;
     let reason = "flat_fee";
     let regimeLabel: string | null = null;
     let selectedVenue: string | null = null;
@@ -1051,32 +1047,32 @@ export function App() {
           quote = previewQuoteRaw;
         }
         const maxAttempts = 3;
-        let cacheBust = false;
-        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-          if (attempt === 0 && canUsePreviewQuote && !cacheBust) {
-            quote = previewQuoteRaw;
-          } else {
-            const quoteRes = await fetch(`${API_BASE}/put/quote`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                tierName: level.name,
-                asset: primaryAsset,
-                spotPrice: spot,
-                drawdownFloorPct: drawdownPct,
-                fixedPriceUsdc: totalFeeUsd,
-                positionSize,
-                contractSize: 1,
-                leverage: primary?.leverage ?? 1,
-                ivSnapshot: ivSnapshot.value,
-                side: netSide,
-                coverageId,
-                targetDays: expiryDays,
-                allowPremiumPassThrough: true,
-                _cacheBust: cacheBust
-              })
-            });
-            quote = await quoteRes.json();
+        for (let attempt = 0; attempt < maxAttempts && !canUsePreviewQuote; attempt += 1) {
+          const quoteRes = await fetch(`${API_BASE}/put/quote`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              tierName: level.name,
+              asset: primaryAsset,
+              spotPrice: spot,
+              drawdownFloorPct: drawdownPct,
+              fixedPriceUsdc: totalFeeUsd,
+              positionSize,
+              contractSize: 1,
+              leverage: primary?.leverage ?? 1,
+              ivSnapshot: ivSnapshot.value,
+              side: netSide,
+              coverageId,
+              targetDays: expiryDays,
+              allowPremiumPassThrough: true
+            })
+          });
+          quote = await quoteRes.json();
+
+          if (quote?.status === "pass_through") {
+            const pricing = quote?.pricing;
+            const message = `High volatility: Premium is ${pricing?.ratio || "N/A"}× base fee. You'll be charged $${quote.feeUsdc} for full protection.`;
+            setLastExecution(message);
           }
 
           if (quote?.status === "partial") {
@@ -1112,7 +1108,6 @@ export function App() {
           }
 
           feeUsd = quote.feeUsdc ? Number(quote.feeUsdc) : totalFeeUsd;
-          subsidyUsd = quote.subsidyUsdc ? Number(quote.subsidyUsdc) : 0;
           reason = quote.reason || "flat_fee";
           regimeLabel = formatFeeRegime(quote.feeRegime);
           const markupCandidate = quote?.premiumMarkupUsdc;
@@ -1174,7 +1169,7 @@ export function App() {
               spotPrice: spot,
               floorPrice,
                 feeRecognized: true,
-                subsidyUsdc: subsidyUsd,
+                subsidyUsdc: 0,
                 reason
               })
             });
@@ -1335,7 +1330,7 @@ export function App() {
       markupUsd,
       selectedVenue,
       totalFeeUsd: feeUsd,
-      subsidyUsd,
+      subsidyUsd: 0,
       reason,
       quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
       selectedIds,
@@ -1354,11 +1349,9 @@ export function App() {
         instrument: hedgeInstrument || null,
         venue: selectedVenue,
         quoteId: quote?.quoteId ?? previewQuote?.quoteId ?? null,
-        premiumUsdc: executedPremiumUsd ?? premiumOutUsd ?? null,
-        quotedPremiumUsdc: premiumOutUsd ?? null,
-        executedPremiumUsdc: executedPremiumUsd ?? null,
-        subsidyUsdc: subsidyUsd || null,
-        reason,
+          premiumUsdc: quote?.premiumUsdc ?? null,
+          subsidyUsdc: null,
+          reason,
         hedgeSize: hedgeSize || null,
         optionType: quote?.optionType ?? null,
         strike: quote?.strike ?? null,

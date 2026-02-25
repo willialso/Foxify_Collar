@@ -45,8 +45,6 @@ import {
   riskSummary,
   liquiditySummary,
   getRiskState,
-  canApplySubsidy,
-  recordSubsidy,
   subsidySummary,
   resetRiskState,
   type LiquidityState
@@ -1672,11 +1670,6 @@ function premiumFloorBreached(premiumTotal: Decimal, feeUsdc: Decimal): {
   return { breached: ratio.gt(threshold), ratio, threshold };
 }
 
-function canCoverageOverride(tierName: string): boolean {
-  const allowed = riskControls.coverage_override_tiers ?? [];
-  return allowed.includes(tierName);
-}
-
 function getCombinedExposureBook(): {
   exposures: Array<{
     asset: string;
@@ -3240,16 +3233,13 @@ app.post("/deribit/order", async (req) => {
       tier: body.tierName,
       feeUsdc: feeForAccounting,
       premiumUsdc: premiumForAccounting,
-      subsidyUsdc: effectiveSubsidyUsdc,
+      subsidyUsdc: 0,
       notionalUsdc: body.notionalUsdc ?? 0,
       hedgeNotionalUsdc,
       hedgeMarginUsdc,
       delta: accounting.liquidityDelta,
       totals: liquiditySummary()
     });
-    if (effectiveSubsidyUsdc > 0) {
-      recordSubsidy(body.tierName, body.accountId || null, effectiveSubsidyUsdc);
-    }
   }
   return response;
 });
@@ -4120,54 +4110,15 @@ app.post("/put/quote", async (req) => {
     const markupPct = resolvePremiumMarkupPct(tierName, leverage);
     const passThroughFee = allInPremium.mul(new Decimal(1).add(markupPct));
     const premiumFloor = premiumFloorBreached(allInPremium, baseFeeUsdc);
-    const isPremiumTier =
-      tierName === "Pro (Silver)" ||
-      tierName === "Pro (Gold)" ||
-      tierName === "Pro (Platinum)";
     const allowPartialCoverage = tierName === "Pro (Bronze)" && body.allowPartialCoverage === true;
     const passThroughEnabled = riskControls.enable_premium_pass_through !== false;
     const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
     const userOptedIn = body.allowPremiumPassThrough !== false;
     const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
-    const passThroughCapInfo = applyPassThroughCap(
-      baseFeeUsdc,
-      allInPremium,
-      leverage,
-      tierName,
-      feeIv.scaled ?? 0
-    );
+    const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
     const passThroughCapped = passThroughCapInfo.maxFee
       ? passThroughFee.gt(passThroughCapInfo.maxFee)
       : false;
-    const uncappedBronzeEnabled = riskControls.pass_through_allow_uncapped_bronze === true;
-    const uncappedMaxRatioRaw = riskControls.pass_through_uncapped_max_ratio ?? 0;
-    const uncappedMaxRatioValue = Number(uncappedMaxRatioRaw);
-    const uncappedMaxRatio =
-      Number.isFinite(uncappedMaxRatioValue) && uncappedMaxRatioValue > 0
-        ? new Decimal(uncappedMaxRatioValue)
-        : null;
-    const allowBronzeCapOverride =
-      uncappedBronzeEnabled &&
-      tierName === "Pro (Bronze)" &&
-      (uncappedMaxRatio ? premiumFloor.ratio.lte(uncappedMaxRatio) : true);
-    if (!premiumFloor.breached) {
-      if (passThroughFee.gt(baseFeeUsdc)) {
-        feeUsdc = passThroughFee;
-        feeReason = "premium_markup";
-      } else {
-        feeUsdc = baseFeeUsdc;
-        if (feeReason !== "ctc_safety") {
-          feeReason = "base_fee";
-        }
-      }
-    }
-    let subsidyNeeded = allInPremium.minus(feeUsdc);
-    let subsidyCheck = canApplySubsidy(
-      tierName,
-      body.accountId || null,
-      subsidyNeeded.toNumber(),
-      feeIv.scaled
-    );
     await audit("pass_through_gate", {
       passThroughEnabled,
       requiresUserOptIn,
@@ -4201,11 +4152,7 @@ app.post("/put/quote", async (req) => {
       : null;
     const canFullyCover = bestCandidate.availableSize.greaterThanOrEqualTo(hedgeSizeForQuote);
 
-    if (premiumFloor.breached) {
-      const minNotificationRatio = new Decimal(
-        riskControls.pass_through_min_notification_ratio ?? 1.5
-      );
-      const shouldNotify = premiumFloor.ratio.gte(minNotificationRatio);
+    if (premiumFloor.breached && !canPassThrough) {
       const optionSymbol = optionType === "put" ? "P" : "C";
       const optionInstrument = buildVenueInstrumentName(
         asset,
@@ -4213,541 +4160,22 @@ app.post("/put/quote", async (req) => {
         bestCandidate.strike.toFixed(0),
         optionSymbol
       );
-      const ratio = premiumFloor.ratio.toFixed(4);
-      const threshold = premiumFloor.threshold.toFixed(4);
-
-      if (canPassThrough && !passThroughCapped) {
-        const venueInfo = attachVenueMetadata({
-          selectionSnapshot: fallbackSnapshot,
-          hedgeSize: hedgeSizeForQuote.toFixed(4)
-        } as Record<string, unknown>);
-        await audit("premium_pass_through", {
-          type: "uncapped",
-          baseFee: baseFeeUsdc.toFixed(2),
-          allInPremium: allInPremium.toFixed(2),
-          markupPct: markupPct.mul(100).toFixed(2),
-          ratio,
-          threshold,
-          tierName,
-          leverage,
-          optionType,
-          instrument: optionInstrument,
-          optionVenue: (venueInfo as any).optionVenue ?? null,
-          venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
-        });
-        return cacheAndReturn({
-          status: "pass_through",
-          expiryTag: bestCandidate.expiryTag,
-          targetDays: bestCandidate.targetDays,
-          optionType,
-          strike: bestCandidate.strike.toFixed(0),
-          instrument: optionInstrument,
-          spotPrice: spotPrice.toNumber(),
-          drawdownFloorPct: drawdownFloorPct.toNumber(),
-          targetStrike: targetStrike.toNumber(),
-          premiumUsdc: premiumTotal.toFixed(2),
-          premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: hedgeSizeForQuote.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          subsidyUsdc: "0.00",
-          baseFeeUsdc: baseFeeUsdc.toFixed(2),
-          feeUsdc: passThroughFee.toFixed(2),
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-          passThroughCapped: false,
-          reason: "premium_floor_pass_through",
-          liquidityOverride: liquidityOverrideUsed,
-          replication: fallbackReplication,
-          survivalCheck,
-          selectionSnapshot: fallbackSnapshot,
-          rollMultiplier: bestCandidate.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-          hedge: {
-            instrument: optionInstrument,
-            size: hedgeSizeForQuote.toFixed(4),
-            premiumUsdc: allInPremium.toFixed(2),
-            expiryTag: bestCandidate.expiryTag,
-            daysToExpiry: bestCandidate.targetDays,
-            strike: bestCandidate.strike.toFixed(0)
-          },
-          pricing: {
-            type: "pass_through",
-            baseFee: baseFeeUsdc.toFixed(2),
-            hedgePremium: allInPremium.toFixed(2),
-            totalFee: passThroughFee.toFixed(2),
-            ratio,
-            threshold,
-            markupPct: markupPct.mul(100).toFixed(2),
-            markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
-            explanation:
-              `Market volatility requires premium ${premiumFloor.ratio.toFixed(2)}× base fee. ` +
-              `Charging premium + markup = $${passThroughFee.toFixed(2)} for full protection.`
-          },
-          warning: shouldNotify
-            ? {
-                type: "premium_pass_through",
-                ratio,
-                threshold,
-                message:
-                  `Premium is ${premiumFloor.ratio.toFixed(2)}× the base fee due to market conditions. ` +
-                  `You'll be charged premium + markup = $${passThroughFee.toFixed(2)}.`
-              }
-            : undefined
-        });
-      }
-
-      if (canPassThrough && passThroughCapped && passThroughCapInfo.maxFee) {
-        const cappedFee = passThroughCapInfo.maxFee;
-        const subsidyNeededCapped = allInPremium.minus(cappedFee);
-        if (!isPremiumTier) {
-          if (allowBronzeCapOverride) {
-            const venueInfo = attachVenueMetadata({
-              selectionSnapshot: fallbackSnapshot,
-              hedgeSize: hedgeSizeForQuote.toFixed(4)
-            } as Record<string, unknown>);
-            await audit("premium_pass_through", {
-              type: "cap_override",
-              baseFee: baseFeeUsdc.toFixed(2),
-              allInPremium: allInPremium.toFixed(2),
-              capMultiplier: passThroughCapInfo.capMultiplier
-                ? formatCapMultiplier(passThroughCapInfo)
-                : null,
-              ratio,
-              threshold,
-              tierName,
-              leverage,
-              optionType,
-              instrument: optionInstrument,
-              optionVenue: (venueInfo as any).optionVenue ?? null,
-              venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
-            });
-            const explanation =
-              `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
-              `of ${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}×. ` +
-              `Charging the full hedge premium to keep protection active.`;
-            return cacheAndReturn({
-              status: "pass_through",
-              expiryTag: bestCandidate.expiryTag,
-              targetDays: bestCandidate.targetDays,
-              optionType,
-              strike: bestCandidate.strike.toFixed(0),
-              instrument: optionInstrument,
-              spotPrice: spotPrice.toNumber(),
-              drawdownFloorPct: drawdownFloorPct.toNumber(),
-              targetStrike: targetStrike.toNumber(),
-              premiumUsdc: premiumTotal.toFixed(2),
-              premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-              hedgeSize: hedgeSizeForQuote.toFixed(4),
-              sizingMethod: body.optionDelta ? "delta" : "notional",
-              bufferTargetPct: "0.00",
-              markIv: feeIv.raw,
-              subsidyUsdc: "0.00",
-              baseFeeUsdc: baseFeeUsdc.toFixed(2),
-              feeUsdc: passThroughFee.toFixed(2),
-              feeRegime: feeRegime.regime,
-              feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-              feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-              passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-              passThroughCapped: true,
-              reason: "premium_floor_pass_through_override",
-              liquidityOverride: liquidityOverrideUsed,
-              replication: fallbackReplication,
-              survivalCheck,
-              selectionSnapshot: fallbackSnapshot,
-              rollMultiplier: bestCandidate.rollMultiplier,
-              rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-              hedge: {
-                instrument: optionInstrument,
-                size: hedgeSizeForQuote.toFixed(4),
-                premiumUsdc: allInPremium.toFixed(2),
-                expiryTag: bestCandidate.expiryTag,
-                daysToExpiry: bestCandidate.targetDays,
-                strike: bestCandidate.strike.toFixed(0)
-              },
-              pricing: {
-                type: "pass_through_override",
-                baseFee: baseFeeUsdc.toFixed(2),
-                hedgePremium: allInPremium.toFixed(2),
-                totalFee: passThroughFee.toFixed(2),
-                markupPct: markupPct.mul(100).toFixed(2),
-                markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
-                ratio,
-                threshold,
-                capMultiplier: passThroughCapInfo.capMultiplier
-                  ? formatCapMultiplier(passThroughCapInfo, 2)
-                  : "N/A",
-                explanation
-              },
-              warning: {
-                type: "premium_pass_through_override",
-                ratio,
-                threshold,
-                message: explanation
-              }
-            });
-          }
-          const rejectReason = "premium_floor_pass_through_capped";
-          await audit("premium_floor_rejected", {
-            baseFee: baseFeeUsdc.toFixed(2),
-            allInPremium: allInPremium.toFixed(2),
-            ratio,
-            threshold,
-            reason: rejectReason,
-            canPassThrough,
-            capped: true,
-            capMultiplier: passThroughCapInfo.capMultiplier
-              ? formatCapMultiplier(passThroughCapInfo)
-              : null,
-            tierName,
-            leverage,
-            optionType,
-            instrument: optionInstrument
-          });
-          await audit("debug_feasibility_search_start", {
-            tierName,
-            optionType,
-            leverage,
-            targetDays,
-            premium: allInPremium.toFixed(2),
-            cap: cappedFee.toFixed(2)
-          });
-          // Bronze tier does not receive capped pass-through subsidy.
-          const feasibility = null;
-          await audit("debug_feasibility_search_result", {
-            found: feasibility?.found ?? false,
-            suggestionType: feasibility?.suggestion?.type,
-            newLeverage: feasibility?.suggestion?.newLeverage,
-            newDuration: feasibility?.suggestion?.newDuration,
-            estimatedPremium: feasibility?.suggestion?.estimatedPremium?.toFixed(2)
-          });
-          const leverageSuggestion = Math.max(1, Math.floor(leverage / 2));
-          const suggestedCap = resolvePassThroughCapMultiplier(leverageSuggestion, tierName);
-          const currentDays = bestCandidate.targetDays;
-          const currentFloorPct = drawdownFloorPct.toNumber();
-          const enhancedMessage =
-            optionType === "call" && tierName === "Pro (Bronze)"
-              ? `Bronze tier call protection limit reached. Current request: ` +
-                `${leverage}× leverage, ${currentDays} days, ${(currentFloorPct * 100).toFixed(
-                  0
-                )}% floor.`
-              : "Protection cost exceeds Bronze tier limits for this request.";
-          const baseSuggestions = [
-            `Reduce leverage from ${leverage}× to ${leverageSuggestion}× ` +
-              `(cap ${suggestedCap ? `${suggestedCap.toFixed(1)}×` : "N/A"})`,
-            `Reduce protection duration from ${currentDays} days to ${Math.max(
-              1,
-              Math.floor(currentDays / 2)
-            )} days`,
-            `Increase drawdown floor to ${Math.min(0.25, currentFloorPct + 0.05).toFixed(2)}`,
-            "Reduce position size to lower premium"
-          ];
-          const dynamicSuggestions = baseSuggestions;
-          return cacheAndReturn({
-            status: "premium_floor",
-            expiryTag: bestCandidate.expiryTag,
-            targetDays: bestCandidate.targetDays,
-            optionType,
-            strike: bestCandidate.strike.toFixed(0),
-            instrument: optionInstrument,
-            spotPrice: spotPrice.toNumber(),
-            premiumUsdc: premiumTotal.toFixed(2),
-            premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-            hedgeSize: hedgeSizeForQuote.toFixed(4),
-            sizingMethod: body.optionDelta ? "delta" : "notional",
-            bufferTargetPct: "0.00",
-            markIv: feeIv.raw,
-            subsidyUsdc: "0.00",
-            baseFeeUsdc: baseFeeUsdc.toFixed(2),
-            feeUsdc: baseFeeUsdc.toFixed(2),
-            feeRegime: feeRegime.regime,
-            feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-            feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-            passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-            passThroughCapped: true,
-            reason: rejectReason,
-            liquidityOverride: liquidityOverrideUsed,
-            replication: fallbackReplication,
-            survivalCheck,
-            selectionSnapshot: fallbackSnapshot,
-            rollMultiplier: bestCandidate.rollMultiplier,
-            rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-            message: enhancedMessage,
-            details:
-              optionType === "call" && tierName === "Pro (Bronze)"
-                ? {
-                    requestedPremium: premiumTotal.toFixed(2),
-                    tierCap: cappedFee.toFixed(2),
-                    exceedAmount: premiumTotal.minus(cappedFee).toFixed(2),
-                    currentParams: {
-                      leverage,
-                      duration: currentDays,
-                      drawdownFloor: currentFloorPct
-                    }
-                  }
-                : undefined,
-            // No guaranteed_working_option for Bronze
-            pricing: {
-              baseFee: baseFeeUsdc.toFixed(2),
-              hedgePremium: allInPremium.toFixed(2),
-              ratio,
-              threshold,
-              capMultiplier: passThroughCapInfo.capMultiplier
-                ? formatCapMultiplier(passThroughCapInfo, 2)
-                : "N/A",
-              explanation:
-                `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
-                `of ${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}×. ` +
-                `Reduce leverage, duration, or widen the floor to lower premium.`
-            },
-            warning: {
-              type: "premium_floor",
-              ratio,
-              threshold,
-              message:
-                "Premium too high for Bronze tier. Reduce leverage, duration, or widen the floor."
-            },
-            suggestions: dynamicSuggestions
-          });
-        }
-        const subsidyCheckCapped = subsidyNeededCapped.gt(0)
-          ? canApplySubsidy(
-              tierName,
-              body.accountId || null,
-              subsidyNeededCapped.toNumber(),
-              feeIv.scaled
-            )
-          : { allowed: true, reason: "ok" };
-        if (subsidyNeededCapped.gt(0) && !subsidyCheckCapped.allowed) {
-          const rejectReason = "premium_floor_pass_through_capped";
-          await audit("premium_floor_rejected", {
-            baseFee: baseFeeUsdc.toFixed(2),
-            allInPremium: allInPremium.toFixed(2),
-            ratio,
-            threshold,
-            reason: rejectReason,
-            canPassThrough,
-            capped: true,
-            capMultiplier: passThroughCapInfo.capMultiplier
-              ? formatCapMultiplier(passThroughCapInfo)
-              : null,
-            tierName,
-            leverage,
-            optionType,
-            instrument: optionInstrument
-          });
-          const leverageSuggestion = Math.max(1, Math.floor(leverage / 2));
-          const suggestedCap = resolvePassThroughCapMultiplier(leverageSuggestion, tierName);
-          return cacheAndReturn({
-            status: "premium_floor",
-            expiryTag: bestCandidate.expiryTag,
-            targetDays: bestCandidate.targetDays,
-            optionType,
-            strike: bestCandidate.strike.toFixed(0),
-            instrument: optionInstrument,
-            spotPrice: spotPrice.toNumber(),
-            premiumUsdc: premiumTotal.toFixed(2),
-            premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-            hedgeSize: hedgeSizeForQuote.toFixed(4),
-            sizingMethod: body.optionDelta ? "delta" : "notional",
-            bufferTargetPct: "0.00",
-            markIv: feeIv.raw,
-            subsidyUsdc: "0.00",
-            baseFeeUsdc: baseFeeUsdc.toFixed(2),
-            feeUsdc: baseFeeUsdc.toFixed(2),
-            feeRegime: feeRegime.regime,
-            feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-            feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-            passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-            passThroughCapped: true,
-            reason: rejectReason,
-            liquidityOverride: liquidityOverrideUsed,
-            replication: fallbackReplication,
-            survivalCheck,
-            selectionSnapshot: fallbackSnapshot,
-            rollMultiplier: bestCandidate.rollMultiplier,
-            rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-            pricing: {
-              baseFee: baseFeeUsdc.toFixed(2),
-              hedgePremium: allInPremium.toFixed(2),
-              ratio,
-              threshold,
-              capMultiplier: passThroughCapInfo.capMultiplier
-                ? formatCapMultiplier(passThroughCapInfo, 2)
-                : "N/A",
-              explanation:
-                `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds maximum ` +
-                `${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
-                `Try: lower leverage, shorter duration, wider floor, or smaller size.`
-            },
-            warning: {
-              type: "premium_floor",
-              ratio,
-              threshold,
-              message:
-                `Premium too high for ${tierName} tier at ${leverage}× leverage. ` +
-                `Reduce leverage, duration, or widen the floor.`
-            },
-            suggestions: [
-              `Reduce leverage from ${leverage}× to ${leverageSuggestion}× ` +
-                `(cap ${suggestedCap ? `${suggestedCap.toFixed(1)}×` : "N/A"})`,
-              `Reduce protection duration from ${bestCandidate.targetDays} days to ${Math.max(
-                1,
-                Math.floor(bestCandidate.targetDays / 2)
-              )} days`,
-              "Increase drawdown floor percentage to reduce premium",
-              "Reduce position size to lower premium"
-            ]
-          });
-        }
-
-        const venueInfo = attachVenueMetadata({
-          selectionSnapshot: fallbackSnapshot,
-          hedgeSize: hedgeSizeForQuote.toFixed(4)
-        } as Record<string, unknown>);
-        await audit("premium_pass_through", {
-          type: "capped",
-          baseFee: baseFeeUsdc.toFixed(2),
-          allInPremium: allInPremium.toFixed(2),
-          cappedFee: cappedFee.toFixed(2),
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? formatCapMultiplier(passThroughCapInfo)
-            : null,
-          ratio,
-          tierName,
-          leverage,
-          optionType,
-          instrument: optionInstrument,
-          optionVenue: (venueInfo as any).optionVenue ?? null,
-          venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
-        });
-        return cacheAndReturn({
-          status: "pass_through_capped",
-          expiryTag: bestCandidate.expiryTag,
-          targetDays: bestCandidate.targetDays,
-          optionType,
-          strike: bestCandidate.strike.toFixed(0),
-          instrument: optionInstrument,
-          spotPrice: spotPrice.toNumber(),
-          drawdownFloorPct: drawdownFloorPct.toNumber(),
-          targetStrike: targetStrike.toNumber(),
-          premiumUsdc: premiumTotal.toFixed(2),
-          premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: hedgeSizeForQuote.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          subsidyUsdc: subsidyNeededCapped.toFixed(2),
-          baseFeeUsdc: baseFeeUsdc.toFixed(2),
-          feeUsdc: cappedFee.toFixed(2),
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-          passThroughCapped: true,
-          reason: "premium_floor_pass_through_capped",
-          liquidityOverride: liquidityOverrideUsed,
-          replication: fallbackReplication,
-          survivalCheck,
-          selectionSnapshot: fallbackSnapshot,
-          rollMultiplier: bestCandidate.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-          hedge: {
-            instrument: optionInstrument,
-            size: hedgeSizeForQuote.toFixed(4),
-            premiumUsdc: allInPremium.toFixed(2),
-            expiryTag: bestCandidate.expiryTag,
-            daysToExpiry: bestCandidate.targetDays,
-            strike: bestCandidate.strike.toFixed(0)
-          },
-          pricing: {
-            type: "pass_through_capped",
-            baseFee: baseFeeUsdc.toFixed(2),
-            hedgePremium: allInPremium.toFixed(2),
-            cappedFee: cappedFee.toFixed(2),
-            capMultiplier: passThroughCapInfo.capMultiplier
-              ? formatCapMultiplier(passThroughCapInfo, 2)
-              : "N/A",
-            platformSubsidy: subsidyNeededCapped.toFixed(2),
-            totalFee: cappedFee.toFixed(2),
-            ratio,
-            threshold,
-            explanation:
-              `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds ${tierName} tier cap. ` +
-              `Fee capped at $${cappedFee.toFixed(2)} ` +
-              `(${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}× base). ` +
-              `Platform subsidizing $${subsidyNeededCapped.toFixed(2)} for full protection.`
-          },
-          warning: shouldNotify
-            ? {
-                type: "premium_capped",
-                ratio,
-                threshold,
-                message:
-                  `Premium exceeds tier cap. Fee capped at $${cappedFee.toFixed(2)}. ` +
-                  `You're still fully protected.`
-              }
-            : undefined
-        });
-      }
-
-      const rejectReason = passThroughCapped
-        ? "premium_floor_pass_through_capped"
-        : "premium_floor_no_pass_through";
       await audit("premium_floor_rejected", {
         baseFee: baseFeeUsdc.toFixed(2),
         allInPremium: allInPremium.toFixed(2),
-        ratio,
-        threshold,
-        reason: rejectReason,
+        ratio: premiumFloor.ratio.toFixed(4),
+        threshold: premiumFloor.threshold.toFixed(4),
+        reason: "premium_floor_no_pass_through",
         canPassThrough,
-        capped: passThroughCapped,
-        capMultiplier: passThroughCapInfo.capMultiplier
-          ? formatCapMultiplier(passThroughCapInfo)
-          : null,
+        capped: false,
+        capMultiplier: null,
         tierName,
         leverage,
         optionType,
         instrument: optionInstrument
       });
-      await audit("debug_feasibility_search_start", {
-        tierName,
-        optionType,
-        leverage,
-        targetDays,
-        premium: allInPremium.toFixed(2),
-        cap: passThroughCapInfo.maxFee ? passThroughCapInfo.maxFee.toFixed(2) : null
-      });
-      // Bronze tier does not receive capped pass-through subsidy.
-      const feasibility = null;
-      await audit("debug_feasibility_search_result", {
-        found: feasibility?.found ?? false,
-        suggestionType: feasibility?.suggestion?.type,
-        newLeverage: feasibility?.suggestion?.newLeverage,
-        newDuration: feasibility?.suggestion?.newDuration,
-        estimatedPremium: feasibility?.suggestion?.estimatedPremium?.toFixed(2)
-      });
       const currentDays = bestCandidate.targetDays;
       const currentFloorPct = drawdownFloorPct.toNumber();
-      const baseSuggestions = passThroughCapped
-        ? [
-            `Reduce leverage from ${leverage}× to ${Math.max(1, Math.floor(leverage / 2))}×`,
-            `Reduce protection duration from ${currentDays} days to ${Math.max(
-              1,
-              Math.floor(currentDays / 2)
-            )} days`,
-            "Increase drawdown floor percentage to reduce premium",
-            "Reduce position size to lower premium"
-          ]
-        : [
-            "Reduce leverage or duration to lower premium",
-            "Increase drawdown floor percentage to reduce premium",
-            "Contact support to enable premium pass-through"
-          ];
-      const dynamicSuggestions = baseSuggestions;
       return cacheAndReturn({
         status: "premium_floor",
         expiryTag: bestCandidate.expiryTag,
@@ -4768,41 +4196,36 @@ app.post("/put/quote", async (req) => {
         feeRegime: feeRegime.regime,
         feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
         feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-        passThroughCapped: passThroughCapped,
-        reason: rejectReason,
+        passThroughCapMultiplier: null,
+        passThroughCapped: false,
+        reason: "premium_floor_no_pass_through",
         liquidityOverride: liquidityOverrideUsed,
         replication: fallbackReplication,
         survivalCheck,
         selectionSnapshot: fallbackSnapshot,
         rollMultiplier: bestCandidate.rollMultiplier,
         rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-        // No guaranteed_working_option for Bronze
         pricing: {
           baseFee: baseFeeUsdc.toFixed(2),
           hedgePremium: allInPremium.toFixed(2),
-          ratio,
-          threshold,
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? formatCapMultiplier(passThroughCapInfo, 2)
-            : "N/A",
-          explanation: passThroughCapped
-            ? `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds maximum ` +
-              `${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
-              `Try: lower leverage, shorter duration, wider floor, or smaller size.`
-            : `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds threshold. ` +
-              `Pass-through not enabled. Contact support if you need higher limits.`
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4),
+          explanation:
+            `Premium ${premiumFloor.ratio.toFixed(2)}\u00d7 base fee exceeds threshold. ` +
+            `Enable pass-through or reduce leverage, duration, floor strictness, or size.`
         },
         warning: {
           type: "premium_floor",
-          ratio,
-          threshold,
-          message: passThroughCapped
-            ? `Premium too high for ${tierName} tier at ${leverage}× leverage. ` +
-              `Reduce leverage, duration, or widen the floor.`
-            : `Premium ${premiumFloor.ratio.toFixed(2)}× base fee cannot be accommodated.`
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4),
+          message: `Premium ${premiumFloor.ratio.toFixed(2)}\u00d7 base fee cannot be accommodated.`
         },
-        suggestions: dynamicSuggestions
+        suggestions: [
+          `Reduce leverage from ${leverage}\u00d7 to ${Math.max(1, Math.floor(leverage / 2))}\u00d7`,
+          `Reduce protection duration from ${currentDays} days to ${Math.max(1, Math.floor(currentDays / 2))} days`,
+          `Increase drawdown floor to ${Math.min(0.25, currentFloorPct + 0.05).toFixed(2)}`,
+          "Reduce position size to lower premium"
+        ]
       });
     }
 
@@ -4814,6 +4237,30 @@ app.post("/put/quote", async (req) => {
         bestCandidate.strike.toFixed(0),
         optionSymbol
       );
+      const ratio = premiumFloor.ratio.toFixed(4);
+      const threshold = premiumFloor.threshold.toFixed(4);
+      const minNotificationRatio = new Decimal(
+        riskControls.pass_through_min_notification_ratio ?? 1.5
+      );
+      const shouldNotify = premiumFloor.ratio.gte(minNotificationRatio);
+      const venueInfo = attachVenueMetadata({
+        selectionSnapshot: fallbackSnapshot,
+        hedgeSize: requiredSize.toFixed(4)
+      } as Record<string, unknown>);
+      await audit("premium_pass_through", {
+        type: "uncapped",
+        baseFee: baseFeeUsdc.toFixed(2),
+        allInPremium: allInPremium.toFixed(2),
+        markupPct: markupPct.mul(100).toFixed(2),
+        ratio,
+        threshold,
+        tierName,
+        leverage,
+        optionType,
+        instrument: optionInstrument,
+        optionVenue: (venueInfo as any).optionVenue ?? null,
+        venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
+      });
       return cacheAndReturn({
         status: "pass_through",
         expiryTag: bestCandidate.expiryTag,
@@ -4821,6 +4268,9 @@ app.post("/put/quote", async (req) => {
         optionType,
         strike: bestCandidate.strike.toFixed(0),
         instrument: optionInstrument,
+        spotPrice: spotPrice.toNumber(),
+        drawdownFloorPct: drawdownFloorPct.toNumber(),
+        targetStrike: targetStrike.toNumber(),
         premiumUsdc: premiumTotal.toFixed(2),
         premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
         hedgeSize: requiredSize.toFixed(4),
@@ -4833,17 +4283,23 @@ app.post("/put/quote", async (req) => {
         feeRegime: feeRegime.regime,
         feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
         feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
+        passThroughCapMultiplier: null,
         passThroughCapped: false,
-        reason: "pass_through",
+        reason: premiumFloor.breached ? "premium_floor_pass_through" : "pass_through",
         liquidityOverride: liquidityOverrideUsed,
         replication: fallbackReplication,
         survivalCheck,
         selectionSnapshot: fallbackSnapshot,
         rollMultiplier: bestCandidate.rollMultiplier,
         rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+        hedge: {
+          instrument: optionInstrument,
+          size: requiredSize.toFixed(4),
+          premiumUsdc: allInPremium.toFixed(2),
+          expiryTag: bestCandidate.expiryTag,
+          daysToExpiry: bestCandidate.targetDays,
+          strike: bestCandidate.strike.toFixed(0)
+        },
         pricing: {
           type: "pass_through",
           baseFee: baseFeeUsdc.toFixed(2),
@@ -4851,136 +4307,23 @@ app.post("/put/quote", async (req) => {
           totalFee: passThroughFee.toFixed(2),
           markupPct: markupPct.mul(100).toFixed(2),
           markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
-          ratio: premiumFloor.ratio.toFixed(4),
-          threshold: premiumFloor.threshold.toFixed(4)
-        }
+          ratio,
+          threshold,
+          explanation:
+            `Market volatility requires premium ${premiumFloor.ratio.toFixed(2)}\u00d7 base fee. ` +
+            `Charging premium + markup = $${passThroughFee.toFixed(2)} for full protection.`
+        },
+        warning: premiumFloor.breached && shouldNotify
+          ? {
+              type: "premium_pass_through",
+              ratio,
+              threshold,
+              message:
+                `Premium is ${premiumFloor.ratio.toFixed(2)}\u00d7 the base fee due to market conditions. ` +
+                `You'll be charged premium + markup = $${passThroughFee.toFixed(2)}.`
+            }
+          : undefined
       });
-    }
-
-    if (subsidyNeeded.gt(0) && subsidyCheck.allowed && canFullyCover) {
-      const optionSymbol = optionType === "put" ? "P" : "C";
-      const optionInstrument = buildVenueInstrumentName(
-        asset,
-        bestCandidate.expiryTag,
-        bestCandidate.strike.toFixed(0),
-        optionSymbol
-      );
-      return cacheAndReturn({
-        status: "subsidized",
-        expiryTag: bestCandidate.expiryTag,
-        targetDays: bestCandidate.targetDays,
-        optionType,
-        strike: bestCandidate.strike.toFixed(0),
-        instrument: optionInstrument,
-        premiumUsdc: premiumTotal.toFixed(2),
-        premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-        hedgeSize: hedgeSizeForQuote.toFixed(4),
-        sizingMethod: body.optionDelta ? "delta" : "notional",
-        bufferTargetPct: "0.00",
-        markIv: feeIv.raw,
-        subsidyUsdc: subsidyNeeded.toFixed(2),
-        feeUsdc: feeUsdc.toFixed(2),
-        feeRegime: feeRegime.regime,
-        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-        passThroughCapped: passThroughCapped,
-        reason: "subsidized",
-        capBreached: false,
-        liquidityOverride: liquidityOverrideUsed,
-        replication: fallbackReplication,
-        survivalCheck,
-        selectionSnapshot: fallbackSnapshot,
-        rollMultiplier: bestCandidate.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-      });
-    }
-
-    if (subsidyNeeded.gt(0) && canFullyCover && canCoverageOverride(tierName)) {
-      const optionSymbol = optionType === "put" ? "P" : "C";
-      const optionInstrument = buildVenueInstrumentName(
-        asset,
-        bestCandidate.expiryTag,
-        bestCandidate.strike.toFixed(0),
-        optionSymbol
-      );
-      return cacheAndReturn({
-        status: "subsidized",
-        expiryTag: bestCandidate.expiryTag,
-        targetDays: bestCandidate.targetDays,
-        optionType,
-        strike: bestCandidate.strike.toFixed(0),
-        instrument: optionInstrument,
-        premiumUsdc: premiumTotal.toFixed(2),
-        premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-        hedgeSize: hedgeSizeForQuote.toFixed(4),
-        sizingMethod: body.optionDelta ? "delta" : "notional",
-        bufferTargetPct: "0.00",
-        markIv: feeIv.raw,
-        subsidyUsdc: subsidyNeeded.toFixed(2),
-        feeUsdc: feeUsdc.toFixed(2),
-        feeRegime: feeRegime.regime,
-        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-        passThroughCapped: passThroughCapped,
-        reason: "coverage_override",
-        capBreached: true,
-        subsidyCapReason: subsidyCheck.reason,
-        liquidityOverride: liquidityOverrideUsed,
-        replication: fallbackReplication,
-        survivalCheck,
-        selectionSnapshot: fallbackSnapshot,
-        rollMultiplier: bestCandidate.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-      });
-    }
-
-    if (canPassThrough && allInPremium.gt(feeUsdc)) {
-      const passThroughCapInfoLate = applyPassThroughCap(
-        baseFeeUsdc,
-        allInPremium,
-        leverage,
-        tierName,
-        feeIv.scaled ?? 0
-      );
-      if (!passThroughCapInfoLate.capped) {
-        const optionSymbol = optionType === "put" ? "P" : "C";
-        const optionInstrument = buildVenueInstrumentName(
-          asset,
-          bestCandidate.expiryTag,
-          bestCandidate.strike.toFixed(0),
-          optionSymbol
-        );
-        return cacheAndReturn({
-          status: "pass_through",
-          expiryTag: bestCandidate.expiryTag,
-          targetDays: bestCandidate.targetDays,
-          optionType,
-          strike: bestCandidate.strike.toFixed(0),
-          instrument: optionInstrument,
-          premiumUsdc: premiumTotal.toFixed(2),
-          premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: hedgeSizeForQuote.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          subsidyUsdc: "0.00",
-          feeUsdc: passThroughFee.toFixed(2),
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfoLate),
-          passThroughCapped: false,
-          reason: "pass_through",
-          liquidityOverride: liquidityOverrideUsed,
-          replication: fallbackReplication,
-          survivalCheck,
-          selectionSnapshot: fallbackSnapshot,
-          rollMultiplier: bestCandidate.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-        });
-      }
     }
 
     const affordableSize = feeUsdc.div(
@@ -5142,10 +4485,6 @@ app.post("/put/quote", async (req) => {
   const markupPct = resolvePremiumMarkupPct(tierName, leverage);
   const passThroughFee = allInPremium.mul(new Decimal(1).add(markupPct));
   const premiumFloor = premiumFloorBreached(allInPremium, baseFeeUsdc);
-  const isPremiumTier =
-    tierName === "Pro (Silver)" ||
-    tierName === "Pro (Gold)" ||
-    tierName === "Pro (Platinum)";
   const allowPartialCoverage = tierName === "Pro (Bronze)" && body.allowPartialCoverage === true;
   const passThroughEnabled = riskControls.enable_premium_pass_through !== false;
   const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
@@ -5192,570 +4531,7 @@ app.post("/put/quote", async (req) => {
     leverage,
     premiumRatio: premiumFloor.ratio.toFixed(4)
   });
-  const canFullyCoverQuote = quote.availableSize.greaterThanOrEqualTo(hedgeSizeForQuote);
-  if (premiumFloor.breached && canPassThrough && passThroughCapped && passThroughCapInfo.maxFee) {
-    const cappedFee = passThroughCapInfo.maxFee;
-    const optionSymbol = optionType === "put" ? "P" : "C";
-    const optionInstrument = buildVenueInstrumentName(
-      asset,
-      quote.expiryTag || "",
-      quote.strike.toFixed(0),
-      optionSymbol
-    );
-    const passThroughDebug = body._debugPassThrough
-      ? {
-          tierName,
-          canPassThrough,
-          passThroughCapped,
-          premiumRatio: premiumFloor.ratio.toFixed(4),
-          uncappedBronzeEnabled,
-          uncappedMaxRatio: uncappedMaxRatio ? uncappedMaxRatio.toFixed(4) : null,
-          allowBronzeCapOverride
-        }
-      : undefined;
-    if (allowBronzeCapOverride) {
-      const venueInfo = attachVenueMetadata({
-        selectionSnapshot: bestSnapshots
-          ? {
-              expiryTag: quote.expiryTag,
-              targetDays: quote.targetDays,
-              strike: quote.strike.toFixed(0),
-              books: bestSnapshots
-            }
-          : null,
-        hedgeSize: hedgeSizeForQuote.toFixed(4)
-      } as Record<string, unknown>);
-      await audit("premium_pass_through", {
-        type: "cap_override",
-        baseFee: baseFeeUsdc.toFixed(2),
-        allInPremium: allInPremium.toFixed(2),
-        capMultiplier: passThroughCapInfo.capMultiplier
-          ? formatCapMultiplier(passThroughCapInfo)
-          : null,
-        ratio: premiumFloor.ratio.toFixed(4),
-        tierName,
-        leverage,
-        optionType,
-        instrument: optionInstrument,
-        optionVenue: (venueInfo as any).optionVenue ?? null,
-        venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
-      });
-      const explanation =
-        `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
-        `of ${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}×. ` +
-        `Charging the full hedge premium to keep protection active.`;
-      return cacheAndReturn({
-        status: "pass_through",
-        expiryTag: quote.expiryTag || "",
-        targetDays: quote.targetDays || 0,
-        optionType,
-        strike: quote.strike.toFixed(0),
-        instrument: optionInstrument,
-        premiumUsdc: quote.premiumTotal.toFixed(2),
-        premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-        hedgeSize: hedgeSizeForQuote.toFixed(4),
-        sizingMethod: body.optionDelta ? "delta" : "notional",
-        bufferTargetPct: bufferTargetPctCapped.toFixed(4),
-        markIv: feeIv.raw,
-        feeUsdc: passThroughFee.toFixed(2),
-        subsidyUsdc: "0.00",
-        feeRegime: feeRegime.regime,
-        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-        passThroughCapped: true,
-        liquidityOverride: liquidityOverrideUsed,
-        replication: replicationMeta,
-        survivalCheck: buildSurvivalCheck({
-          spotPrice,
-          drawdownFloorPct,
-          optionType,
-          strike: quote.strike,
-          hedgeSize: hedgeSizeForQuote,
-          requiredSize,
-          tolerancePct: survivalTolerance
-        }),
-        selectionSnapshot: bestSnapshots
-          ? {
-              expiryTag: quote.expiryTag,
-              targetDays: quote.targetDays,
-              strike: quote.strike.toFixed(0),
-              books: bestSnapshots
-            }
-          : null,
-        rollMultiplier: quote.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-        pricing: {
-          type: "pass_through_override",
-          baseFee: baseFeeUsdc.toFixed(2),
-          hedgePremium: allInPremium.toFixed(2),
-          totalFee: passThroughFee.toFixed(2),
-          markupPct: markupPct.mul(100).toFixed(2),
-          markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
-          ratio: premiumFloor.ratio.toFixed(4),
-          threshold: premiumFloor.threshold.toFixed(4),
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? formatCapMultiplier(passThroughCapInfo, 2)
-            : "N/A",
-          explanation
-        },
-        warning: {
-          type: "premium_pass_through_override",
-          ratio: premiumFloor.ratio.toFixed(4),
-          threshold: premiumFloor.threshold.toFixed(4),
-          message: explanation
-        },
-        reason: "premium_floor_pass_through_override",
-        debugPassThrough: passThroughDebug
-      });
-    }
-    const subsidyNeededFull = allInPremium.minus(cappedFee);
-    if (isPremiumTier) {
-      const venueInfo = attachVenueMetadata({
-        selectionSnapshot: bestSnapshots
-          ? {
-              expiryTag: quote.expiryTag,
-              targetDays: quote.targetDays,
-              strike: quote.strike.toFixed(0),
-              books: bestSnapshots
-            }
-          : null,
-        hedgeSize: hedgeSizeForQuote.toFixed(4)
-      } as Record<string, unknown>);
-      await audit("premium_pass_through", {
-        type: "capped_with_subsidy",
-        baseFee: feeBase.feeUsdc.toFixed(2),
-        allInPremium: allInPremium.toFixed(2),
-        cappedFee: cappedFee.toFixed(2),
-        platformSubsidy: subsidyNeededFull.toFixed(2),
-        capMultiplier: passThroughCapInfo.capMultiplier
-          ? formatCapMultiplier(passThroughCapInfo, 2)
-          : null,
-        ratio: premiumFloor.ratio.toFixed(4),
-        tierName,
-        leverage,
-        optionType,
-        instrument: optionInstrument,
-        hedgeSize: hedgeSizeForQuote.toFixed(4),
-        fullProtection: true,
-        optionVenue: (venueInfo as any).optionVenue ?? null,
-        venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
-      });
-      return cacheAndReturn({
-        status: "pass_through_capped",
-        optionType,
-        venue: "deribit",
-        strike: quote.strike.toFixed(0),
-        premiumUsdc: quote.premiumTotal.toFixed(2),
-        premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-        hedgeSize: hedgeSizeForQuote.toFixed(4),
-        sizingMethod: body.optionDelta ? "delta" : "notional",
-        bufferTargetPct: "0.00",
-        markIv: feeIv.raw,
-        expiryTag: quote.expiryTag || "",
-        targetDays: quote.targetDays || 0,
-        instrument: optionInstrument,
-        feeUsdc: cappedFee.toFixed(2),
-        subsidyUsdc: subsidyNeededFull.toFixed(2),
-        feeRegime: feeRegime.regime,
-        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-        passThroughCapped: true,
-        reason: "pass_through_capped_subsidized",
-        liquidityOverride: liquidityOverrideUsed,
-        replication: replicationMeta,
-        survivalCheck: buildSurvivalCheck({
-          spotPrice,
-          drawdownFloorPct,
-          optionType,
-          strike: quote.strike,
-          hedgeSize: hedgeSizeForQuote,
-          requiredSize,
-          tolerancePct: survivalTolerance
-        }),
-        selectionSnapshot: bestSnapshots
-          ? {
-              expiryTag: quote.expiryTag,
-              targetDays: quote.targetDays,
-              strike: quote.strike.toFixed(0),
-              books: bestSnapshots
-            }
-          : null,
-        rollMultiplier: quote.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-        coveragePct: "100.00",
-        feeDiscountPct: (riskControls.partial_coverage_discount_pct ?? 0) * 100,
-        pricing: {
-          baseFee: feeBase.feeUsdc.toFixed(2),
-          hedgePremium: allInPremium.toFixed(2),
-          cappedFee: cappedFee.toFixed(2),
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? formatCapMultiplier(passThroughCapInfo, 2)
-            : "N/A",
-          platformSubsidy: subsidyNeededFull.toFixed(2),
-          ratio: premiumFloor.ratio.toFixed(4),
-          threshold: premiumFloor.threshold.toFixed(4),
-          explanation:
-            `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds ${tierName} tier cap. ` +
-            `Fee capped at $${cappedFee.toFixed(2)} ` +
-            `(${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}× base). ` +
-            `Platform subsidizing $${subsidyNeededFull.toFixed(2)} for full protection.`
-        },
-        warning: {
-          type: "premium_capped_full_protection",
-          ratio: premiumFloor.ratio.toFixed(4),
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? formatCapMultiplier(passThroughCapInfo, 2)
-            : "N/A",
-          message:
-            `Premium exceeds tier cap. Fee capped at $${cappedFee.toFixed(2)}. ` +
-            `You're fully protected (100% hedge). Platform covers excess.`
-        },
-        debugPassThrough: passThroughDebug
-      });
-    }
-    if (!allowPartialCoverage) {
-      await audit("premium_floor_rejected", {
-        baseFee: feeBase.feeUsdc.toFixed(2),
-        allInPremium: allInPremium.toFixed(2),
-        ratio: premiumFloor.ratio.toFixed(4),
-        threshold: premiumFloor.threshold.toFixed(4),
-        reason: "premium_floor_pass_through_capped",
-        canPassThrough,
-        capped: true,
-        capMultiplier: passThroughCapInfo.capMultiplier
-          ? formatCapMultiplier(passThroughCapInfo, 2)
-          : null,
-        tierName,
-        leverage,
-        optionType,
-        instrument: optionInstrument
-      });
-      return cacheAndReturn({
-        status: "premium_floor",
-        reason: "premium_floor_pass_through_capped",
-        optionType,
-        venue: "deribit",
-        strike: quote.strike.toFixed(0),
-        premiumUsdc: quote.premiumTotal.toFixed(2),
-        premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-        hedgeSize: hedgeSizeForQuote.toFixed(4),
-        sizingMethod: body.optionDelta ? "delta" : "notional",
-        bufferTargetPct: "0.00",
-        markIv: feeIv.raw,
-        expiryTag: quote.expiryTag || "",
-        targetDays: quote.targetDays || 0,
-        instrument: optionInstrument,
-        feeUsdc: cappedFee.toFixed(2),
-        subsidyUsdc: "0.00",
-        feeRegime: feeRegime.regime,
-        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-        passThroughCapped: true,
-        liquidityOverride: liquidityOverrideUsed,
-        replication: replicationMeta,
-        survivalCheck: buildSurvivalCheck({
-          spotPrice,
-          drawdownFloorPct,
-          optionType,
-          strike: quote.strike,
-          hedgeSize: hedgeSizeForQuote,
-          requiredSize,
-          tolerancePct: survivalTolerance
-        }),
-        selectionSnapshot: bestSnapshots
-          ? {
-              expiryTag: quote.expiryTag,
-              targetDays: quote.targetDays,
-              strike: quote.strike.toFixed(0),
-              books: bestSnapshots
-            }
-          : null,
-        rollMultiplier: quote.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-        pricing: {
-          baseFee: feeBase.feeUsdc.toFixed(2),
-          hedgePremium: allInPremium.toFixed(2),
-          ratio: premiumFloor.ratio.toFixed(4),
-          threshold: premiumFloor.threshold.toFixed(4),
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? formatCapMultiplier(passThroughCapInfo, 2)
-            : "N/A",
-          explanation:
-            `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
-            `of ${formatCapMultiplier(passThroughCapInfo, 1) || "N/A"}×. ` +
-            `Reduce leverage, duration, or widen the floor to lower premium.`
-        },
-        warning: {
-          type: "premium_floor",
-          ratio: premiumFloor.ratio.toFixed(4),
-          threshold: premiumFloor.threshold.toFixed(4),
-          message:
-            "Premium too high for Bronze tier. Reduce leverage, duration, or widen the floor."
-        },
-        debugPassThrough: passThroughDebug,
-        suggestions: [
-          `Reduce leverage from ${leverage}× to ${Math.max(1, Math.floor(leverage / 2))}×`,
-          `Reduce protection duration from ${quote.targetDays || 0} days to ${Math.max(
-            1,
-            Math.floor((quote.targetDays || 0) / 2)
-          )} days`,
-          "Increase drawdown floor percentage to reduce premium",
-          "Reduce position size to lower premium"
-        ]
-      });
-    }
-    feeUsdc = cappedFee;
-    const bronzeFixedCapped = applyBronzeFixedFee(tierName, leverage, feeUsdc, optionType);
-    feeUsdc = bronzeFixedCapped.fee;
-    const subsidyNeeded = allInPremium.minus(feeUsdc);
-    const subsidyCheck = canApplySubsidy(
-      tierName,
-      body.accountId || null,
-      subsidyNeeded.toNumber(),
-      feeIv.scaled
-    );
-    if (subsidyNeeded.gt(0)) {
-      const affordableSize = feeUsdc.div(
-        quote.premiumPerUnit.mul(new Decimal(quote.rollMultiplier))
-      );
-      const partialSize = Decimal.min(quote.availableSize, affordableSize);
-      if (partialSize.greaterThanOrEqualTo(minSize)) {
-        if (!allowPartialCoverage) {
-          return cacheAndReturn({
-            status: "premium_floor",
-            reason: "partial_not_allowed",
-            optionType,
-            venue: "deribit",
-            strike: quote.strike.toFixed(0),
-            premiumUsdc: quote.premiumPerUnit.mul(partialSize).toFixed(2),
-            premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-            hedgeSize: hedgeSizeForQuote.toFixed(4),
-            sizingMethod: body.optionDelta ? "delta" : "notional",
-            bufferTargetPct: "0.00",
-            markIv: feeIv.raw,
-            expiryTag: quote.expiryTag || "",
-            targetDays: quote.targetDays || 0,
-            instrument: optionInstrument,
-            feeUsdc: feeUsdc.toFixed(2),
-            subsidyUsdc: "0.00",
-            feeRegime: feeRegime.regime,
-            feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-            feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-            passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-            passThroughCapped: true,
-            liquidityOverride: liquidityOverrideUsed,
-            replication: replicationMeta,
-            survivalCheck: buildSurvivalCheck({
-              spotPrice,
-              drawdownFloorPct,
-              optionType,
-              strike: quote.strike,
-              hedgeSize: hedgeSizeForQuote,
-              requiredSize,
-              tolerancePct: survivalTolerance
-            }),
-            selectionSnapshot: bestSnapshots
-              ? {
-                  expiryTag: quote.expiryTag,
-                  targetDays: quote.targetDays,
-                  strike: quote.strike.toFixed(0),
-                  books: bestSnapshots
-                }
-              : null,
-            rollMultiplier: quote.rollMultiplier,
-            rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-            pricing: {
-              baseFee: feeBase.feeUsdc.toFixed(2),
-              hedgePremium: allInPremium.toFixed(2),
-              ratio: premiumFloor.ratio.toFixed(4),
-              threshold: premiumFloor.threshold.toFixed(4),
-              capMultiplier: passThroughCapInfo.capMultiplier
-                ? formatCapMultiplier(passThroughCapInfo, 2)
-                : "N/A",
-              explanation:
-                "Partial coverage not allowed for this tier. Reduce leverage or duration to lower premium."
-            },
-            warning: {
-              type: "premium_floor",
-              ratio: premiumFloor.ratio.toFixed(4),
-              threshold: premiumFloor.threshold.toFixed(4),
-              message: "Partial coverage not allowed for this tier."
-            }
-          });
-        }
-        const coverageRatio = partialSize.div(requiredSize);
-        const discountedFee = applyPartialDiscount(feeUsdc, coverageRatio);
-        return cacheAndReturn({
-          status: "partial",
-          optionType,
-          venue: "deribit",
-          strike: quote.strike.toFixed(0),
-          premiumUsdc: quote.premiumPerUnit.mul(partialSize).toFixed(2),
-          premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-          hedgeSize: partialSize.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          expiryTag: quote.expiryTag || "",
-          targetDays: quote.targetDays || 0,
-          instrument: optionInstrument,
-          feeUsdc: discountedFee.toFixed(2),
-          subsidyUsdc: "0.00",
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-          passThroughCapped: true,
-          reason: "pass_through_capped_partial",
-          liquidityOverride: liquidityOverrideUsed,
-          replication: replicationMeta,
-          survivalCheck: buildSurvivalCheck({
-            spotPrice,
-            drawdownFloorPct,
-            optionType,
-            strike: quote.strike,
-            hedgeSize: partialSize,
-            requiredSize,
-            tolerancePct: survivalTolerance
-          }),
-          selectionSnapshot: bestSnapshots
-            ? {
-                expiryTag: quote.expiryTag,
-                targetDays: quote.targetDays,
-                strike: quote.strike.toFixed(0),
-                books: bestSnapshots
-              }
-            : null,
-          rollMultiplier: quote.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-          coveragePct: coverageRatio.mul(100).toFixed(2),
-          feeDiscountPct: (riskControls.partial_coverage_discount_pct ?? 0) * 100
-        });
-      }
-      if (subsidyNeeded.gt(0) && subsidyCheck.allowed && canFullyCoverQuote) {
-        return cacheAndReturn({
-          status: "subsidized",
-          optionType,
-          venue: "deribit",
-          strike: quote.strike.toFixed(0),
-          premiumUsdc: quote.premiumTotal.toFixed(2),
-          premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-          hedgeSize: hedgeSizeForQuote.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          expiryTag: quote.expiryTag || "",
-          targetDays: quote.targetDays || 0,
-          instrument: optionInstrument,
-          feeUsdc: feeUsdc.toFixed(2),
-          subsidyUsdc: subsidyNeeded.toFixed(2),
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-          passThroughCapped: true,
-          reason: "pass_through_capped_subsidized",
-          liquidityOverride: liquidityOverrideUsed,
-          replication: replicationMeta,
-          survivalCheck: buildSurvivalCheck({
-            spotPrice,
-            drawdownFloorPct,
-            optionType,
-            strike: quote.strike,
-            hedgeSize: hedgeSizeForQuote,
-            requiredSize,
-            tolerancePct: survivalTolerance
-          }),
-          selectionSnapshot: bestSnapshots
-            ? {
-                expiryTag: quote.expiryTag,
-                targetDays: quote.targetDays,
-                strike: quote.strike.toFixed(0),
-                books: bestSnapshots
-              }
-            : null,
-          rollMultiplier: quote.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-        });
-      }
-      if (subsidyNeeded.gt(0) && canFullyCoverQuote && canCoverageOverride(tierName)) {
-        return cacheAndReturn({
-          status: "subsidized",
-          optionType,
-          venue: "deribit",
-          strike: quote.strike.toFixed(0),
-          premiumUsdc: quote.premiumTotal.toFixed(2),
-          premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-          hedgeSize: hedgeSizeForQuote.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          expiryTag: quote.expiryTag || "",
-          targetDays: quote.targetDays || 0,
-          instrument: optionInstrument,
-          feeUsdc: feeUsdc.toFixed(2),
-          subsidyUsdc: subsidyNeeded.toFixed(2),
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
-          passThroughCapped: true,
-          reason: "pass_through_capped_override",
-          capBreached: true,
-          subsidyCapReason: subsidyCheck.reason,
-          liquidityOverride: liquidityOverrideUsed,
-          replication: replicationMeta,
-          survivalCheck: buildSurvivalCheck({
-            spotPrice,
-            drawdownFloorPct,
-            optionType,
-            strike: quote.strike,
-            hedgeSize: hedgeSizeForQuote,
-            requiredSize,
-            tolerancePct: survivalTolerance
-          }),
-          selectionSnapshot: bestSnapshots
-            ? {
-                expiryTag: quote.expiryTag,
-                targetDays: quote.targetDays,
-                strike: quote.strike.toFixed(0),
-                books: bestSnapshots
-              }
-            : null,
-          rollMultiplier: quote.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-        });
-      }
-      return cacheAndReturn({
-        status: "perp_fallback",
-        expiryTag: quote.expiryTag || "",
-        targetDays: quote.targetDays || 0,
-        rejected: {
-          missingBook: 0,
-          spreadTooWide: 0,
-          sizeTooSmall: 0,
-          noBidAsk: 0,
-          slippageTooHigh: 0
-        },
-        reason: "pass_through_capped_perp_fallback",
-        liquidityOverride: liquidityOverrideUsed,
-        replication: replicationMeta,
-        selectionSnapshot: bestSnapshots
-          ? {
-              expiryTag: quote.expiryTag,
-              targetDays: quote.targetDays,
-              strike: quote.strike.toFixed(0),
-              books: bestSnapshots
-            }
-          : null,
-        rollMultiplier: quote.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-      });
-    }
-  }
+  const canFullyCoverQuote = quote.availableSize.greaterThanOrEqualTo(requiredSize);
   const cap = riskControls.net_exposure_cap_usdc[tierName] ?? Number.POSITIVE_INFINITY;
   const state = getRiskState(tierName);
 
@@ -6239,7 +5015,6 @@ app.post("/put/auto-renew", async (req) => {
     : null;
 
   let renewReason = "flat_fee";
-  let subsidyUsdc = new Decimal(0);
   let effectiveFeeUsdc = new Decimal(body.fixedPriceUsdc);
   let effectiveSize = hedgeSizeForRenew;
   let effectiveExpiryTag = quote?.expiryTag || body.expiryTag || "";
@@ -6312,24 +5087,6 @@ app.post("/put/auto-renew", async (req) => {
   const renewUserOptedIn = body.allowPremiumPassThrough !== false;
   const renewCanPassThrough =
     renewPassThroughEnabled && (!renewRequiresUserOptIn || renewUserOptedIn);
-  if (!renewPremiumFloor.breached) {
-    if (renewPassThroughFee.gt(renewBaseFeeUsdc)) {
-      effectiveFeeUsdc = renewPassThroughFee;
-      renewReason = "premium_markup";
-    } else {
-      effectiveFeeUsdc = renewBaseFeeUsdc;
-      if (renewReason !== "ctc_safety") {
-        renewReason = "base_fee";
-      }
-    }
-  }
-  let subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
-  let subsidyCheck = canApplySubsidy(
-    tierName,
-    body.accountId || null,
-    subsidyNeeded.toNumber(),
-    effectiveIv
-  );
   const renewPassThroughCap = applyPassThroughCap(
     renewBaseFeeUsdc,
     effectiveAllInPremium,
@@ -6343,8 +5100,6 @@ app.post("/put/auto-renew", async (req) => {
   if (renewCanPassThrough && renewPassThroughFee.gt(effectiveFeeUsdc)) {
     renewReason = "pass_through";
     effectiveFeeUsdc = renewPassThroughFee;
-    subsidyNeeded = new Decimal(0);
-    subsidyCheck = { allowed: true, reason: "pass_through" };
   }
   await audit("pass_through_gate", {
     passThroughEnabled: renewPassThroughEnabled,
@@ -6355,116 +5110,49 @@ app.post("/put/auto-renew", async (req) => {
     leverage: renewLeverage,
     premiumRatio: renewPremiumFloor.ratio.toFixed(4)
   });
-  const canFullyCover = effectiveAvailableSize
-    ? effectiveAvailableSize.greaterThanOrEqualTo(effectiveSize)
-    : false;
-  if (renewPremiumFloor.breached && renewReason !== "pass_through") {
-    if (renewCanPassThrough && !renewPassThroughCapped) {
-      renewReason = "pass_through";
-      effectiveFeeUsdc = renewPassThroughFee;
-    } else if (renewCanPassThrough && renewPassThroughCapped && renewPassThroughCap.maxFee) {
-      renewReason = "pass_through_capped";
-      effectiveFeeUsdc = renewPassThroughCap.maxFee;
-      subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
-      subsidyCheck = canApplySubsidy(
-        tierName,
-        body.accountId || null,
-        subsidyNeeded.toNumber(),
-        effectiveIv
+
+  if (renewPremiumFloor.breached && !renewCanPassThrough) {
+    return {
+      status: "premium_floor",
+      reason: "premium_floor",
+      liquidityOverride: liquidityOverrideUsed,
+      feeRegime: renewFeeRegime.regime,
+      feeRegimeMultiplier: renewFeeRegime.multiplier
+        ? renewFeeRegime.multiplier.toFixed(4)
+        : null,
+      feeLeverageMultiplier: renewFeeLeverage.multiplier
+        ? renewFeeLeverage.multiplier.toFixed(4)
+        : null,
+      passThroughCapMultiplier: null,
+      passThroughCapped: false,
+      warning: {
+        type: "premium_floor",
+        ratio: renewPremiumFloor.ratio.toFixed(4),
+        threshold: renewPremiumFloor.threshold.toFixed(4)
+      }
+    };
+  }
+
+  if (renewReason !== "pass_through" && effectiveAllInPremium.gt(effectiveFeeUsdc)) {
+    const minSize = new Decimal(riskControls.min_option_size ?? 0.01);
+    const affordableSize = effectiveFeeUsdc.div(
+      quote.premiumPerUnit.mul(new Decimal(effectiveRollMultiplier))
+    );
+    const partialSize = Decimal.min(quote.availableSize, affordableSize);
+    if (partialSize.greaterThanOrEqualTo(minSize)) {
+      renewReason = "partial";
+      effectiveSize = partialSize;
+      effectivePremiumUsdc = quote.premiumPerUnit.mul(partialSize);
+      effectiveFeeUsdc = applyPartialDiscount(
+        effectiveFeeUsdc,
+        partialSize.div(requiredSize)
       );
     } else {
-      return {
-        status: "premium_floor",
-        reason: renewPassThroughCapped
-          ? "premium_floor_pass_through_capped"
-          : "premium_floor",
-        liquidityOverride: liquidityOverrideUsed,
-        feeRegime: renewFeeRegime.regime,
-        feeRegimeMultiplier: renewFeeRegime.multiplier
-          ? renewFeeRegime.multiplier.toFixed(4)
-          : null,
-        feeLeverageMultiplier: renewFeeLeverage.multiplier
-          ? renewFeeLeverage.multiplier.toFixed(4)
-          : null,
-        passThroughCapMultiplier: formatCapMultiplier(renewPassThroughCap),
-        passThroughCapped: renewPassThroughCapped,
-        warning: {
-          type: "premium_floor",
-          ratio: renewPremiumFloor.ratio.toFixed(4),
-          threshold: renewPremiumFloor.threshold.toFixed(4)
-        }
-      };
+      await audit("put_renew_failed", { reason: "perp_fallback" });
+      return { status: "perp_fallback" };
     }
   }
-  if (renewReason !== "pass_through") {
-    if (renewReason === "pass_through_capped" && subsidyNeeded.gt(0)) {
-      const minSize = new Decimal(riskControls.min_option_size ?? 0.01);
-      const affordableSize = effectiveFeeUsdc.div(
-        quote.premiumPerUnit.mul(new Decimal(effectiveRollMultiplier))
-      );
-      const partialSize = Decimal.min(quote.availableSize, affordableSize);
-      if (partialSize.greaterThanOrEqualTo(minSize)) {
-        renewReason = "partial";
-        effectiveSize = partialSize;
-        effectivePremiumUsdc = quote.premiumPerUnit.mul(partialSize);
-        effectiveFeeUsdc = applyPartialDiscount(
-          effectiveFeeUsdc,
-          partialSize.div(requiredSize)
-        );
-      }
-    }
-    if (renewReason !== "partial") {
-      if (subsidyNeeded.gt(0) && subsidyCheck.allowed && canFullyCover) {
-        renewReason = "subsidized";
-        subsidyUsdc = subsidyNeeded;
-      } else if (subsidyNeeded.gt(0) && canFullyCover && canCoverageOverride(tierName)) {
-        renewReason = "coverage_override";
-        subsidyUsdc = subsidyNeeded;
-      } else if (renewCanPassThrough && effectiveAllInPremium.gt(effectiveFeeUsdc)) {
-        const lateCap = applyPassThroughCap(
-          renewBaseFeeUsdc,
-          effectiveAllInPremium,
-          renewLeverage,
-          tierName,
-          effectiveIv ?? 0
-        );
-        const latePassThroughFee = effectiveAllInPremium.mul(new Decimal(1).add(renewMarkupPct));
-        const lateCapped = lateCap.maxFee ? latePassThroughFee.gt(lateCap.maxFee) : false;
-        if (!lateCapped) {
-          renewReason = "pass_through";
-          effectiveFeeUsdc = latePassThroughFee;
-        } else if (lateCap.maxFee) {
-          renewReason = "pass_through_capped";
-          effectiveFeeUsdc = lateCap.maxFee;
-          subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
-          subsidyCheck = canApplySubsidy(
-            tierName,
-            body.accountId || null,
-            subsidyNeeded.toNumber(),
-            effectiveIv
-          );
-        }
-      } else if (subsidyNeeded.gt(0)) {
-        const minSize = new Decimal(riskControls.min_option_size ?? 0.01);
-        const affordableSize = effectiveFeeUsdc.div(
-          quote.premiumPerUnit.mul(new Decimal(effectiveRollMultiplier))
-        );
-        const partialSize = Decimal.min(quote.availableSize, affordableSize);
-        if (partialSize.greaterThanOrEqualTo(minSize)) {
-          renewReason = "partial";
-          effectiveSize = partialSize;
-          effectivePremiumUsdc = quote.premiumPerUnit.mul(partialSize);
-          effectiveFeeUsdc = applyPartialDiscount(
-            effectiveFeeUsdc,
-            partialSize.div(requiredSize)
-          );
-        } else {
-          await audit("put_renew_failed", { reason: "perp_fallback" });
-          return { status: "perp_fallback" };
-        }
-      }
-    }
-  }
+
   const feeUsdc = Number(effectiveFeeUsdc.toFixed(2));
   const premiumUsdc = Number(effectivePremiumUsdc.toFixed(2));
   const cap = riskControls.net_exposure_cap_usdc[tierName] ?? Number.POSITIVE_INFINITY;
@@ -6553,7 +5241,7 @@ app.post("/put/auto-renew", async (req) => {
     rollMultiplier: effectiveRollMultiplier,
     rollEstimatedPremiumUsdc: effectiveAllInPremium.toFixed(2),
     liquidityOverride: liquidityOverrideUsed,
-    subsidyUsdc: subsidyUsdc.toFixed(2),
+    subsidyUsdc: "0.00",
     feeUsdc: effectiveFeeUsdc.toFixed(2),
     feeRegime: renewFeeRegime.regime,
     feeRegimeMultiplier: renewFeeRegime.multiplier
@@ -6562,9 +5250,10 @@ app.post("/put/auto-renew", async (req) => {
     feeLeverageMultiplier: renewFeeLeverage.multiplier
       ? renewFeeLeverage.multiplier.toFixed(4)
       : null,
-    passThroughCapMultiplier: formatCapMultiplier(renewPassThroughCap),
-    passThroughCapped: renewPassThroughCap.capped,
-    capBreached: renewReason === "coverage_override",
+    passThroughCapMultiplier: renewPassThroughCap.capMultiplier
+      ? renewPassThroughCap.capMultiplier.toFixed(4)
+      : null,
+    passThroughCapped: renewPassThroughCapped,
     executionPlan: chosenExecutionPlans
       ? chosenExecutionPlans.map((plan) => ({
           venue: plan.venue,
@@ -6596,7 +5285,7 @@ app.post("/put/auto-renew", async (req) => {
     premiumUsdc: renewPremiumUsdc ?? effectivePremiumUsdc.toFixed(2),
     cashflowUsdc: renewCashflowUsdc,
     feeUsdc,
-    subsidyUsdc: subsidyUsdc.toFixed(2),
+    subsidyUsdc: "0.00",
     reason: renewReason,
     venue: renewVenue
   });
@@ -6614,14 +5303,11 @@ app.post("/put/auto-renew", async (req) => {
       tier: tierName,
       feeUsdc,
       premiumUsdc: renewPremiumUsdc ?? Number(effectivePremiumUsdc.toFixed(2)),
-      subsidyUsdc: subsidyUsdc.toFixed(2),
+      subsidyUsdc: "0.00",
       notionalUsdc,
       delta: accounting.liquidityDelta,
       totals: liquiditySummary()
     });
-    if (subsidyUsdc.gt(0)) {
-      recordSubsidy(tierName, body.accountId || null, subsidyUsdc.toNumber());
-    }
   }
   const renewExecuted =
     renewStatus === "paper_filled" || renewStatus === "filled" || renewStatus === "ok";
