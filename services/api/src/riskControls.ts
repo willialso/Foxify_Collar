@@ -35,6 +35,13 @@ export interface RiskControlsConfig {
   subsidy_volatility_multiplier?: number;
   survival_tolerance_pct?: number;
   min_fee_usdc_by_tier?: Record<string, number>;
+  tier_min_notional_usdc_by_tier?: Record<string, number>;
+  tier_min_notional_tolerance_pct?: number;
+  vc_demo_override_enabled?: boolean;
+  vc_demo_override_min_notional_usdc?: number;
+  vc_demo_override_note?: string;
+  vc_demo_override_premium_markup_pct_by_tier?: Record<string, number>;
+  vc_demo_override_leverage_markup_pct_by_x?: Record<string, number>;
   premium_floor_ratio?: number;
   fee_iv_uplift_threshold?: number;
   fee_iv_uplift_pct_by_tier?: Record<string, number>;
@@ -72,6 +79,13 @@ export interface RiskControlsConfig {
   ctc_floor_buckets?: number[];
   ctc_price_buffer_pct?: number;
   ctc_max_snapshot_age_ms?: number;
+  ctc_shadow_mode?: boolean;
+  ctc_price_override_enabled?: boolean;
+  ctc_shadow_reject_on_explosion?: boolean;
+  ctc_max_multiple_of_hedge_premium?: number;
+  ctc_max_pct_notional?: number;
+  ctc_min_intrinsic_pct_of_spot?: number;
+  tenor_preference_tolerance_days?: number;
   option_search_budget_ms?: number;
 }
 
@@ -127,12 +141,19 @@ const DEFAULTS: RiskControlsConfig = {
     liquidity: 0.25,
     volatility: 0.1
   },
-  subsidy_daily_cap_usdc: 500,
+  subsidy_daily_cap_usdc: 0,
   subsidy_tier_daily_cap_usdc: {},
-  subsidy_account_daily_cap_usdc: 100,
-  subsidy_volatility_multiplier: 0.5,
+  subsidy_account_daily_cap_usdc: 0,
+  subsidy_volatility_multiplier: 1,
   survival_tolerance_pct: 0.98,
   min_fee_usdc_by_tier: {},
+  tier_min_notional_usdc_by_tier: {},
+  tier_min_notional_tolerance_pct: 0,
+  vc_demo_override_enabled: false,
+  vc_demo_override_min_notional_usdc: 0,
+  vc_demo_override_note: "",
+  vc_demo_override_premium_markup_pct_by_tier: {},
+  vc_demo_override_leverage_markup_pct_by_x: {},
   premium_floor_ratio: 1.25,
   fee_iv_uplift_threshold: 0.8,
   fee_iv_uplift_pct_by_tier: {},
@@ -172,6 +193,13 @@ const DEFAULTS: RiskControlsConfig = {
   ctc_floor_buckets: [0.12, 0.16, 0.2],
   ctc_price_buffer_pct: 0.02,
   ctc_max_snapshot_age_ms: 10000,
+  ctc_shadow_mode: true,
+  ctc_price_override_enabled: false,
+  ctc_shadow_reject_on_explosion: false,
+  ctc_max_multiple_of_hedge_premium: 1.5,
+  ctc_max_pct_notional: 0.15,
+  ctc_min_intrinsic_pct_of_spot: 0.005,
+  tenor_preference_tolerance_days: 2,
   option_search_budget_ms: 1200
 };
 

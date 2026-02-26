@@ -1,0 +1,5 @@
+{
+  "name": "Foxify Node Workspace",
+  "install": "bash ./scripts/cloud-agent-setup.sh",
+  "start": "echo 'Cloud agent environment ready'"
+}

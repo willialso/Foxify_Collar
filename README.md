@@ -10,10 +10,19 @@ Fixed-price protective put protection for FUNDED traders with MTM crediting, rol
 
 ## Quick Start
 1. Copy `.env.example` to `.env` and fill in Deribit keys.
-2. Install dependencies (once packages are wired to the build system).
+2. Install workspace dependencies from repo root: `npm install`.
 3. Start API and web:
    - `npm run dev:api`
    - `npm run dev:web`
+
+### Runtime source of truth
+- API runtime code is canonical under `services/api/src`.
+- Root-level `src/` is legacy test scaffolding and not used by `npm run dev:api`.
+
+### Cloud Agent Bootstrap
+- Repo includes `.cursor/environment.json` so cloud agents run:
+  - `bash ./scripts/cloud-agent-setup.sh`
+- This performs root workspace dependency install (`npm install`) before task execution.
 
 ## Repository Layout
 - `apps/web/` UI widget (TypeScript/React)

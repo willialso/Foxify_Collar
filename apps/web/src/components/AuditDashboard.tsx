@@ -120,28 +120,8 @@ export function AuditDashboard({
     hedgeSpend: liquidity?.hedgeSpendUsdc ?? 0,
     unrealizedPnl: profitability?.unrealizedHedgePnlUsdc ?? 0
   };
-  // ═══════════════════════════════════════════════════════════
-  // CEO AUDIT EVENTS FILTER
-  // Must match CEO_AUDIT_EVENTS in services/api/src/server.ts
-  // Last synced: 2026-01-31
-  // Count: 13 events
-  // ═══════════════════════════════════════════════════════════
-  const allowedEvents = new Set([
-    "coverage_activated",
-    "coverage_renewed",
-    "coverage_expired",
-    "coverage_duplicate",
-    "liquidity_update",
-    "hedge_order",
-    "hedge_action",
-    "put_quote_failed",
-    "put_renew_failed",
-    "option_exec_failed",
-    "close_blocked",
-    "put_renew"
-  ]);
-  console.log(`✓ Frontend audit filter: ${allowedEvents.size} event types`);
-  const visibleEntries = entries.filter((entry) => allowedEvents.has(entry.event));
+  // Backend /audit/logs already applies CEO_AUDIT_EVENTS filtering unless showAll=true.
+  const visibleEntries = entries;
   const isNetExposure = (entry: AuditEntry) => {
     const coverageId = String(entry.payload?.coverageId || "");
     if (coverageId.startsWith("net-") || coverageId === "platform-risk") return true;

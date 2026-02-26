@@ -9,7 +9,7 @@ Target users: funded traders and internal operators (exec and ops views), with a
 
 Recent operational changes (demo readiness):
 - Bronze tier supports **put protection only** (call protection disabled).
-- Quote caching now applies to **all response types** (including `premium_floor` and capped responses).
+- Quote caching now applies to **all response types** (including `premium_floor` responses).
 - Quote cache TTL extended to **5 minutes** (env-configurable) for demo performance.
 
 ### 1.2 Technology Stack
@@ -78,6 +78,7 @@ apps/web/
 **API structure**
 Single Fastify server in `services/api/src/server.ts` with 26 endpoints and internal in-memory state for:
 - `activeCoverages` (Map)
+- `coverageLedger` (Map)
 - `portfolioSnapshots` (Map)
 - `hedgeLedger` (Map)
 
@@ -196,7 +197,7 @@ Response:
 Notes: Expired coverages are pruned and saved to `logs/coverages.json`.
 
 #### GET /coverage/report
-Purpose: Match latest coverage per position  
+Purpose: Compute position coverage from canonical `coverageLedger` state (not audit log reconstruction)  
 Query: `accountId`  
 Response (shape):
 ```json
@@ -357,6 +358,7 @@ Purpose: Clear audit logs and reset in-memory state
 #### GET /audit/logs
 Purpose: Return audit log entries  
 Query: `limit`, `showAll`
+- Default mode (`showAll=false`) applies backend CEO event filtering before response.
 
 #### GET /audit/summary
 Purpose: Return audit summary for dashboards  
@@ -407,6 +409,11 @@ Schema: serialized array of `[coverageId, CoverageRecord]`
   ]
 }
 ```
+
+**Coverage Ledger (canonical report source)**  
+File: `logs/coverage-ledger.json`  
+Schema: serialized array of `[coverageId, CoverageLedgerEntry]`  
+Used by: `/coverage/report` and coverage status reconstruction.
 
 **Hedge Ledger**  
 File: `logs/hedge-ledger.json`  

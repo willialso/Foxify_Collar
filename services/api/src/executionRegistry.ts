@@ -1,5 +1,6 @@
 import { DeribitConnector, DeribitOrderRequest } from "@foxify/connectors";
 import { getBybitOrderbook, parseBybitExpiryTag } from "./bybitAdapter";
+import { simulateTopOfBookPaperFill } from "./executionUtils";
 
 export type VenueOrderRequest = DeribitOrderRequest & { spotPrice?: number };
 
@@ -53,11 +54,24 @@ export function createBybitExecutor(): VenueExecutor {
         throw new Error(`Bybit orderbook unavailable: ${instrument}`);
       }
       const side = request.side === "sell" ? "sell" : "buy";
-      const price = side === "sell" ? book.bid : book.ask;
+      const simulated = simulateTopOfBookPaperFill({
+        side,
+        amount: Number(request.amount ?? 0),
+        bestBid: Number.isFinite(book.bid) ? book.bid : null,
+        bestAsk: Number.isFinite(book.ask) ? book.ask : null,
+        bidSize: Number.isFinite(book.bidSize) ? book.bidSize : 0,
+        askSize: Number.isFinite(book.askSize) ? book.askSize : 0,
+        fillCurrency: "usdt"
+      });
       return {
-        status: "filled",
-        filledAmount: request.amount,
-        result: { price }
+        status: simulated.status,
+        reason: simulated.reason,
+        filledAmount: simulated.filledAmount ?? 0,
+        fillPrice: simulated.fillPrice ?? null,
+        fillCurrency: simulated.fillCurrency ?? "usdt",
+        bestBid: simulated.bestBid,
+        bestAsk: simulated.bestAsk,
+        availableSize: simulated.availableSize
       };
     }
   };

@@ -1,6 +1,13 @@
 {
   "max_leverage": 10,
   "ctc_enabled": true,
+  "ctc_shadow_mode": true,
+  "ctc_price_override_enabled": false,
+  "ctc_shadow_reject_on_explosion": false,
+  "ctc_max_multiple_of_hedge_premium": 1.5,
+  "ctc_max_pct_notional": 0.15,
+  "ctc_min_intrinsic_pct_of_spot": 0.005,
+  "tenor_preference_tolerance_days": 2,
   "ctc_margin_by_tier": {
     "Pro (Bronze)": 0.6,
     "Pro (Silver)": 0.5,
@@ -16,6 +23,29 @@
   "premium_floor_ratio": 1.25,
   "min_fee_usdc_by_tier": {
     "Pro (Bronze)": 10
+  },
+  "tier_min_notional_usdc_by_tier": {
+    "Pro (Bronze)": 500,
+    "Pro (Silver)": 500,
+    "Pro (Gold)": 500,
+    "Pro (Platinum)": 500
+  },
+  "tier_min_notional_tolerance_pct": 0.02,
+  "vc_demo_override_enabled": true,
+  "vc_demo_override_min_notional_usdc": 500,
+  "vc_demo_override_note": "VC demo override",
+  "vc_demo_override_premium_markup_pct_by_tier": {
+    "Pro (Bronze)": 0.005,
+    "Pro (Silver)": 0.015,
+    "Pro (Gold)": 0.02,
+    "Pro (Platinum)": 0.025
+  },
+  "vc_demo_override_leverage_markup_pct_by_x": {
+    "1": 0,
+    "2": 0.0025,
+    "3": 0.005,
+    "5": 0.01,
+    "10": 0.015
   },
   "premium_markup_pct_by_tier": {
     "Pro (Bronze)": 0,
@@ -42,43 +72,8 @@
     "Pro (Gold)": 2,
     "Pro (Platinum)": 3
   },
-  "pass_through_cap_by_leverage": {
-    "1": 6.0,
-    "2": 5.0,
-    "3": 4.0,
-    "5": 3.5,
-    "10": 3.0
-  },
-  "pass_through_cap_by_tier": {
-    "Pro (Bronze)": {
-      "1": 4.0,
-      "2": 3.5,
-      "3": 3.0,
-      "5": 2.5,
-      "10": 2.0
-    },
-    "Pro (Silver)": {
-      "1": 6.0,
-      "2": 5.0,
-      "3": 4.0,
-      "5": 3.5,
-      "10": 3.0
-    },
-    "Pro (Gold)": {
-      "1": 8.0,
-      "2": 6.5,
-      "3": 5.5,
-      "5": 4.5,
-      "10": 4.0
-    },
-    "Pro (Platinum)": {
-      "1": 10.0,
-      "2": 8.0,
-      "3": 7.0,
-      "5": 6.0,
-      "10": 5.0
-    }
-  },
+  "pass_through_cap_by_leverage": {},
+  "pass_through_cap_by_tier": {},
   "max_leverage_by_tier": {
     "Pro (Bronze)": {
       "put": 10,
@@ -97,8 +92,6 @@
       "call": 10
     }
   },
-  "subsidy_daily_cap_usdc": 500,
-  "subsidy_account_daily_cap_usdc": 100,
   "ctc_max_snapshot_age_ms": 10000,
   "ctc_price_buffer_pct": 0.02,
   "enable_premium_pass_through": true,

@@ -108,6 +108,11 @@ body {
   margin-left: 8px;
 }
 
+.pill-warning {
+  background: rgba(242, 166, 90, 0.16);
+  color: #f2a65a;
+}
+
 .stats {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -251,6 +256,32 @@ body {
 .row-inline-fee {
   justify-content: flex-end;
   min-width: 220px;
+}
+
+.premium-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.fetching-status {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.fetching-status em {
+  display: inline-flex;
+  align-items: center;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.fetching-dots {
+  display: inline-block;
+  width: 3ch;
+  text-align: left;
 }
 
 .fee-amount {
@@ -975,6 +1006,10 @@ select.input {
   line-height: 1.4;
 }
 
+.ineligible-hint {
+  margin-top: 4px;
+}
+
 .toast {
   position: fixed;
   top: 18px;
@@ -1233,4 +1268,87 @@ select.input {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.presentation-gate-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: #f3f4f6;
+  color: #111827;
+}
+
+.presentation-gate-card {
+  width: min(560px, 100%);
+  border-radius: 16px;
+  border: 1px solid #e5e7eb;
+  background: #ffffff;
+  box-shadow: 0 18px 32px rgba(15, 23, 42, 0.12);
+  padding: 28px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  text-align: center;
+}
+
+.presentation-gate-logos {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: 10px;
+}
+
+.presentation-gate-logo-slot {
+  width: min(190px, 35vw);
+  min-height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.presentation-gate-logo-img {
+  max-width: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.presentation-gate-logo-img--atticus {
+  max-height: 54px;
+}
+
+.presentation-gate-logo-img--trammell {
+  max-height: 72px;
+}
+
+.presentation-gate-logo-fallback {
+  font-size: 16px;
+  font-weight: 600;
+  color: #374151;
+}
+
+.presentation-gate-separator {
+  color: #6b7280;
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: 0.04em;
+  padding: 0 2px;
+}
+
+.presentation-gate-copy {
+  display: grid;
+  gap: 8px;
+  color: #374151;
+  max-width: 480px;
+}
+
+.presentation-gate-copy p {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.presentation-gate-cta {
+  min-width: 180px;
 }

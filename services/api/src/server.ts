@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { appendFile, readdir, rm, writeFile, readFile } from "node:fs/promises";
+import { appendFile, readdir, rm, writeFile, readFile, mkdir, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import Decimal from "decimal.js";
 import {
@@ -45,12 +45,19 @@ import {
   riskSummary,
   liquiditySummary,
   getRiskState,
-  canApplySubsidy,
-  recordSubsidy,
-  subsidySummary,
-  resetRiskState
+  resetRiskState,
+  type LiquidityState
 } from "./riskControls";
 import { sendWebhookAlert } from "@foxify/hedging";
+import {
+  isQuoteAmountWithinTolerance,
+  isSurvivalSatisfied,
+  resolveLiveCtcFeeControl
+} from "./phase0Guards";
+import { resolveOptionPremiumUsdc } from "./executionUtils";
+import { buildCoverageReport } from "./coverageReport";
+import { resolveCoverageTargetSize } from "./quoteCoverage";
+import { resolvePremiumMarkupPctForQuote } from "./markupProfile";
 
 // ═══════════════════════════════════════════════════════════
 // CEO-FOCUSED AUDIT EVENTS (Filter for Modal Display)
@@ -64,6 +71,9 @@ const CEO_AUDIT_EVENTS = [
   "liquidity_update",
   "hedge_order",
   "hedge_action",
+  "mtm_position",
+  "mtm_credit",
+  "demo_credit",
   "put_quote_failed",
   "put_renew_failed",
   "option_exec_failed",
@@ -92,7 +102,11 @@ await app.register(cors, { origin: true });
 const LOOP_INTERVAL_MS = Number(process.env.LOOP_INTERVAL_MS || "600000");
 const MTM_INTERVAL_MS = Number(process.env.MTM_INTERVAL_MS || "300000");
 const APP_MODE = process.env.APP_MODE || "demo";
+const ALLOW_DERIBIT_PRIVATE_MTM =
+  process.env.ALLOW_DERIBIT_PRIVATE_MTM === "true" || APP_MODE !== "demo";
 const AUDIT_SEED = process.env.AUDIT_SEED !== "false";
+const API_PORT = Number(process.env.PORT || process.env.API_PORT || "4100");
+const API_HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_PATH = process.env.ACCOUNTS_CONFIG_PATH || "../../../configs/live_accounts.json";
 const AUDIT_LOG_PATH = new URL("../../../logs/audit.log", import.meta.url);
 const LOGS_DIR = new URL("../../../logs/", import.meta.url);
@@ -100,9 +114,21 @@ const RISK_CONTROLS_PATH = new URL("../../../configs/risk_controls.json", import
 const VENUE_CONFIG_PATH = new URL("../config.json", import.meta.url);
 const COVERAGE_FILE_PATH = new URL("../../../logs/coverages.json", import.meta.url);
 const HEDGE_LEDGER_PATH = new URL("../../../logs/hedge-ledger.json", import.meta.url);
+const COVERAGE_LEDGER_PATH = new URL("../../../logs/coverage-ledger.json", import.meta.url);
 const QUOTE_CACHE_TTL_MS = Number(process.env.QUOTE_CACHE_TTL_MS || "300000");
+async function ensureLogsDir(): Promise<void> {
+  try {
+    await mkdir(LOGS_DIR, { recursive: true });
+  } catch (error) {
+    console.error("Failed to ensure logs directory:", error);
+  }
+}
 const QUOTE_CACHE_STALE_MS = Number(process.env.QUOTE_CACHE_STALE_MS || "20000");
 const QUOTE_CACHE_HARD_MS = Number(process.env.QUOTE_CACHE_HARD_MS || "120000");
+const QUOTE_STRIKE_SCAN_LIMIT = Number(process.env.QUOTE_STRIKE_SCAN_LIMIT || "12");
+const QUOTE_STRIKE_CONCURRENCY = Number(process.env.QUOTE_STRIKE_CONCURRENCY || "4");
+const PRICING_POLICY_VERSION = "pilot-pricing-v2";
+const SERVER_BOOTED_AT = new Date().toISOString();
 
 type VenueMode = "bybit_only" | "deribit_only" | "dual_venue";
 type VenueConfig = {
@@ -163,17 +189,43 @@ if (venueConfig.mode === "bybit_only") {
 }
 console.log("════════════════════════════════════════════════════════");
 
-type QuoteCacheEntry = { ts: number; response: Record<string, unknown> };
+type QuoteCacheEntry = { ts: number; response: Record<string, unknown>; ttlMs?: number };
 const quoteCache = new Map<string, QuoteCacheEntry>();
 const quoteInflight = new Map<string, Promise<Record<string, unknown>>>();
 type QuoteLock = {
   feeUsdc: Decimal;
+  premiumTotalUsdc?: Decimal;
+  premiumPerUnitUsdc?: Decimal;
+  hedgeSize?: Decimal;
+  optionType?: "put" | "call";
   issuedAt: number;
   expiresAt: number;
   tierName: string;
+  instruments: string[];
 };
 const quoteLocks = new Map<string, QuoteLock>();
 const cacheStats = { hits: 0, misses: 0, avgHitTime: 0, avgMissTime: 0 };
+const hedgeActionCooldownByCoverage = new Map<string, number>();
+const netExposureCooldownByTier = new Map<string, number>();
+
+const extractQuoteInstruments = (response: Record<string, unknown>): string[] => {
+  const instruments = new Set<string>();
+  const responseAny = response as any;
+  const direct = responseAny.instrument ?? responseAny?.hedge?.instrument;
+  if (typeof direct === "string" && direct.length > 0) {
+    instruments.add(direct);
+  }
+  const executionPlan = responseAny.executionPlan;
+  if (Array.isArray(executionPlan)) {
+    for (const plan of executionPlan) {
+      const instrument = plan?.instrument;
+      if (typeof instrument === "string" && instrument.length > 0) {
+        instruments.add(instrument);
+      }
+    }
+  }
+  return Array.from(instruments);
+};
 
 function buildQuoteCacheKey(body: {
   tierName?: string;
@@ -226,7 +278,8 @@ function getQuoteCache(key: string): QuoteCacheEntry | null {
 }
 
 function isQuoteCacheFresh(entry: QuoteCacheEntry): boolean {
-  return Date.now() - entry.ts <= QUOTE_CACHE_TTL_MS;
+  const ttlMs = entry.ttlMs ?? QUOTE_CACHE_TTL_MS;
+  return Date.now() - entry.ts <= ttlMs;
 }
 
 function isQuoteCacheStale(entry: QuoteCacheEntry): boolean {
@@ -237,8 +290,8 @@ function isQuoteCacheUsable(entry: QuoteCacheEntry): boolean {
   return Date.now() - entry.ts <= QUOTE_CACHE_HARD_MS;
 }
 
-function setQuoteCache(key: string, response: Record<string, unknown>): void {
-  quoteCache.set(key, { ts: Date.now(), response });
+function setQuoteCache(key: string, response: Record<string, unknown>, ttlMs?: number): void {
+  quoteCache.set(key, { ts: Date.now(), response, ttlMs });
 }
 
 function recordCacheHit(elapsedMs: number): void {
@@ -255,6 +308,27 @@ function recordCacheMiss(elapsedMs: number): void {
     (cacheStats.avgMissTime * (cacheStats.misses - 1) + elapsedMs) / cacheStats.misses;
   const total = cacheStats.hits + cacheStats.misses;
   console.log(`[Cache] MISS - Hit rate: ${((cacheStats.hits / total) * 100).toFixed(1)}%`);
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (!items.length) return [];
+  const workerCount = Math.max(1, Math.min(items.length, concurrency));
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 async function audit(event: string, payload: Record<string, unknown>): Promise<void> {
@@ -326,6 +400,97 @@ async function loadCoverages(): Promise<void> {
   } catch (error) {
     console.error("Failed to load coverages:", error);
   }
+}
+
+// ═══════════════════════════════════════════════════════════
+// COVERAGE LEDGER PERSISTENCE
+// ═══════════════════════════════════════════════════════════
+
+function serializeCoverageLedger(): CoverageLedgerEntry[] {
+  return Array.from(coverageLedger.values()).map((entry) => ({
+    ...entry,
+    positions: entry.positions ?? [],
+    updatedAt: entry.updatedAt || new Date().toISOString()
+  }));
+}
+
+async function saveCoverageLedger(): Promise<void> {
+  try {
+    const data = {
+      ledger: serializeCoverageLedger(),
+      timestamp: new Date().toISOString()
+    };
+    await writeFile(COVERAGE_LEDGER_PATH, JSON.stringify(data, null, 2), "utf-8");
+    console.log(`✓ Saved coverage ledger (${data.ledger.length} entries)`);
+  } catch (error) {
+    console.error("Failed to save coverage ledger:", error);
+  }
+}
+
+async function loadCoverageLedger(): Promise<void> {
+  try {
+    const { existsSync } = await import("node:fs");
+    if (!existsSync(COVERAGE_LEDGER_PATH)) {
+      console.log("No coverage ledger found (fresh start)");
+      return;
+    }
+    const raw = await (await import("node:fs/promises")).readFile(COVERAGE_LEDGER_PATH, "utf-8");
+    const data = JSON.parse(raw) as {
+      ledger?: CoverageLedgerEntry[];
+      timestamp?: string;
+    };
+    const entries = Array.isArray(data.ledger) ? data.ledger : [];
+    for (const entry of entries) {
+      if (!entry?.coverageId) continue;
+      coverageLedger.set(entry.coverageId, {
+        ...entry,
+        positions: entry.positions ?? [],
+        updatedAt: entry.updatedAt || new Date().toISOString()
+      });
+    }
+    console.log(`✓ Loaded coverage ledger: ${coverageLedger.size} entries`);
+  } catch (error) {
+    console.error("Failed to load coverage ledger:", error);
+  }
+}
+
+function upsertCoverageLedger(
+  update: Partial<CoverageLedgerEntry> & { coverageId: string }
+): CoverageLedgerEntry {
+  const existing = coverageLedger.get(update.coverageId);
+  const now = new Date().toISOString();
+  const next: CoverageLedgerEntry = {
+    coverageId: update.coverageId,
+    expiryIso: update.expiryIso || existing?.expiryIso || "",
+    positions: update.positions || existing?.positions || [],
+    accountId: update.accountId ?? existing?.accountId ?? null,
+    tier: update.tier ?? existing?.tier ?? null,
+    autoRenew: update.autoRenew ?? existing?.autoRenew ?? undefined,
+    selectedVenue: update.selectedVenue ?? existing?.selectedVenue ?? null,
+    hedgeInstrument: update.hedgeInstrument ?? existing?.hedgeInstrument ?? null,
+    hedgeSize: update.hedgeSize ?? existing?.hedgeSize ?? null,
+    hedgeType: update.hedgeType ?? existing?.hedgeType ?? null,
+    optionType: update.optionType ?? existing?.optionType ?? null,
+    strike: update.strike ?? existing?.strike ?? null,
+    coverageLegs: update.coverageLegs ?? existing?.coverageLegs ?? undefined,
+    notionalUsdc: update.notionalUsdc ?? existing?.notionalUsdc ?? null,
+    floorUsd: update.floorUsd ?? existing?.floorUsd ?? null,
+    equityUsd: update.equityUsd ?? existing?.equityUsd ?? null,
+    quotedFeeUsdc: update.quotedFeeUsdc ?? existing?.quotedFeeUsdc ?? null,
+    collectedFeeUsdc: update.collectedFeeUsdc ?? existing?.collectedFeeUsdc ?? null,
+    hedgeSpendUsdc: update.hedgeSpendUsdc ?? existing?.hedgeSpendUsdc ?? null,
+    grossMarginUsdc: update.grossMarginUsdc ?? existing?.grossMarginUsdc ?? null,
+    pricingReason: update.pricingReason ?? existing?.pricingReason ?? null,
+    markSource: update.markSource ?? existing?.markSource ?? null,
+    mtmAttribution: update.mtmAttribution ?? existing?.mtmAttribution ?? null,
+    lastMtm: update.lastMtm ?? existing?.lastMtm ?? null,
+    creditUsdc: update.creditUsdc ?? existing?.creditUsdc ?? undefined,
+    expiredAt: update.expiredAt ?? existing?.expiredAt ?? undefined,
+    status: update.status ?? existing?.status ?? "active",
+    updatedAt: now
+  };
+  coverageLedger.set(update.coverageId, next);
+  return next;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -439,6 +604,47 @@ type CoverageRecord = {
   positions: CoveragePosition[];
 };
 
+type CoverageLedgerEntry = {
+  coverageId: string;
+  expiryIso: string;
+  positions: CoveragePosition[];
+  accountId?: string | null;
+  tier?: string | null;
+  autoRenew?: boolean;
+  selectedVenue?: string | null;
+  hedgeInstrument?: string | null;
+  hedgeSize?: number | null;
+  hedgeType?: "option" | "perp" | null;
+  optionType?: "put" | "call" | null;
+  strike?: number | null;
+  coverageLegs?: Array<{
+    instrument: string;
+    size: number;
+    venue?: string | null;
+    optionType?: "put" | "call" | null;
+    strike?: number | null;
+  }>;
+  notionalUsdc?: number | null;
+  floorUsd?: number | null;
+  equityUsd?: number | null;
+  quotedFeeUsdc?: number | null;
+  collectedFeeUsdc?: number | null;
+  hedgeSpendUsdc?: number | null;
+  grossMarginUsdc?: number | null;
+  pricingReason?: string | null;
+  markSource?: "bybit" | "deribit" | null;
+  mtmAttribution?: "position" | "net" | null;
+  lastMtm?: {
+    bufferUsdc?: string;
+    coverageRatio?: string;
+    ts?: string;
+  } | null;
+  creditUsdc?: number;
+  expiredAt?: string;
+  status?: "active" | "expired";
+  updatedAt: string;
+};
+
 type QuoteBookSnapshot = {
   venue: string;
   instrument: string;
@@ -460,16 +666,52 @@ type PortfolioExposure = {
 };
 
 const activeCoverages = new Map<string, CoverageRecord>();
+const coverageLedger = new Map<string, CoverageLedgerEntry>();
 const portfolioSnapshots = new Map<string, { positions: PortfolioExposure[]; updatedAt: string }>();
 const hedgeLedger = new Map<string, { size: Decimal; avgCostUsdc: Decimal }>();
 let realizedHedgePnlUsdc = new Decimal(0);
 let lastMtmSnapshot: { equityUsdc: Decimal; positionPnlUsdc: Decimal; hedgeMtmUsdc: Decimal } | null =
   null;
+let lastMtmSnapshotAt = 0;
 
 function parseInstrumentAsset(instrument: string): string | null {
   const parts = instrument.split("-");
   if (parts.length >= 1) return parts[0] || null;
   return null;
+}
+
+function inferVenueFromInstrument(instrument?: string | null): "bybit" | "deribit" | null {
+  if (!instrument) return null;
+  if (instrument.endsWith("-USDT")) return "bybit";
+  return "deribit";
+}
+
+function isNetCoverageId(
+  coverageId?: string | null,
+  coverageIds?: Array<string> | null
+): boolean {
+  const id = coverageId ? String(coverageId) : "";
+  if (id.startsWith("net-") || id === "platform-risk") return true;
+  if (Array.isArray(coverageIds)) {
+    return coverageIds.some((entry) => entry.startsWith("net-") || entry === "platform-risk");
+  }
+  return false;
+}
+
+function parseOptionInstrument(
+  instrument?: string | null
+): { strike: number | null; optionType: "put" | "call" | null } {
+  if (!instrument) return { strike: null, optionType: null };
+  const parts = instrument.split("-");
+  if (parts.length < 4) return { strike: null, optionType: null };
+  const strikeValue = Number(parts[2]);
+  const rawType = parts[3]?.toUpperCase();
+  const optionType =
+    rawType === "P" ? "put" : rawType === "C" ? "call" : null;
+  return {
+    strike: Number.isFinite(strikeValue) ? strikeValue : null,
+    optionType
+  };
 }
 
 async function computeUnrealizedHedgeMetrics(): Promise<{
@@ -483,29 +725,51 @@ async function computeUnrealizedHedgeMetrics(): Promise<{
     if (!entry.size || entry.size.eq(0)) continue;
     let markPriceUsdc: Decimal | null = null;
     try {
-      const ticker = await deribit.getTicker(instrument);
-      const result = (ticker as any)?.result || {};
-      if (instrument.includes("PERPETUAL")) {
-        const mark = Number(result?.mark_price ?? result?.last_price ?? 0);
-        if (Number.isFinite(mark) && mark > 0) {
-          markPriceUsdc = new Decimal(mark);
+      if (instrument.endsWith("-USDT")) {
+        if (instrument.includes("PERPETUAL")) {
+          const asset = parseInstrumentAsset(instrument);
+          const spot = asset ? await fetchSpotPrice(asset) : null;
+          if (spot) {
+            markPriceUsdc = spot;
+          }
+        } else {
+          markPriceUsdc = await fetchBybitOptionMarkUsdc(instrument);
         }
       } else {
-        const markUsd = Number(result?.mark_price_usd ?? 0);
-        if (Number.isFinite(markUsd) && markUsd > 0) {
-          markPriceUsdc = new Decimal(markUsd);
+        const ticker = await deribit.getTicker(instrument);
+        const result = (ticker as any)?.result || {};
+        if (instrument.includes("PERPETUAL")) {
+          const mark = Number(result?.mark_price ?? result?.last_price ?? 0);
+          if (Number.isFinite(mark) && mark > 0) {
+            markPriceUsdc = new Decimal(mark);
+          }
         } else {
-          const markBtc = Number(result?.mark_price ?? 0);
-          const underlying = Number(result?.underlying_price ?? 0);
-          if (Number.isFinite(markBtc) && markBtc > 0 && Number.isFinite(underlying) && underlying > 0) {
-            markPriceUsdc = new Decimal(markBtc).mul(new Decimal(underlying));
+          const markUsd = Number(result?.mark_price_usd ?? 0);
+          if (Number.isFinite(markUsd) && markUsd > 0) {
+            markPriceUsdc = new Decimal(markUsd);
           } else {
-            const asset = parseInstrumentAsset(instrument);
-            if (asset) {
-              const index = await deribit.getIndexPrice(`${asset.toLowerCase()}_usd`);
-              const spot = Number((index as any)?.result?.index_price ?? 0);
-              if (Number.isFinite(markBtc) && markBtc > 0 && Number.isFinite(spot) && spot > 0) {
-                markPriceUsdc = new Decimal(markBtc).mul(new Decimal(spot));
+            const markBtc = Number(result?.mark_price ?? 0);
+            const underlying = Number(result?.underlying_price ?? 0);
+            if (
+              Number.isFinite(markBtc) &&
+              markBtc > 0 &&
+              Number.isFinite(underlying) &&
+              underlying > 0
+            ) {
+              markPriceUsdc = new Decimal(markBtc).mul(new Decimal(underlying));
+            } else {
+              const asset = parseInstrumentAsset(instrument);
+              if (asset) {
+                const index = await deribit.getIndexPrice(`${asset.toLowerCase()}_usd`);
+                const spot = Number((index as any)?.result?.index_price ?? 0);
+                if (
+                  Number.isFinite(markBtc) &&
+                  markBtc > 0 &&
+                  Number.isFinite(spot) &&
+                  spot > 0
+                ) {
+                  markPriceUsdc = new Decimal(markBtc).mul(new Decimal(spot));
+                }
               }
             }
           }
@@ -523,31 +787,373 @@ async function computeUnrealizedHedgeMetrics(): Promise<{
   return { unrealizedHedgePnlUsdc: unrealized, hedgeNotionalUsdc: hedgeNotional };
 }
 
-function calculateCoverageStatus(
-  position: PortfolioExposure,
-  hedge?: {
-    optionType?: string | null;
-    strike?: number | string | null;
-    hedgeSize?: number | string | null;
-  },
-  drawdownFloorPct = 0.2
-): {
-  requiredSize: number;
-  coveredSize: number;
-  coveragePct: number;
-  floorStrike: number;
-  isCovered: boolean;
-} {
-  const requiredSize = position.size || 0;
-  const coveredSize = Number(hedge?.hedgeSize ?? 0);
-  const coveragePct =
-    requiredSize > 0 ? Math.min(1, coveredSize / requiredSize) * 100 : 0;
-  const floorStrike =
-    position.side === "long"
-      ? position.entryPrice * (1 - drawdownFloorPct)
-      : position.entryPrice * (1 + drawdownFloorPct);
-  const isCovered = coveredSize >= requiredSize * 0.99;
-  return { requiredSize, coveredSize, coveragePct, floorStrike, isCovered };
+async function fetchSpotPrice(asset: string): Promise<Decimal | null> {
+  try {
+    const index = await deribit.getIndexPrice(`${asset.toLowerCase()}_usd`);
+    const spot = Number((index as any)?.result?.index_price ?? 0);
+    if (!Number.isFinite(spot) || spot <= 0) return null;
+    return new Decimal(spot);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchDeribitOptionMarkUsdc(
+  instrument: string,
+  spotPrice: Decimal
+): Promise<Decimal | null> {
+  try {
+    const ticker = await deribit.getTicker(instrument);
+    const result = (ticker as any)?.result || {};
+    const markUsd = Number(result?.mark_price_usd ?? 0);
+    if (Number.isFinite(markUsd) && markUsd > 0) {
+      return new Decimal(markUsd);
+    }
+    const markBtc = Number(result?.mark_price ?? 0);
+    if (Number.isFinite(markBtc) && markBtc > 0) {
+      return new Decimal(markBtc).mul(spotPrice);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchBybitOptionMarkUsdc(instrument: string): Promise<Decimal | null> {
+  try {
+    const expiryTag = deriveExpiryTag(instrument);
+    const expiryDate = expiryTag ? parseExpiryTagToDate(expiryTag) : null;
+    const asset = parseInstrumentAsset(instrument);
+    const optionMeta = parseOptionInstrument(instrument);
+    if (!expiryDate || !asset || !optionMeta.optionType || !optionMeta.strike) return null;
+    const optionSymbol = optionMeta.optionType === "put" ? "P" : "C";
+    const book = await getBybitOrderbook(asset, optionMeta.strike, expiryDate, optionSymbol);
+    if (!book) return null;
+    const bid = Number(book.bid || 0);
+    const ask = Number(book.ask || 0);
+    if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
+      return new Decimal(bid).add(new Decimal(ask)).div(2);
+    }
+    if (Number.isFinite(ask) && ask > 0) return new Decimal(ask);
+    if (Number.isFinite(bid) && bid > 0) return new Decimal(bid);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchCoverageOptionMarkUsdc(
+  venue: string | null,
+  instrument: string,
+  spotPrice: Decimal
+): Promise<Decimal | null> {
+  if (venue === "bybit") {
+    return fetchBybitOptionMarkUsdc(instrument);
+  }
+  return fetchDeribitOptionMarkUsdc(instrument, spotPrice);
+}
+
+function shouldLogMtmUpdate(params: {
+  entry: CoverageLedgerEntry;
+  bufferUsdc: Decimal;
+  bufferPct: Decimal;
+  coverageRatio?: Decimal | null;
+  lastBufferPct?: Decimal | null;
+}): boolean {
+  const lastBuffer = params.entry.lastMtm?.bufferUsdc
+    ? new Decimal(params.entry.lastMtm.bufferUsdc)
+    : null;
+  const lastCoverage = params.entry.lastMtm?.coverageRatio
+    ? new Decimal(params.entry.lastMtm.coverageRatio)
+    : null;
+  if (!lastBuffer) return true;
+  const bufferDelta = params.bufferUsdc.minus(lastBuffer).abs();
+  if (bufferDelta.greaterThanOrEqualTo(MTM_BUFFER_THRESHOLD_USDC)) return true;
+  if (params.lastBufferPct) {
+    const pctDelta = params.bufferPct.minus(params.lastBufferPct).abs();
+    if (pctDelta.greaterThanOrEqualTo(MTM_BUFFER_THRESHOLD_PCT)) return true;
+  }
+  if (params.coverageRatio && lastCoverage) {
+    const ratioDelta = params.coverageRatio.minus(lastCoverage).abs();
+    if (ratioDelta.greaterThanOrEqualTo(MTM_COVERAGE_RATIO_THRESHOLD)) return true;
+  }
+  if (params.bufferUsdc.isNegative() && lastBuffer.greaterThanOrEqualTo(0)) return true;
+  return false;
+}
+
+function mergeCoverageLegs(
+  existing: CoverageLedgerEntry["coverageLegs"] | undefined,
+  leg: {
+    instrument: string;
+    size: number;
+    venue?: string | null;
+    optionType?: "put" | "call" | null;
+    strike?: number | null;
+  }
+): CoverageLedgerEntry["coverageLegs"] {
+  const legs = Array.isArray(existing) ? existing.slice() : [];
+  const idx = legs.findIndex((entry) => entry.instrument === leg.instrument);
+  if (idx >= 0) {
+    const updated = { ...legs[idx] };
+    updated.size = Number(updated.size || 0) + leg.size;
+    updated.venue = leg.venue ?? updated.venue;
+    updated.optionType = leg.optionType ?? updated.optionType;
+    updated.strike = leg.strike ?? updated.strike;
+    legs[idx] = updated;
+    return legs;
+  }
+  legs.push({ ...leg });
+  return legs;
+}
+
+function buildCoverageLegsFromPlans(
+  plans: Array<{
+    venue: string;
+    instrument: string;
+    side: "buy" | "sell";
+    size: Decimal;
+    price: Decimal;
+  }>
+): CoverageLedgerEntry["coverageLegs"] {
+  let legs: CoverageLedgerEntry["coverageLegs"] = [];
+  for (const plan of plans) {
+    if (!plan.instrument || !plan.size) continue;
+    const parsed = parseOptionInstrument(plan.instrument);
+    legs = mergeCoverageLegs(legs, {
+      instrument: plan.instrument,
+      size: Number(plan.size.toFixed(6)),
+      venue: plan.venue,
+      optionType: parsed.optionType,
+      strike: parsed.strike
+    });
+  }
+  return legs;
+}
+
+function sumCoverageCredits(): Decimal {
+  let total = new Decimal(0);
+  for (const entry of coverageLedger.values()) {
+    if (entry.creditUsdc && entry.creditUsdc > 0) {
+      total = total.add(new Decimal(entry.creditUsdc));
+    }
+  }
+  return total;
+}
+
+async function markCoverageExpired(coverageId: string, expiryIso: string): Promise<void> {
+  const existing = coverageLedger.get(coverageId);
+  if (existing?.status === "expired") return;
+  const expiredAt = new Date().toISOString();
+  upsertCoverageLedger({
+    coverageId,
+    expiryIso,
+    status: "expired",
+    expiredAt
+  });
+  await saveCoverageLedger();
+  await audit("coverage_expired", {
+    coverageId,
+    expiryIso,
+    expiredAt,
+    selectedVenue: existing?.selectedVenue ?? null
+  });
+}
+
+async function computeCoverageMtmSnapshots(): Promise<void> {
+  const now = Date.now();
+  const spotCache = new Map<string, Decimal>();
+  for (const entry of coverageLedger.values()) {
+    if (!entry.positions || entry.positions.length === 0) continue;
+    const expiryMs = Date.parse(entry.expiryIso);
+    if (Number.isFinite(expiryMs) && expiryMs <= now) {
+      await markCoverageExpired(entry.coverageId, entry.expiryIso);
+      continue;
+    }
+    const asset = entry.positions[0].asset || "BTC";
+    if (!spotCache.has(asset)) {
+      const spot = await fetchSpotPrice(asset);
+      if (spot) spotCache.set(asset, spot);
+    }
+    const spotPrice = spotCache.get(asset);
+    if (!spotPrice) continue;
+    const totalNotional = entry.positions.reduce((acc, pos) => {
+      const notional = new Decimal(pos.marginUsd || 0).mul(new Decimal(pos.leverage || 1));
+      return acc.add(notional);
+    }, new Decimal(0));
+    const hedgeSize = Array.isArray(entry.coverageLegs)
+      ? new Decimal(
+          entry.coverageLegs.reduce((sum, leg) => sum + Number(leg.size || 0), 0)
+        )
+      : entry.hedgeSize
+        ? new Decimal(entry.hedgeSize)
+        : new Decimal(0);
+    const hedgeVenue =
+      entry.markSource ?? entry.selectedVenue ?? inferVenueFromInstrument(entry.hedgeInstrument);
+    let hedgeMtmTotal = new Decimal(0);
+    if (Array.isArray(entry.coverageLegs) && entry.coverageLegs.length > 0) {
+      for (const leg of entry.coverageLegs) {
+        if (!leg.instrument || !leg.size) continue;
+        const legVenue = leg.venue ?? hedgeVenue;
+        const mark = await fetchCoverageOptionMarkUsdc(
+          legVenue ?? "deribit",
+          leg.instrument,
+          spotPrice
+        );
+        if (mark) {
+          hedgeMtmTotal = hedgeMtmTotal.add(mark.mul(new Decimal(leg.size)));
+        }
+      }
+    } else if (
+      entry.hedgeType === "option" &&
+      entry.hedgeInstrument &&
+      hedgeSize.gt(0) &&
+      hedgeVenue
+    ) {
+      const mark = await fetchCoverageOptionMarkUsdc(
+        hedgeVenue,
+        entry.hedgeInstrument,
+        spotPrice
+      );
+      if (mark) hedgeMtmTotal = mark.mul(hedgeSize);
+    }
+    const drawdownFloorPct =
+      entry.equityUsd && entry.floorUsd && entry.equityUsd > 0
+        ? new Decimal(1).minus(new Decimal(entry.floorUsd).div(entry.equityUsd))
+        : new Decimal(0.2);
+    const optionType = entry.optionType ?? "put";
+    const floorPrice = computeFloorPrice(spotPrice, drawdownFloorPct, optionType);
+    let coverageCreditTotal = new Decimal(0);
+    if (Array.isArray(entry.coverageLegs) && entry.coverageLegs.length > 0) {
+      for (const leg of entry.coverageLegs) {
+        if (!Number.isFinite(leg.strike) || !leg.size) continue;
+        const intrinsic = computeIntrinsicAtFloor({
+          spotPrice,
+          drawdownFloorPct,
+          optionType: leg.optionType ?? optionType,
+          strike: new Decimal(leg.strike)
+        });
+        if (intrinsic.gt(0)) {
+          coverageCreditTotal = coverageCreditTotal.add(
+            intrinsic.mul(new Decimal(leg.size))
+          );
+        }
+      }
+    }
+    const survivalTolerance = new Decimal(riskControls.survival_tolerance_pct ?? 0.98);
+
+    for (const position of entry.positions) {
+      const margin = new Decimal(position.marginUsd || 0);
+      const leverage = new Decimal(position.leverage || 1);
+      const entryPrice = new Decimal(position.entryPrice || 0);
+      if (margin.lte(0) || leverage.lte(0) || entryPrice.lte(0)) continue;
+      const notional = margin.mul(leverage);
+      const sizeUnits = notional.div(entryPrice);
+      const pnl =
+        position.side === "short"
+          ? entryPrice.minus(spotPrice).mul(sizeUnits)
+          : spotPrice.minus(entryPrice).mul(sizeUnits);
+      const hedgeShare = totalNotional.gt(0) ? notional.div(totalNotional) : new Decimal(1);
+      const hedgeMtm = hedgeMtmTotal.mul(hedgeShare);
+      const existingCreditTotal = new Decimal(entry.creditUsdc ?? 0);
+      const creditShare = existingCreditTotal.mul(hedgeShare);
+      let equityUsdc = margin.add(pnl).add(hedgeMtm).add(creditShare);
+      const drawdownLimitUsdc = margin.mul(new Decimal(1).minus(drawdownFloorPct));
+      let bufferUsdc = equityUsdc.minus(drawdownLimitUsdc);
+      let bufferPct = margin.gt(0) ? bufferUsdc.div(margin) : new Decimal(0);
+      const lastBuffer = entry.lastMtm?.bufferUsdc
+        ? new Decimal(entry.lastMtm.bufferUsdc)
+        : null;
+      const lastBufferPct =
+        entry.lastMtm?.bufferUsdc && margin.gt(0)
+          ? new Decimal(entry.lastMtm.bufferUsdc).div(margin)
+          : null;
+      const hedgedSize = hedgeSize.mul(hedgeShare);
+      const survivalCheck = buildSurvivalCheck({
+        spotPrice,
+        drawdownFloorPct,
+        optionType,
+        strike: entry.strike ? new Decimal(entry.strike) : null,
+        hedgeSize: hedgedSize,
+        requiredSize: sizeUnits,
+        tolerancePct: survivalTolerance
+      });
+      const coverageRatioBase = survivalCheck?.coverageRatio
+        ? new Decimal(survivalCheck.coverageRatio)
+        : null;
+      const requiredCredit = spotPrice.sub(floorPrice).abs().mul(sizeUnits);
+      const coverageRatio = coverageCreditTotal.gt(0)
+        ? requiredCredit.gt(0)
+          ? coverageCreditTotal.mul(hedgeShare).div(requiredCredit)
+          : null
+        : coverageRatioBase;
+      let creditApplied = new Decimal(0);
+      if (bufferUsdc.isNegative()) {
+        creditApplied = bufferUsdc.abs();
+        const nextCreditTotal = existingCreditTotal.add(creditApplied);
+        equityUsdc = equityUsdc.add(creditApplied);
+        bufferUsdc = bufferUsdc.add(creditApplied);
+        bufferPct = margin.gt(0) ? bufferUsdc.div(margin) : new Decimal(0);
+        await audit("demo_credit", {
+          coverageId: entry.coverageId,
+          positionId: position.id,
+          creditUsdc: creditApplied.toFixed(2),
+          totalCreditUsdc: nextCreditTotal.toFixed(2),
+          bufferUsdc: bufferUsdc.sub(creditApplied).toFixed(2),
+          equityUsdc: equityUsdc.sub(creditApplied).toFixed(2),
+          hedgeInstrument: entry.hedgeInstrument ?? null,
+          hedgeVenue,
+          mtmAttribution: entry.mtmAttribution ?? "position"
+        });
+        upsertCoverageLedger({
+          coverageId: entry.coverageId,
+          creditUsdc: nextCreditTotal.toNumber()
+        });
+        await saveCoverageLedger();
+      }
+      const shouldLog = shouldLogMtmUpdate({
+        entry,
+        bufferUsdc,
+        bufferPct,
+        coverageRatio,
+        lastBufferPct
+      });
+      if (!shouldLog) continue;
+      await audit("mtm_position", {
+        coverageId: entry.coverageId,
+        positionId: position.id,
+        asset: position.asset,
+        side: position.side,
+        entryPrice: entryPrice.toFixed(2),
+        leverage: leverage.toFixed(2),
+        marginUsd: margin.toFixed(2),
+        spotPrice: spotPrice.toFixed(2),
+        positionPnlUsdc: pnl.toFixed(2),
+        hedgeMtmUsdc: hedgeMtm.toFixed(2),
+        equityUsdc: equityUsdc.toFixed(2),
+        drawdownLimitUsdc: drawdownLimitUsdc.toFixed(2),
+        drawdownBufferUsdc: bufferUsdc.toFixed(2),
+        drawdownBufferPct: bufferPct.mul(100).toFixed(2),
+        creditUsdc: creditShare.add(creditApplied).toFixed(2),
+        coverageRatio: coverageRatio ? coverageRatio.toFixed(4) : null,
+        hedgeInstrument: entry.hedgeInstrument ?? null,
+        hedgeVenue,
+        hedgeSize: hedgedSize.toFixed(6),
+        optionType: entry.optionType ?? null,
+        strike: entry.strike ?? null,
+        floorPrice: survivalCheck?.floorPrice ?? floorPrice.toFixed(2),
+        mtmAttribution: entry.mtmAttribution ?? "position"
+      });
+      upsertCoverageLedger({
+        coverageId: entry.coverageId,
+        lastMtm: {
+          bufferUsdc: bufferUsdc.toFixed(2),
+          coverageRatio: coverageRatio ? coverageRatio.toFixed(4) : undefined,
+          ts: new Date().toISOString()
+        }
+      });
+      await saveCoverageLedger();
+    }
+  }
 }
 
 function serializeDecimal(value: Decimal | null | undefined, digits = 6): string | null {
@@ -572,15 +1178,18 @@ function buildSurvivalCheck(params: {
 } | null {
   if (!params.strike || !params.hedgeSize || !params.requiredSize) return null;
   if (params.hedgeSize.lte(0) || params.requiredSize.lte(0)) return null;
-  const floorPrice =
-    params.optionType === "put"
-      ? params.spotPrice.mul(new Decimal(1).minus(params.drawdownFloorPct))
-      : params.spotPrice.mul(new Decimal(1).plus(params.drawdownFloorPct));
+  const floorPrice = computeFloorPrice(
+    params.spotPrice,
+    params.drawdownFloorPct,
+    params.optionType
+  );
   const requiredCredit = params.spotPrice.sub(floorPrice).abs().mul(params.requiredSize);
-  const intrinsic =
-    params.optionType === "put"
-      ? Decimal.max(new Decimal(0), params.strike.sub(floorPrice))
-      : Decimal.max(new Decimal(0), floorPrice.sub(params.strike));
+  const intrinsic = computeIntrinsicAtFloor({
+    spotPrice: params.spotPrice,
+    drawdownFloorPct: params.drawdownFloorPct,
+    optionType: params.optionType,
+    strike: params.strike
+  });
   const hedgeCredit = intrinsic.mul(params.hedgeSize);
   const coverageRatio = requiredCredit.gt(0) ? hedgeCredit.div(requiredCredit) : new Decimal(1);
   return {
@@ -590,6 +1199,55 @@ function buildSurvivalCheck(params: {
     coverageRatio: coverageRatio.toFixed(4),
     pass: coverageRatio.greaterThanOrEqualTo(params.tolerancePct)
   };
+}
+
+function computeFloorPrice(
+  spotPrice: Decimal,
+  drawdownFloorPct: Decimal,
+  optionType: "put" | "call"
+): Decimal {
+  return optionType === "put"
+    ? spotPrice.mul(new Decimal(1).minus(drawdownFloorPct))
+    : spotPrice.mul(new Decimal(1).plus(drawdownFloorPct));
+}
+
+function computeIntrinsicAtFloor(params: {
+  spotPrice: Decimal;
+  drawdownFloorPct: Decimal;
+  optionType: "put" | "call";
+  strike: Decimal;
+}): Decimal {
+  const floorPrice = computeFloorPrice(
+    params.spotPrice,
+    params.drawdownFloorPct,
+    params.optionType
+  );
+  return params.optionType === "put"
+    ? Decimal.max(new Decimal(0), params.strike.sub(floorPrice))
+    : Decimal.max(new Decimal(0), floorPrice.sub(params.strike));
+}
+
+function requiredHedgeSizeForFullCoverage(params: {
+  spotPrice: Decimal;
+  drawdownFloorPct: Decimal;
+  optionType: "put" | "call";
+  strike: Decimal;
+  requiredSize: Decimal;
+}): Decimal | null {
+  const floorPrice = computeFloorPrice(
+    params.spotPrice,
+    params.drawdownFloorPct,
+    params.optionType
+  );
+  const requiredCredit = params.spotPrice.sub(floorPrice).abs().mul(params.requiredSize);
+  const intrinsic = computeIntrinsicAtFloor({
+    spotPrice: params.spotPrice,
+    drawdownFloorPct: params.drawdownFloorPct,
+    optionType: params.optionType,
+    strike: params.strike
+  });
+  if (intrinsic.lte(0)) return null;
+  return requiredCredit.div(intrinsic);
 }
 
 function buildReplicationMeta(params: {
@@ -690,40 +1348,108 @@ function normalizeLeverage(rawLeverage?: number): { ok: boolean; value: number; 
 }
 
 function resolvePassThroughCapMultiplier(leverage?: number, tierName?: string): Decimal | null {
-  if (tierName && riskControls.pass_through_cap_by_tier) {
-    const tierCaps = riskControls.pass_through_cap_by_tier[tierName];
-    if (tierCaps) {
-      const selected = findLeverageMultiplier(leverage, tierCaps);
-      if (Number.isFinite(selected) && selected && selected > 0) {
-        return new Decimal(selected);
-      }
-    }
+  // Caps intentionally disabled: pass-through is uncapped by policy.
+  return null;
+}
+
+function resolveDynamicCapMultiplier(ivScaled: number, liquidity: LiquidityState): Decimal {
+  const enabled = riskControls.dynamic_cap_enabled !== false;
+  if (!enabled) return new Decimal(1);
+  const ivValue = Number.isFinite(ivScaled) ? ivScaled : 0;
+  const baseLiquidity = riskControls.initial_liquidity_usdc ?? 0;
+  const liquidityRatio =
+    baseLiquidity > 0 ? liquidity.liquidityBalanceUsdc / baseLiquidity : 0;
+  const low = riskControls.dynamic_cap_liquidity_ratio_low ?? 1.0;
+  const high = riskControls.dynamic_cap_liquidity_ratio_high ?? 1.5;
+  const liquidityScore =
+    liquidityRatio <= low
+      ? 0
+      : liquidityRatio >= high
+        ? 1
+        : (liquidityRatio - low) / (high - low);
+  const thresholds = riskControls.fee_iv_regime_thresholds ?? { low: 0.5, high: 0.8 };
+  const normalUplift = riskControls.dynamic_cap_iv_uplift_pct_normal ?? 0.1;
+  const highUplift = riskControls.dynamic_cap_iv_uplift_pct_high ?? 0.25;
+  const maxUplift = riskControls.dynamic_cap_max_uplift_pct ?? 0.25;
+  let ivBoost = 0;
+  if (ivValue >= thresholds.high) {
+    ivBoost = highUplift;
+  } else if (ivValue >= thresholds.low) {
+    ivBoost = normalUplift;
   }
-  const selected = findLeverageMultiplier(leverage, riskControls.pass_through_cap_by_leverage);
-  if (!Number.isFinite(selected) || !selected || selected <= 0) return null;
-  return new Decimal(selected);
+  const uplift = Math.min(maxUplift, ivBoost * liquidityScore);
+  return new Decimal(1).add(new Decimal(uplift));
 }
 
 function applyPassThroughCap(
   baseFee: Decimal,
   allInPremium: Decimal,
   leverage?: number,
-  tierName?: string
-): { maxFee: Decimal | null; capped: boolean; capMultiplier: Decimal | null; tierName?: string } {
+  tierName?: string,
+  ivScaled = 0,
+  liquidity = liquiditySummary()
+): {
+  maxFee: Decimal | null;
+  capped: boolean;
+  capMultiplier: Decimal | null;
+  dynamicMultiplier: Decimal;
+  tierName?: string;
+} {
   const capMultiplier = resolvePassThroughCapMultiplier(leverage, tierName);
   if (!capMultiplier) {
-    return { maxFee: null, capped: false, capMultiplier: null, tierName };
+    return {
+      maxFee: null,
+      capped: false,
+      capMultiplier: null,
+      dynamicMultiplier: new Decimal(1),
+      tierName
+    };
   }
-  const maxFee = baseFee.mul(capMultiplier);
+  const dynamicMultiplier = resolveDynamicCapMultiplier(ivScaled, liquidity);
+  const maxFee = baseFee.mul(capMultiplier).mul(dynamicMultiplier);
   const capped = allInPremium.gt(maxFee);
-  return { maxFee, capped, capMultiplier, tierName };
+  return { maxFee, capped, capMultiplier, dynamicMultiplier, tierName };
+}
+
+function formatCapMultiplier(
+  info: {
+    capMultiplier: Decimal | null;
+    dynamicMultiplier: Decimal;
+  },
+  digits = 4
+): string | null {
+  if (!info.capMultiplier) return null;
+  return info.capMultiplier.mul(info.dynamicMultiplier).toFixed(digits);
 }
 
 function resolvePremiumMarkupPct(tierName: string, leverage?: number): Decimal {
-  const tierMarkup = riskControls.premium_markup_pct_by_tier?.[tierName] ?? 0;
-  const leverageMarkup = findLeverageMultiplier(leverage, riskControls.leverage_markup_pct_by_x);
-  const leveragePct = Number.isFinite(leverageMarkup) ? leverageMarkup : 0;
-  return new Decimal(tierMarkup).add(new Decimal(leveragePct));
+  return resolvePremiumMarkupPctForQuote(tierName, leverage, riskControls);
+}
+
+function resolveTierMinNotionalUsdc(tierName: string): Decimal | null {
+  // VC demo override keeps a single threshold for investor walkthroughs.
+  const demoOverrideEnabled = riskControls.vc_demo_override_enabled === true;
+  const demoOverrideRaw = Number(riskControls.vc_demo_override_min_notional_usdc ?? 0);
+  if (demoOverrideEnabled && Number.isFinite(demoOverrideRaw) && demoOverrideRaw > 0) {
+    return new Decimal(demoOverrideRaw);
+  }
+  const raw = riskControls.tier_min_notional_usdc_by_tier?.[tierName];
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return new Decimal(value);
+}
+
+function isBelowTierMinNotional(
+  protectedNotionalUsdc: Decimal,
+  tierMinNotionalUsdc: Decimal
+): boolean {
+  const protectedRounded = protectedNotionalUsdc.toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+  const toleranceRaw = Number(riskControls.tier_min_notional_tolerance_pct ?? 0);
+  const tolerancePct = Number.isFinite(toleranceRaw)
+    ? Math.max(0, Math.min(0.1, toleranceRaw))
+    : 0;
+  const effectiveMin = tierMinNotionalUsdc.mul(new Decimal(1).minus(new Decimal(tolerancePct)));
+  return protectedRounded.lt(effectiveMin);
 }
 
 function resolveDriftTolerance(tierName: string): { pct: Decimal; usdc: Decimal } {
@@ -738,7 +1464,10 @@ function applyBronzeFixedFee(
   feeUsdc: Decimal,
   optionType?: "put" | "call"
 ): { fee: Decimal; applied: boolean } {
-  return { fee: feeUsdc, applied: false };
+  if (tierName !== "Pro (Bronze)") {
+    return { fee: feeUsdc, applied: false };
+  }
+  return { fee: feeUsdc, applied: true };
 }
 
 function applyIvFeeUplift(tierName: string, feeUsdc: Decimal, iv?: number): Decimal {
@@ -789,9 +1518,18 @@ async function calculateFeeBase(params: {
   feeIv: NormalizedIv;
 }> {
   const feeIv = await resolveFeeIv(params.asset, params.ivCandidate);
+  if (params.tierName === "Pro (Bronze)") {
+    const fixedFee = applyMinFee(params.tierName, params.baseFeeUsdc);
+    return {
+      feeUsdc: fixedFee,
+      feeRegime: { regime: null, multiplier: null },
+      feeLeverage: { multiplier: new Decimal(1) },
+      feeIv
+    };
+  }
   let feeUsdc = applyMinFee(params.tierName, params.baseFeeUsdc);
   feeUsdc = applyDurationFee(feeUsdc, params.targetDays);
-  const ctcEnabled = riskControls.ctc_enabled ?? false;
+  const ctcEnabled = resolveLiveCtcFeeControl(riskControls);
   const feeRegime = ctcEnabled
     ? { fee: feeUsdc, regime: null, multiplier: null }
     : applyFeeRegime(params.tierName, feeUsdc, feeIv.scaled);
@@ -856,12 +1594,15 @@ function calculateCtcSafetyFee(params: {
       ? params.spotPrice.mul(new Decimal(1).minus(params.drawdownPct))
       : params.spotPrice.mul(new Decimal(1).plus(params.drawdownPct));
   if (floorPrice.lte(0)) return { feeUsdc: null, baseIv: ladder.baseIv, hedgeIv: ladder.hedgeIv };
-  const notionalUsdc = params.spotPrice.mul(params.positionSize).mul(new Decimal(params.leverage));
+  // positionSize is already exposure units from widget/API request payload.
+  const notionalUsdc = params.spotPrice.mul(params.positionSize);
   const bufferPct = riskControls.ctc_buffer_pct ?? 0.15;
   const targetUsd = notionalUsdc
     .mul(params.drawdownPct)
     .mul(new Decimal(1).add(new Decimal(bufferPct)));
   let totalCost = new Decimal(0);
+  const minIntrinsicPct = Number(riskControls.ctc_min_intrinsic_pct_of_spot ?? 0.005);
+  const minIntrinsicAbs = params.spotPrice.mul(new Decimal(Math.max(0, minIntrinsicPct)));
   const pickLeg = (tenorDays: number) => {
     const candidates = ladder.legs.filter(
       (leg) =>
@@ -870,9 +1611,15 @@ function calculateCtcSafetyFee(params: {
         Number.isFinite(leg.strike)
     );
     if (!candidates.length) return null;
-    let best = candidates[0];
+    let best: (typeof candidates)[number] | null = null;
     let bestScore = Number.POSITIVE_INFINITY;
     for (const leg of candidates) {
+      const strike = new Decimal(leg.strike);
+      const intrinsic =
+        params.optionType === "put" ? strike.minus(floorPrice) : floorPrice.minus(strike);
+      if (!intrinsic.isFinite() || intrinsic.lte(minIntrinsicAbs)) {
+        continue;
+      }
       const tenorDiff = Math.abs(leg.tenorDays - tenorDays);
       const floorDiff = Math.abs(leg.floorPct - bucket);
       const score = tenorDiff * 10 + floorDiff;
@@ -905,6 +1652,95 @@ function calculateCtcSafetyFee(params: {
   const opsBuffer = riskControls.ctc_ops_buffer_usdc_by_tier?.[params.tierName] ?? 0;
   const feeUsdc = totalCost.mul(new Decimal(1).add(new Decimal(marginPct))).add(new Decimal(opsBuffer));
   return { feeUsdc, baseIv: ladder.baseIv, hedgeIv: ladder.hedgeIv };
+}
+
+type CtcShadowAssessment = {
+  rawFeeUsdc: Decimal | null;
+  boundedFeeUsdc: Decimal | null;
+  maxByPremiumUsdc: Decimal | null;
+  maxByNotionalUsdc: Decimal | null;
+  breached: boolean;
+  reasons: string[];
+  reject: boolean;
+  shadowMode: boolean;
+  priceOverrideEnabled: boolean;
+  wouldOverride: boolean;
+};
+
+function assessCtcShadow(params: {
+  ctcFeeUsdc: Decimal | null;
+  baseFeeUsdc: Decimal;
+  hedgePremiumUsdc: Decimal;
+  protectedNotionalUsdc: Decimal;
+}): CtcShadowAssessment {
+  const shadowMode = riskControls.ctc_shadow_mode !== false;
+  const priceOverrideEnabled = riskControls.ctc_price_override_enabled === true && !shadowMode;
+  if (!params.ctcFeeUsdc || !params.ctcFeeUsdc.isFinite() || params.ctcFeeUsdc.lte(0)) {
+    return {
+      rawFeeUsdc: null,
+      boundedFeeUsdc: null,
+      maxByPremiumUsdc: null,
+      maxByNotionalUsdc: null,
+      breached: false,
+      reasons: [],
+      reject: false,
+      shadowMode,
+      priceOverrideEnabled,
+      wouldOverride: false
+    };
+  }
+
+  const maxMultiple = Number(riskControls.ctc_max_multiple_of_hedge_premium ?? 1.5);
+  const maxPctNotional = Number(riskControls.ctc_max_pct_notional ?? 0.15);
+  const maxByPremiumUsdc =
+    Number.isFinite(maxMultiple) && maxMultiple > 0 && params.hedgePremiumUsdc.gt(0)
+      ? params.hedgePremiumUsdc.mul(new Decimal(maxMultiple))
+      : null;
+  const maxByNotionalUsdc =
+    Number.isFinite(maxPctNotional) && maxPctNotional > 0 && params.protectedNotionalUsdc.gt(0)
+      ? params.protectedNotionalUsdc.mul(new Decimal(maxPctNotional))
+      : null;
+
+  let boundedFeeUsdc = params.ctcFeeUsdc;
+  const reasons: string[] = [];
+  if (maxByPremiumUsdc && boundedFeeUsdc.gt(maxByPremiumUsdc)) {
+    boundedFeeUsdc = maxByPremiumUsdc;
+    reasons.push("max_multiple_of_hedge_premium");
+  }
+  if (maxByNotionalUsdc && boundedFeeUsdc.gt(maxByNotionalUsdc)) {
+    boundedFeeUsdc = maxByNotionalUsdc;
+    reasons.push("max_pct_notional");
+  }
+  const breached = reasons.length > 0;
+  const reject = breached && riskControls.ctc_shadow_reject_on_explosion === true;
+  const wouldOverride = boundedFeeUsdc.gt(params.baseFeeUsdc);
+
+  return {
+    rawFeeUsdc: params.ctcFeeUsdc,
+    boundedFeeUsdc,
+    maxByPremiumUsdc,
+    maxByNotionalUsdc,
+    breached,
+    reasons,
+    reject,
+    shadowMode,
+    priceOverrideEnabled,
+    wouldOverride
+  };
+}
+
+function serializeCtcShadow(assessment: CtcShadowAssessment): Record<string, unknown> {
+  return {
+    mode: assessment.shadowMode ? "shadow" : assessment.priceOverrideEnabled ? "pricing" : "disabled",
+    rawFeeUsdc: assessment.rawFeeUsdc ? assessment.rawFeeUsdc.toFixed(2) : null,
+    boundedFeeUsdc: assessment.boundedFeeUsdc ? assessment.boundedFeeUsdc.toFixed(2) : null,
+    maxByPremiumUsdc: assessment.maxByPremiumUsdc ? assessment.maxByPremiumUsdc.toFixed(2) : null,
+    maxByNotionalUsdc: assessment.maxByNotionalUsdc ? assessment.maxByNotionalUsdc.toFixed(2) : null,
+    breached: assessment.breached,
+    reasons: assessment.reasons,
+    reject: assessment.reject,
+    wouldOverride: assessment.wouldOverride
+  };
 }
 
 function applyPartialDiscount(feeUsdc: Decimal, coverageRatio: Decimal): Decimal {
@@ -963,11 +1799,6 @@ function premiumFloorBreached(premiumTotal: Decimal, feeUsdc: Decimal): {
   }
   const ratio = premiumTotal.div(feeUsdc);
   return { breached: ratio.gt(threshold), ratio, threshold };
-}
-
-function canCoverageOverride(tierName: string): boolean {
-  const allowed = riskControls.coverage_override_tiers ?? [];
-  return allowed.includes(tierName);
 }
 
 function getCombinedExposureBook(): {
@@ -1077,6 +1908,9 @@ app.get("/coverage/active", async (req) => {
       active.push(coverage);
     } else {
       activeCoverages.delete(key);
+      if (Number.isFinite(expiryMs)) {
+        await markCoverageExpired(key, coverage.expiryIso);
+      }
     }
   }
 
@@ -1087,7 +1921,17 @@ app.get("/coverage/active", async (req) => {
   return {
     status: "ok",
     accountId,
-    coverages: active,
+    coverages: active.map((coverage) => {
+      const ledger = coverageLedger.get(coverage.coverageId);
+      return {
+        ...coverage,
+        quotedFeeUsdc: ledger?.quotedFeeUsdc ?? null,
+        collectedFeeUsdc: ledger?.collectedFeeUsdc ?? null,
+        hedgeSpendUsdc: ledger?.hedgeSpendUsdc ?? null,
+        grossMarginUsdc: ledger?.grossMarginUsdc ?? null,
+        pricingReason: ledger?.pricingReason ?? null
+      };
+    }),
     count: active.length
   };
 });
@@ -1096,91 +1940,19 @@ app.get("/coverage/report", async (req) => {
   const query = req.query as { accountId?: string };
   const accountId = query.accountId || "demo";
   const portfolio = portfolioSnapshots.get(accountId);
-  const coverages = await readAuditEntries(500);
-  const coverageEvents = coverages.filter((entry) => entry.event === "coverage_activated");
-
-  const latestByPosition = new Map<string, Record<string, unknown>>();
-  for (const entry of coverageEvents) {
-    const payload = entry.payload as any;
-    const pos = payload?.portfolio?.positions?.[0];
-    if (!pos?.asset || !pos?.side || !pos?.entryPrice) continue;
-    const key = `${pos.asset}|${pos.side}|${pos.leverage}|${pos.entryPrice}`;
-    latestByPosition.set(key, payload);
-  }
-  const matchCoverage = (position: PortfolioExposure): Record<string, unknown> | null => {
-    const key = `${position.asset}|${position.side}|${position.leverage}|${position.entryPrice}`;
-    if (latestByPosition.has(key)) return latestByPosition.get(key) as Record<string, unknown>;
-    const candidates: Array<{ payload: Record<string, unknown>; diff: number }> = [];
-    for (const payload of latestByPosition.values()) {
-      const pos = (payload as any)?.portfolio?.positions?.[0];
-      if (!pos?.asset || !pos?.side || !pos?.entryPrice || !pos?.leverage) continue;
-      if (pos.asset !== position.asset || pos.side !== position.side) continue;
-      const notional = Number(pos.marginUsd || 0) * Number(pos.leverage || 1);
-      const size = pos.entryPrice ? notional / Number(pos.entryPrice) : 0;
-      const diff = Math.abs(size - position.size);
-      candidates.push({ payload, diff });
-    }
-    if (!candidates.length) return null;
-    candidates.sort((a, b) => a.diff - b.diff);
-    return candidates[0].payload;
-  };
-
   const positions = portfolio?.positions ?? [];
-  const results = positions.map((pos, idx) => {
-    const id = `pos_${idx + 1}`;
-    const coverage = matchCoverage(pos) as any;
-    const hedge = coverage?.hedge || null;
-    const drawdownFloorPct =
-      coverage?.equityUsd && coverage?.floorUsd
-        ? Math.max(0, 1 - Number(coverage.floorUsd) / Number(coverage.equityUsd))
-        : 0.2;
-    const status = calculateCoverageStatus(
-      {
-        asset: pos.asset,
-        side: pos.side,
-        entryPrice: pos.entryPrice,
-        size: pos.size,
-        leverage: pos.leverage
-      },
-      {
-        optionType: hedge?.optionType ?? null,
-        strike: hedge?.strike ?? null,
-        hedgeSize: hedge?.hedgeSize ?? null
-      },
-      drawdownFloorPct
-    );
-    return {
-      positionId: id,
-      asset: pos.asset,
-      side: pos.side,
-      entryPrice: pos.entryPrice,
-      size: pos.size,
-      leverage: pos.leverage,
-      coverageId: coverage?.coverageId ?? null,
-      hedgeInstrument: hedge?.instrument ?? null,
-      expiryTag: hedge?.expiryTag ?? null,
-      optionType: hedge?.optionType ?? null,
-      strike: hedge?.strike ?? null,
-      reason: coverage?.reason ?? null,
-      feeUsd: coverage?.feeUsd ?? null,
-      premiumUsd: hedge?.premiumUsdc ?? null,
-      subsidyUsd: hedge?.subsidyUsdc ?? null,
-      requiredSize: status.requiredSize,
-      coveredSize: status.coveredSize,
-      coveragePct: status.coveragePct.toFixed(2),
-      floorStrike: status.floorStrike,
-      isCovered: status.isCovered
-    };
+  const coverageReport = buildCoverageReport({
+    accountId,
+    positions,
+    coverageLedgerEntries: Array.from(coverageLedger.values())
   });
-
-  const covered = results.filter((r) => r.isCovered).length;
   return {
     status: "ok",
     accountId,
-    positions: results.length,
-    covered,
-    coveragePct: results.length ? ((covered / results.length) * 100).toFixed(2) : "0",
-    results
+    positions: coverageReport.results.length,
+    covered: coverageReport.covered,
+    coveragePct: coverageReport.coveragePct,
+    results: coverageReport.results
   };
 });
 
@@ -1215,12 +1987,18 @@ app.get("/risk/summary", async (req) => {
   let positionPnl = new Decimal(query.positionPnlUsdc || "0");
   let hedgeMtm = new Decimal(query.hedgeMtmUsdc || "0");
   const maxMtmAgeMs = Number(query.maxMtmAgeMs || "15000");
+  const requestedAssets = query.assets
+    ? query.assets
+        .split(",")
+        .map((asset) => asset.trim().toUpperCase())
+        .filter(Boolean)
+    : ["BTC"];
+  const assets = Array.from(new Set(requestedAssets.length ? requestedAssets : ["BTC"]));
 
   const needsPositionPnl = !query.positionPnlUsdc;
   const needsHedgeMtm = !query.hedgeMtmUsdc;
-  if (needsPositionPnl || needsHedgeMtm) {
+  if (ALLOW_DERIBIT_PRIVATE_MTM && (needsPositionPnl || needsHedgeMtm)) {
     try {
-      const assets = ["BTC"];
       for (const asset of assets) {
         const positions = await deribit.getPositions(asset);
         if (needsPositionPnl) {
@@ -1248,9 +2026,10 @@ app.get("/risk/summary", async (req) => {
     }
   }
 
+  const creditUsdc = sumCoverageCredits();
   const summary = computeRiskSummary(
     {
-      cashUsdc: new Decimal(query.cashUsdc || "10000"),
+      cashUsdc: new Decimal(query.cashUsdc || "10000").add(creditUsdc),
       positionPnlUsdc: positionPnl,
       hedgeMtmUsdc: hedgeMtm,
       drawdownLimitUsdc: new Decimal(query.drawdownLimitUsdc || "9000")
@@ -1262,13 +2041,15 @@ app.get("/risk/summary", async (req) => {
     equityUsdc: summary.equityUsdc.toFixed(2),
     drawdownLimitUsdc: summary.drawdownLimitUsdc.toFixed(2),
     drawdownBufferUsdc: summary.drawdownBufferUsdc.toFixed(2),
-    drawdownBufferPct: summary.drawdownBufferPct.mul(100).toFixed(2)
+    drawdownBufferPct: summary.drawdownBufferPct.mul(100).toFixed(2),
+    creditUsdc: creditUsdc.toFixed(2)
   };
   lastMtmSnapshot = {
     equityUsdc: summary.equityUsdc,
     positionPnlUsdc: positionPnl,
     hedgeMtmUsdc: hedgeMtm
   };
+  lastMtmSnapshotAt = Date.now();
   const mtmHasValue = !positionPnl.isZero() || !hedgeMtm.isZero();
   if (mtmHasValue) {
     await audit("mtm_credit", {
@@ -1281,16 +2062,28 @@ app.get("/risk/summary", async (req) => {
 });
 
 const deribitEnv = (process.env.DERIBIT_ENV as "testnet" | "live") || "live";
-console.log("[Deribit] Using MAINNET endpoint");
-const deribitPaper =
-  process.env.DERIBIT_PAPER !== undefined
-    ? process.env.DERIBIT_PAPER === "true"
-    : deribitEnv !== "live";
+const deribitHasCredentials = Boolean(
+  process.env.DERIBIT_CLIENT_ID && process.env.DERIBIT_CLIENT_SECRET
+);
+const deribitPaperEnv = process.env.DERIBIT_PAPER?.trim().toLowerCase();
+const deribitPaperRequested =
+  deribitPaperEnv !== undefined ? deribitPaperEnv === "true" : deribitEnv !== "live";
+const deribitPaper = deribitHasCredentials ? deribitPaperRequested : true;
+if (!deribitHasCredentials && deribitPaperEnv === "false") {
+  console.warn(
+    "[Deribit] DERIBIT_PAPER=false but credentials are missing; forcing paper mode to avoid execution hard-fail."
+  );
+}
+console.log(
+  `[Deribit] endpoint=${deribitEnv} paper=${deribitPaper ? "true" : "false"} credentials=${
+    deribitHasCredentials ? "present" : "missing"
+  }`
+);
 
 const deribit = new DeribitConnector(
   deribitEnv,
   deribitPaper,
-  process.env.DERIBIT_CLIENT_ID && process.env.DERIBIT_CLIENT_SECRET
+  deribitHasCredentials
     ? {
         clientId: process.env.DERIBIT_CLIENT_ID,
         clientSecret: process.env.DERIBIT_CLIENT_SECRET
@@ -1852,6 +2645,38 @@ async function getOptionVenueQuotes(
 
         return quotes;
       }
+
+      if (raceResult.venue === "deribit") {
+        const deribitOrderBook = (raceResult.data as any)?.result;
+        if (deribitOrderBook) {
+          console.log("[Hybrid] Fast path: returning Deribit price immediately");
+          addDeribitQuote(deribitOrderBook);
+          Promise.resolve()
+            .then(async () => {
+              try {
+                const bybit = await bybitPromise;
+                if (!bybit?.ask) return;
+                const { ask } = bestBidAsk(deribitOrderBook);
+                if (!ask) return;
+                const deribitAskUsd = new Decimal(ask).mul(spotPrice).toNumber();
+                const savings = deribitAskUsd - bybit.ask;
+                await audit("hybrid_comparison", {
+                  bybitPrice: bybit.ask,
+                  deribitPrice: deribitAskUsd,
+                  savings: savings.toFixed(2),
+                  bybitTimeMs: Date.now() - hybridStart,
+                  deribitTimeMs: raceTime,
+                  fastPathUsed: true,
+                  instrument
+                });
+              } catch (error: any) {
+                console.log(`[Hybrid] Background Bybit query failed: ${error?.message ?? "unknown"}`);
+              }
+            })
+            .catch(() => undefined);
+          return quotes;
+        }
+      }
     }
 
     const [deribitResult, bybitResult] = await Promise.allSettled([
@@ -1873,6 +2698,53 @@ async function getOptionVenueQuotes(
   }
 
   throw new Error(`Unknown venue mode: ${venueConfig.mode}`);
+}
+
+async function fetchDeribitQuoteForInstrument(
+  instrument: string,
+  spotPrice: Decimal
+): Promise<
+  | {
+      venue: string;
+      instrument: string;
+      type: "option";
+      book: {
+        bid: Decimal | null;
+        ask: Decimal | null;
+        bidSize: Decimal;
+        askSize: Decimal;
+        spreadPct: Decimal;
+        timestampMs: number | null;
+        markPriceUsd?: Decimal | null;
+      };
+    }
+  | null
+> {
+  try {
+    const deribitOrderBook = (await deribit.getOrderBook(instrument) as any)?.result;
+    if (!deribitOrderBook) return null;
+    const { bid, ask } = bestBidAsk(deribitOrderBook);
+    const markPrice = deribitOrderBook.mark_price ?? null;
+    const bidUsd = bid ? new Decimal(bid).mul(spotPrice) : null;
+    const askUsd = ask ? new Decimal(ask).mul(spotPrice) : null;
+    const markUsd = markPrice ? new Decimal(markPrice).mul(spotPrice) : null;
+    return {
+      venue: "deribit",
+      instrument,
+      type: "option",
+      book: {
+        bid: bidUsd,
+        ask: askUsd,
+        bidSize: new Decimal(deribitOrderBook.bids?.[0]?.[1] || 0),
+        askSize: new Decimal(deribitOrderBook.asks?.[0]?.[1] || 0),
+        spreadPct: spreadPct(bid || 0, ask || 0),
+        timestampMs: deribitOrderBook.timestamp ?? null,
+        markPriceUsd: markUsd
+      }
+    };
+  } catch {
+    return null;
+  }
 }
 
 function aggregateOptionQuotes(
@@ -1979,7 +2851,12 @@ async function buildExpirySearchOrder(
       let total = new Decimal(0);
       let count = 0;
       for (const inst of probes) {
-        const quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+        let quotes: Awaited<ReturnType<typeof getOptionVenueQuotes>> = [];
+        try {
+          quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+        } catch {
+          continue;
+        }
         if (!quotes.length) continue;
         const agg = aggregateOptionQuotes(quotes, "buy", requiredSize);
         if (!agg.bestAsk || !agg.bestBid) continue;
@@ -2052,6 +2929,108 @@ function resolveLiquidityThresholds(
   };
 }
 
+async function simulateDeribitPaperOrderbookFallback(params: {
+  instrument: string;
+  amount: number;
+  side: "buy" | "sell";
+  coverageId?: string;
+  quoteId?: string;
+  tierName?: string;
+  accountId?: string;
+  requestedVenue: string;
+  requestedInstrument: string;
+  primaryError: string;
+}): Promise<any | null> {
+  if (!Number.isFinite(params.amount) || params.amount <= 0 || !params.instrument) {
+    return null;
+  }
+  try {
+    const book = await deribit.getOrderBook(params.instrument);
+    const orderBook = (book as any)?.result;
+    if (!orderBook) {
+      return null;
+    }
+    const bestBid = orderBook?.bids?.[0]?.[0] ?? null;
+    const bestAsk = orderBook?.asks?.[0]?.[0] ?? null;
+    const bidSize = Number(orderBook?.bids?.[0]?.[1] ?? 0);
+    const askSize = Number(orderBook?.asks?.[0]?.[1] ?? 0);
+    const fillPrice = params.side === "buy" ? bestAsk : bestBid;
+    const availableSize = params.side === "buy" ? askSize : bidSize;
+    let fallbackResponse: any;
+    if (!fillPrice) {
+      fallbackResponse = {
+        status: "paper_rejected",
+        reason: "no_top_of_book",
+        bestBid,
+        bestAsk,
+        availableSize,
+        bookTimestamp: orderBook?.timestamp ?? null
+      };
+    } else if (availableSize < params.amount) {
+      if (availableSize > 0) {
+        fallbackResponse = {
+          status: "paper_filled",
+          reason: "partial_fill",
+          fillPrice,
+          filledAmount: availableSize,
+          fillCurrency: "btc",
+          bestBid,
+          bestAsk,
+          availableSize,
+          bookTimestamp: orderBook?.timestamp ?? null
+        };
+      } else {
+        fallbackResponse = {
+          status: "paper_rejected",
+          reason: "insufficient_liquidity",
+          bestBid,
+          bestAsk,
+          availableSize,
+          bookTimestamp: orderBook?.timestamp ?? null
+        };
+      }
+    } else {
+      fallbackResponse = {
+        status: "paper_filled",
+        reason: "deribit_unavailable_paper_fallback",
+        fillPrice,
+        filledAmount: params.amount,
+        fillCurrency: "btc",
+        bestBid,
+        bestAsk,
+        availableSize,
+        bookTimestamp: orderBook?.timestamp ?? null
+      };
+    }
+    fallbackResponse.executionVenue = "deribit";
+    fallbackResponse.executedInstrument = params.instrument;
+    fallbackResponse.diagnostic = {
+      category: "execution_fallback",
+      requestedVenue: params.requestedVenue,
+      executedVenue: "deribit",
+      requestedInstrument: params.requestedInstrument,
+      executedInstrument: params.instrument,
+      reason: "deribit_unavailable_paper_fallback",
+      primaryError: params.primaryError
+    };
+    await audit("hedge_order_fallback", {
+      coverageId: params.coverageId || null,
+      quoteId: params.quoteId ?? null,
+      tierName: params.tierName ?? null,
+      accountId: params.accountId ?? null,
+      requestedVenue: params.requestedVenue,
+      executedVenue: "deribit",
+      requestedInstrument: params.requestedInstrument,
+      executedInstrument: params.instrument,
+      reason: "deribit_unavailable_paper_fallback",
+      primaryError: params.primaryError
+    });
+    return fallbackResponse;
+  } catch {
+    return null;
+  }
+}
+
 app.get("/deribit/instruments", async () => {
   return deribit.listInstruments("BTC");
 });
@@ -2080,6 +3059,7 @@ app.post("/deribit/order", async (req) => {
     feeRecognized?: boolean;
     subsidyUsdc?: number;
     reason?: string;
+    pricingReason?: string;
     accountId?: string;
     intent?: "open" | "close" | "hedge";
     quoteId?: string;
@@ -2091,6 +3071,14 @@ app.post("/deribit/order", async (req) => {
     hedgeMtmUsdc?: string;
     floorPrice?: number;
   };
+  const slippageTrackingEnabled = riskControls.slippage_tracking_enabled === true;
+  const slippageGuardEnabled = riskControls.slippage_guard_enabled === true;
+  const slippageSoftPct = new Decimal(riskControls.slippage_soft_pct ?? 0);
+  const slippageSoftUsdc = new Decimal(riskControls.slippage_soft_usdc ?? 0);
+  const slippageHardPct = new Decimal(riskControls.slippage_hard_pct ?? 0);
+  const slippageHardUsdc = new Decimal(riskControls.slippage_hard_usdc ?? 0);
+  const slippageRejectHard = riskControls.slippage_reject_hard === true;
+  let quoteLock: QuoteLock | null = null;
   if (body.intent !== "close" && body.quoteId && body.feeUsdc !== undefined) {
     const lock = quoteLocks.get(body.quoteId);
     if (!lock) {
@@ -2098,6 +3086,57 @@ app.post("/deribit/order", async (req) => {
     }
     if (Date.now() > lock.expiresAt) {
       return { status: "rejected", reason: "quote_expired" };
+    }
+    const requestedInstrument = String(body.instrument || "");
+    const isPerp =
+      body.hedgeType === "perp" || requestedInstrument.toUpperCase().includes("PERP");
+    if (!isPerp && body.side !== "buy") {
+      return {
+        status: "rejected",
+        reason: "quote_drift",
+        drift: "side",
+        expectedSide: "buy"
+      };
+    }
+    if (!isPerp && lock.instruments.length > 0) {
+      const normalized = requestedInstrument.replace(/-USDT$/, "");
+      const matches =
+        lock.instruments.includes(requestedInstrument) ||
+        lock.instruments.includes(normalized) ||
+        lock.instruments.includes(`${normalized}-USDT`);
+      if (!matches) {
+        return {
+          status: "rejected",
+          reason: "quote_drift",
+          drift: "instrument",
+          expectedInstruments: lock.instruments
+        };
+      }
+    }
+    const requestedAmount = new Decimal(body.amount ?? 0);
+    if (!requestedAmount.isFinite() || requestedAmount.lte(0)) {
+      return {
+        status: "rejected",
+        reason: "quote_drift",
+        drift: "amount"
+      };
+    }
+    if (!isPerp) {
+      const amountGuard = isQuoteAmountWithinTolerance({
+        quotedSize: lock.hedgeSize,
+        requestedSize: requestedAmount,
+        tolerancePct: Number((riskControls as any).quote_size_drift_pct ?? 0.02),
+        toleranceAbs: Number((riskControls as any).quote_size_drift_abs ?? 0.001)
+      });
+      if (!amountGuard.ok) {
+        return {
+          status: "rejected",
+          reason: "quote_drift",
+          drift: "amount",
+          maxAmount: amountGuard.maxAllowed ? amountGuard.maxAllowed.toFixed(6) : null,
+          quoteAmount: lock.hedgeSize ? lock.hedgeSize.toFixed(6) : null
+        };
+      }
     }
     const requestedFee = new Decimal(body.feeUsdc);
     if (requestedFee.isFinite() && requestedFee.gt(0)) {
@@ -2112,6 +3151,7 @@ app.post("/deribit/order", async (req) => {
         };
       }
     }
+    quoteLock = lock;
   }
   if (body.intent === "close") {
     if (!body.drawdownLimitUsdc || !body.initialBalanceUsdc) {
@@ -2159,21 +3199,283 @@ app.post("/deribit/order", async (req) => {
     }
   }
   const venue = body.venue || (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
-  const inferredHedgeType =
-    body.hedgeType || (body.instrument.includes("PERPETUAL") ? "perp" : "option");
+  const instrumentHint = String(body.instrument || "").toUpperCase();
+  const instrumentIsPerp = instrumentHint.includes("PERP");
+  const inferredHedgeType = instrumentIsPerp ? "perp" : body.hedgeType || "option";
   const instrument =
     venue === "bybit" && typeof body.instrument === "string" && !body.instrument.endsWith("-USDT")
       ? `${body.instrument}-USDT`
       : body.instrument;
-  const response = await executionRegistry.placeOrder(venue, {
-    instrument,
-    amount: body.amount,
-    side: body.side,
-    type: body.type,
-    price: body.price,
-    spotPrice: body.spotPrice
-  });
+  let executionVenue = venue;
+  let executionInstrument = instrument;
+  const estimatePremiumEnabled = riskControls.estimate_premium_on_missing === true;
+  let quotedPremiumPerUnit: Decimal | null = null;
+  let quotedPremiumTotal: Decimal | null = null;
+  if (quoteLock?.premiumPerUnitUsdc) {
+    quotedPremiumPerUnit = quoteLock.premiumPerUnitUsdc;
+  }
+  if (quoteLock?.premiumTotalUsdc) {
+    quotedPremiumTotal = quoteLock.premiumTotalUsdc;
+  }
+  if (!quotedPremiumPerUnit && body.premiumUsdc && body.amount) {
+    const premiumRaw = new Decimal(body.premiumUsdc);
+    const amountRaw = new Decimal(body.amount);
+    if (premiumRaw.isFinite() && premiumRaw.gt(0) && amountRaw.gt(0)) {
+      quotedPremiumPerUnit = premiumRaw.div(amountRaw);
+      quotedPremiumTotal = premiumRaw;
+    }
+  }
+  let slippageEval: {
+    status: "ok" | "soft" | "hard" | "skip";
+    reason: string;
+    quotedPerUnit: string | null;
+    currentPerUnit: string | null;
+    slippageUsdc: string | null;
+    slippagePct: string | null;
+  } | null = null;
+  let slippageCurrentPerUnit: Decimal | null = null;
+  if (
+    (slippageTrackingEnabled || slippageGuardEnabled) &&
+    inferredHedgeType === "option" &&
+    quotedPremiumPerUnit
+  ) {
+    let spotPriceForMark: Decimal | null = null;
+    const spotRaw = Number(body.spotPrice ?? 0);
+    if (Number.isFinite(spotRaw) && spotRaw > 0) {
+      spotPriceForMark = new Decimal(spotRaw);
+    } else if (venue !== "bybit") {
+      spotPriceForMark = await fetchSpotPrice(parseInstrumentAsset(instrument) || "BTC");
+    }
+    const currentMark = await fetchCoverageOptionMarkUsdc(
+      venue,
+      instrument,
+      spotPriceForMark || new Decimal(0)
+    );
+    if (!currentMark || !currentMark.isFinite() || currentMark.lte(0)) {
+      slippageEval = {
+        status: "skip",
+        reason: "market_unavailable",
+        quotedPerUnit: quotedPremiumPerUnit.toFixed(6),
+        currentPerUnit: null,
+        slippageUsdc: null,
+        slippagePct: null
+      };
+    } else {
+      const slippageUsdc = currentMark.sub(quotedPremiumPerUnit);
+      const slippagePct = quotedPremiumPerUnit.gt(0)
+        ? slippageUsdc.div(quotedPremiumPerUnit)
+        : new Decimal(0);
+      slippageCurrentPerUnit = currentMark;
+      const slippagePositive = slippageUsdc.gt(0);
+      const softBreached =
+        slippagePositive &&
+        ((slippageSoftPct.gt(0) && slippagePct.gt(slippageSoftPct)) ||
+          (slippageSoftUsdc.gt(0) && slippageUsdc.gt(slippageSoftUsdc)));
+      const hardBreached =
+        slippagePositive &&
+        ((slippageHardPct.gt(0) && slippagePct.gt(slippageHardPct)) ||
+          (slippageHardUsdc.gt(0) && slippageUsdc.gt(slippageHardUsdc)));
+      slippageEval = {
+        status: hardBreached ? "hard" : softBreached ? "soft" : "ok",
+        reason: hardBreached ? "hard_threshold" : softBreached ? "soft_threshold" : "ok",
+        quotedPerUnit: quotedPremiumPerUnit.toFixed(6),
+        currentPerUnit: currentMark.toFixed(6),
+        slippageUsdc: slippageUsdc.toFixed(6),
+        slippagePct: slippagePct.mul(100).toFixed(4)
+      };
+      if (slippageGuardEnabled && hardBreached && slippageRejectHard) {
+        if (slippageTrackingEnabled) {
+          await audit("slippage_guard", {
+            status: "rejected",
+            reason: slippageEval.reason,
+            quoteId: body.quoteId ?? null,
+            coverageId: body.coverageId || null,
+            instrument,
+            quotedPerUnit: slippageEval.quotedPerUnit,
+            currentPerUnit: slippageEval.currentPerUnit,
+            slippageUsdc: slippageEval.slippageUsdc,
+            slippagePct: slippageEval.slippagePct
+          });
+        }
+        return { status: "rejected", reason: "slippage_guard", slippage: slippageEval };
+      }
+    }
+    if (slippageTrackingEnabled && slippageEval) {
+      await audit("slippage_guard", {
+        status: slippageEval.status,
+        reason: slippageEval.reason,
+        quoteId: body.quoteId ?? null,
+        coverageId: body.coverageId || null,
+        instrument,
+        quotedPerUnit: slippageEval.quotedPerUnit,
+        currentPerUnit: slippageEval.currentPerUnit,
+        slippageUsdc: slippageEval.slippageUsdc,
+        slippagePct: slippageEval.slippagePct
+      });
+    }
+  }
+  let response: any;
+  try {
+    response = await executionRegistry.placeOrder(executionVenue, {
+      instrument: executionInstrument,
+      amount: body.amount,
+      side: body.side,
+      type: body.type,
+      price: body.price,
+      spotPrice: body.spotPrice
+    });
+  } catch (error: any) {
+    const primaryError = error?.message ?? "unknown_error";
+    const canFallbackToDeribit =
+      executionVenue === "bybit" &&
+      venueConfig.deribit_enabled === true &&
+      typeof executionInstrument === "string" &&
+      executionInstrument.length > 0;
+    if (canFallbackToDeribit) {
+      const deribitInstrument = executionInstrument.replace(/-USDT$/, "");
+      try {
+        response = await executionRegistry.placeOrder("deribit", {
+          instrument: deribitInstrument,
+          amount: body.amount,
+          side: body.side,
+          type: body.type,
+          price: body.price,
+          spotPrice: body.spotPrice
+        });
+        executionVenue = "deribit";
+        executionInstrument = deribitInstrument;
+        (response as any).diagnostic = {
+          category: "execution_fallback",
+          requestedVenue: venue,
+          executedVenue: executionVenue,
+          requestedInstrument: body.instrument,
+          executedInstrument: executionInstrument,
+          primaryError
+        };
+        await audit("hedge_order_fallback", {
+          coverageId: body.coverageId || null,
+          quoteId: body.quoteId ?? null,
+          tierName: body.tierName ?? null,
+          accountId: body.accountId ?? null,
+          requestedVenue: venue,
+          executedVenue: executionVenue,
+          requestedInstrument: body.instrument,
+          executedInstrument: executionInstrument,
+          reason: "bybit_unavailable",
+          primaryError
+        });
+      } catch (fallbackError: any) {
+        const failure = {
+          status: "execution_error",
+          reason: "venue_unavailable",
+          message: "Order execution failed before liquidity validation.",
+          retryable: true,
+          diagnostic: {
+            category: "execution_error",
+            requestedVenue: venue,
+            attemptedVenue: executionVenue,
+            fallbackVenue: "deribit",
+            requestedInstrument: body.instrument,
+            attemptedInstrument: instrument,
+            amount: body.amount,
+            side: body.side,
+            type: body.type ?? "market",
+            detail: primaryError,
+            fallbackDetail: fallbackError?.message ?? "unknown_fallback_error"
+          }
+        };
+        await audit("hedge_order_failed", {
+          coverageId: body.coverageId || null,
+          quoteId: body.quoteId ?? null,
+          tierName: body.tierName ?? null,
+          accountId: body.accountId ?? null,
+          ...failure.diagnostic
+        });
+        return failure;
+      }
+    } else {
+      const canFallbackToDeribitPaper =
+        executionVenue === "deribit" &&
+        inferredHedgeType === "option" &&
+        typeof executionInstrument === "string" &&
+        executionInstrument.length > 0;
+      if (canFallbackToDeribitPaper) {
+        const paperFallback = await simulateDeribitPaperOrderbookFallback({
+          instrument: executionInstrument,
+          amount: Number(body.amount ?? 0),
+          side: body.side,
+          coverageId: body.coverageId,
+          quoteId: body.quoteId,
+          tierName: body.tierName,
+          accountId: body.accountId,
+          requestedVenue: venue,
+          requestedInstrument: String(body.instrument || executionInstrument),
+          primaryError
+        });
+        if (paperFallback) {
+          response = paperFallback;
+        }
+      }
+      if (!response) {
+        const failure = {
+          status: "execution_error",
+          reason: "venue_unavailable",
+          message: "Order execution failed before liquidity validation.",
+          retryable: true,
+          diagnostic: {
+            category: "execution_error",
+            venue,
+            instrument: body.instrument,
+            amount: body.amount,
+            side: body.side,
+            type: body.type ?? "market",
+            detail: primaryError
+          }
+        };
+        await audit("hedge_order_failed", {
+          coverageId: body.coverageId || null,
+          quoteId: body.quoteId ?? null,
+          tierName: body.tierName ?? null,
+          accountId: body.accountId ?? null,
+          ...failure.diagnostic
+        });
+        return failure;
+      }
+    }
+  }
+  const responseExecutionVenue =
+    typeof (response as any).executionVenue === "string" &&
+    String((response as any).executionVenue).length > 0
+      ? String((response as any).executionVenue)
+      : executionVenue;
+  const responseExecutedInstrument =
+    typeof (response as any).executedInstrument === "string" &&
+    String((response as any).executedInstrument).length > 0
+      ? String((response as any).executedInstrument)
+      : executionInstrument;
+  (response as any).executionVenue = responseExecutionVenue;
+  (response as any).requestedVenue = venue;
+  (response as any).requestedInstrument = body.instrument;
+  (response as any).executedInstrument = responseExecutedInstrument;
   const status = String((response as any)?.status || "");
+  const orderReason = String((response as any)?.reason || "");
+  const liquidityRejected =
+    status === "paper_rejected" &&
+    (orderReason === "no_top_of_book" || orderReason === "insufficient_liquidity");
+  if (liquidityRejected) {
+    (response as any).diagnostic = {
+      ...((response as any).diagnostic || {}),
+      category: "liquidity_rejected",
+      venue: responseExecutionVenue,
+      instrument: responseExecutedInstrument,
+      requestedAmount: body.amount,
+      availableSize: (response as any)?.availableSize ?? null,
+      bestBid: (response as any)?.bestBid ?? null,
+      bestAsk: (response as any)?.bestAsk ?? null,
+      bookTimestamp: (response as any)?.bookTimestamp ?? null
+    };
+    (response as any).retryable = true;
+  }
   const filledAmount = Number((response as any)?.filledAmount ?? body.amount);
   const fillPrice =
     (response as any)?.result?.average_price ??
@@ -2181,15 +3483,44 @@ app.post("/deribit/order", async (req) => {
     (response as any)?.fillPrice ??
     null;
   const spotPrice = body.spotPrice ?? null;
-  const isBybitExec = venue === "bybit";
-  const executedPremiumUsdc =
-    inferredHedgeType === "option" && fillPrice
-      ? isBybitExec
-        ? Number(new Decimal(fillPrice).mul(filledAmount))
-        : spotPrice
-          ? Number(new Decimal(fillPrice).mul(new Decimal(spotPrice)).mul(filledAmount))
-          : null
+  const isBybitExec = responseExecutionVenue === "bybit";
+  const premiumUsdcFromOrder =
+    inferredHedgeType === "option"
+      ? resolveOptionPremiumUsdc({
+          fillPrice,
+          filledAmount,
+          spotPrice,
+          isBybitExecution: isBybitExec
+        })
       : null;
+  let estimatedPremiumUsdc: number | null = null;
+  if (premiumUsdcFromOrder === null && inferredHedgeType === "option" && estimatePremiumEnabled) {
+    if (slippageCurrentPerUnit && Number.isFinite(filledAmount)) {
+      estimatedPremiumUsdc = slippageCurrentPerUnit.mul(new Decimal(filledAmount)).toNumber();
+    } else if (quotedPremiumPerUnit && Number.isFinite(filledAmount)) {
+      estimatedPremiumUsdc = quotedPremiumPerUnit.mul(new Decimal(filledAmount)).toNumber();
+    } else if (body.premiumUsdc && Number.isFinite(body.premiumUsdc)) {
+      estimatedPremiumUsdc = Number(body.premiumUsdc);
+    }
+  }
+  const baseSubsidyUsdc = 0;
+  let slippageUsdc: number | null = null;
+  let slippagePct: number | null = null;
+  let slippageSubsidyUsdc = 0;
+  const executedPremiumResolved =
+    premiumUsdcFromOrder !== null ? premiumUsdcFromOrder : estimatedPremiumUsdc;
+  if (
+    executedPremiumResolved !== null &&
+    quotedPremiumTotal &&
+    quotedPremiumTotal.gt(0)
+  ) {
+    const executed = new Decimal(executedPremiumResolved);
+    const slippageDelta = executed.sub(quotedPremiumTotal);
+    slippageUsdc = slippageDelta.toNumber();
+    slippagePct = slippageDelta.div(quotedPremiumTotal).mul(100).toNumber();
+    slippageSubsidyUsdc = 0;
+  }
+  const effectiveSubsidyUsdc = baseSubsidyUsdc + slippageSubsidyUsdc;
   const fillPriceUsdc =
     inferredHedgeType === "option"
       ? fillPrice
@@ -2210,18 +3541,89 @@ app.post("/deribit/order", async (req) => {
     inferredHedgeType === "perp" && hedgeNotionalUsdc && body.leverage
       ? hedgeNotionalUsdc / Number(body.leverage)
       : 0;
+  const optionMeta = parseOptionInstrument(responseExecutedInstrument);
+  const resolvedOptionType =
+    (body as any).optionType ?? optionMeta.optionType ?? null;
+  const resolvedStrike = optionMeta.strike ?? null;
   const executed = status === "paper_filled" || status === "filled" || status === "ok";
   if (executed && fillPriceUsdc) {
     const sizeDelta = new Decimal(filledAmount).mul(body.side === "buy" ? 1 : -1);
     updateHedgeLedger({
-      instrument: body.instrument,
+      instrument: responseExecutedInstrument,
       sizeDelta,
       fillPriceUsdc
     });
     await saveHedgeLedger();
   }
+  const premiumForAudit = premiumUsdcFromOrder ?? estimatedPremiumUsdc ?? body.premiumUsdc ?? null;
+  if (body.coverageId) {
+    const legSize = Number.isFinite(filledAmount) ? filledAmount : body.amount;
+    const existing = coverageLedger.get(body.coverageId);
+    const quoteFeeRaw = Number(body.feeUsdc ?? 0);
+    const quoteFeeUsdc = Number.isFinite(quoteFeeRaw) && quoteFeeRaw > 0 ? quoteFeeRaw : 0;
+    const existingCollectedRaw = Number(existing?.collectedFeeUsdc ?? 0);
+    const existingCollectedUsdc = Number.isFinite(existingCollectedRaw) ? existingCollectedRaw : 0;
+    const collectedFeeUsdc = body.feeRecognized ? existingCollectedUsdc : existingCollectedUsdc + quoteFeeUsdc;
+    const existingHedgeSpendRaw = Number(existing?.hedgeSpendUsdc ?? 0);
+    const hedgeSpendUsdc =
+      premiumForAudit !== null && premiumForAudit !== undefined
+        ? Number(premiumForAudit)
+        : Number.isFinite(existingHedgeSpendRaw)
+          ? existingHedgeSpendRaw
+          : 0;
+    const quotedFeeUsdc =
+      quoteFeeUsdc > 0
+        ? quoteFeeUsdc
+        : Number.isFinite(Number(existing?.quotedFeeUsdc ?? 0))
+          ? Number(existing?.quotedFeeUsdc ?? 0)
+          : null;
+    const pricingReason =
+      body.pricingReason ?? body.reason ?? existing?.pricingReason ?? null;
+    const grossMarginUsdc =
+      Number.isFinite(collectedFeeUsdc) && Number.isFinite(hedgeSpendUsdc)
+        ? collectedFeeUsdc - hedgeSpendUsdc
+        : null;
+    const coverageLegs =
+      inferredHedgeType === "option"
+        ? mergeCoverageLegs(existing?.coverageLegs, {
+            instrument: responseExecutedInstrument,
+            size: legSize,
+            venue: responseExecutionVenue,
+            optionType: resolvedOptionType,
+            strike: resolvedStrike
+          })
+        : existing?.coverageLegs;
+    upsertCoverageLedger({
+      coverageId: body.coverageId,
+      hedgeInstrument: responseExecutedInstrument,
+      hedgeSize: legSize,
+      hedgeType: inferredHedgeType === "option" ? "option" : "perp",
+      optionType: resolvedOptionType,
+      strike: resolvedStrike,
+      selectedVenue: responseExecutionVenue,
+      markSource:
+        responseExecutionVenue === "bybit" || responseExecutionVenue === "deribit"
+          ? responseExecutionVenue
+          : null,
+      notionalUsdc: body.notionalUsdc ?? null,
+      quotedFeeUsdc,
+      collectedFeeUsdc,
+      hedgeSpendUsdc,
+      grossMarginUsdc,
+      pricingReason,
+      coverageLegs
+    });
+    await saveCoverageLedger();
+  }
+  const cashflowUsdc =
+    premiumForAudit !== null && premiumForAudit !== undefined
+      ? String(body.side).toLowerCase() === "sell"
+        ? -Number(premiumForAudit)
+        : Number(premiumForAudit)
+      : null;
   await audit("hedge_order", {
-    instrument: body.instrument,
+    instrument: responseExecutedInstrument,
+    requestedInstrument: body.instrument,
     side: body.side,
     amount: filledAmount,
     type: body.type ?? "market",
@@ -2231,51 +3633,71 @@ app.post("/deribit/order", async (req) => {
     hedgeType: inferredHedgeType,
     status: status || "submitted",
     fillPrice,
-    premiumUsdc: executedPremiumUsdc ?? body.premiumUsdc ?? null,
+    premiumUsdc: premiumUsdcFromOrder ?? body.premiumUsdc ?? null,
+    estimatedPremiumUsdc,
+    cashflowUsdc,
     feeUsdc: body.feeUsdc ?? null,
-    subsidyUsdc: body.subsidyUsdc ?? null,
+    quotedFeeUsdc: body.feeUsdc ?? null,
+    collectedFeeUsdc: body.feeRecognized ? 0 : body.feeUsdc ?? null,
+    hedgeSpendUsdc: premiumForAudit ?? null,
+    grossMarginUsdc:
+      Number.isFinite(Number(body.feeUsdc ?? NaN)) && Number.isFinite(Number(premiumForAudit ?? NaN))
+        ? Number(body.feeUsdc) - Number(premiumForAudit)
+        : null,
+    subsidyUsdc: effectiveSubsidyUsdc || null,
+    slippageUsdc,
+    slippagePct,
+    quotedPremiumUsdc: quotedPremiumTotal ? quotedPremiumTotal.toNumber() : null,
     reason: body.reason ?? null,
+    pricingReason: body.pricingReason ?? body.reason ?? null,
     accountId: body.accountId ?? null,
     floorPrice: body.floorPrice ?? null,
     hedgeNotionalUsdc,
     hedgeMarginUsdc,
+    venue: responseExecutionVenue,
+    requestedVenue: venue,
     bestBid: (response as any)?.bestBid ?? null,
     bestAsk: (response as any)?.bestAsk ?? null,
-    availableSize: (response as any)?.availableSize ?? null
+    availableSize: (response as any)?.availableSize ?? null,
+    diagnostic: (response as any)?.diagnostic ?? null
   });
   if (executed && body.tierName && body.feeUsdc !== undefined) {
     const premiumForAccounting =
       inferredHedgeType === "option"
-        ? Number(executedPremiumUsdc ?? body.premiumUsdc ?? 0)
+        ? Number(premiumUsdcFromOrder ?? estimatedPremiumUsdc ?? body.premiumUsdc ?? 0)
         : 0;
     const feeForAccounting = body.feeRecognized ? 0 : Number(body.feeUsdc);
+    const hedgeCategory = isNetCoverageId(body.coverageId ?? null, (body as any).coverageIds ?? null)
+      ? "net"
+      : "coverage";
     const accounting = applyRiskAccounting(
       body.tierName,
       feeForAccounting,
       premiumForAccounting,
       Number(body.notionalUsdc ?? 0),
-      hedgeMarginUsdc
+      hedgeMarginUsdc,
+      hedgeCategory
     );
     await audit("liquidity_update", {
       coverageId: body.coverageId || null,
       tier: body.tierName,
       feeUsdc: feeForAccounting,
       premiumUsdc: premiumForAccounting,
-      subsidyUsdc: body.subsidyUsdc ?? 0,
+      subsidyUsdc: 0,
       notionalUsdc: body.notionalUsdc ?? 0,
       hedgeNotionalUsdc,
       hedgeMarginUsdc,
       delta: accounting.liquidityDelta,
       totals: liquiditySummary()
     });
-    if (body.subsidyUsdc && body.subsidyUsdc > 0) {
-      recordSubsidy(body.tierName, body.accountId || null, Number(body.subsidyUsdc));
-    }
   }
   return response;
 });
 
 app.get("/deribit/positions", async () => {
+  if (!ALLOW_DERIBIT_PRIVATE_MTM) {
+    return { status: "disabled", reason: "private_mtm_disabled", positions: [] };
+  }
   return deribit.getPositions("BTC");
 });
 
@@ -2372,21 +3794,18 @@ app.post("/pricing/ctc", async (req) => {
     }
   }
 
-  let feeUsdc = ctcSafety.feeUsdc;
-  let feeReason = "ctc_safety";
-  if (!feeUsdc || feeUsdc.lte(0)) {
-    const fallbackFee = await calculateFeeBase({
-      tierName,
-      baseFeeUsdc: new Decimal(50),
-      targetDays,
-      leverage: leverageCheck.value,
-      asset,
-      ivCandidate: ctcSafety.hedgeIv ?? 0.6,
-      optionType
-    });
-    feeUsdc = fallbackFee.feeUsdc;
-    feeReason = "regime_fallback";
-  }
+  const baseFeeUsdc = applyMinFee(tierName, new Decimal(body.fixedPriceUsdc ?? 0));
+  const markupPct = resolvePremiumMarkupPct(tierName, leverageCheck.value);
+  const size = positionSize;
+  const premiumUsdcDecimal =
+    bestInstrument && Number.isFinite(bestInstrument.markPrice || 0)
+      ? new Decimal(bestInstrument.markPrice || 0).mul(spotPrice).mul(size)
+      : null;
+  const passThroughFee = premiumUsdcDecimal
+    ? premiumUsdcDecimal.mul(new Decimal(1).add(markupPct))
+    : null;
+  const feeUsdc = passThroughFee ? Decimal.max(baseFeeUsdc, passThroughFee) : baseFeeUsdc;
+  const feeReason = passThroughFee && passThroughFee.gt(baseFeeUsdc) ? "premium_markup" : "base_fee";
 
   console.log("CTC Quote Debug:", {
     optionType,
@@ -2398,19 +3817,20 @@ app.post("/pricing/ctc", async (req) => {
     bestInstrument: bestInstrument?.instrument || null
   });
 
-  const size = Number(body.positionSize || 1);
-  const premiumUsdc =
-    bestInstrument && Number.isFinite(bestInstrument.markPrice || 0)
-      ? new Decimal(bestInstrument.markPrice || 0)
-          .mul(spotPrice)
-          .mul(new Decimal(size))
-          .toFixed(2)
+  const premiumUsdc = premiumUsdcDecimal ? premiumUsdcDecimal.toFixed(2) : null;
+  const premiumMarkupUsdc =
+    passThroughFee && premiumUsdcDecimal
+      ? passThroughFee.minus(premiumUsdcDecimal).toFixed(2)
       : null;
+  const hedgeSize = size.toNumber();
   const expiryTag = bestInstrument?.instrument?.split("-")?.[1] || null;
 
   return {
     status: "ok",
     feeUsdc: feeUsdc ? feeUsdc.toFixed(2) : "0.00",
+    baseFeeUsdc: baseFeeUsdc.toFixed(2),
+    premiumMarkupPct: markupPct.mul(100).toFixed(2),
+    premiumMarkupUsdc,
     reason: feeReason,
     ivBase: ctcSafety.baseIv,
     ivHedge: ctcSafety.hedgeIv,
@@ -2422,7 +3842,7 @@ app.post("/pricing/ctc", async (req) => {
     hedge: bestInstrument
       ? {
           instrument: bestInstrument.instrument,
-          size,
+          size: hedgeSize,
           premiumUsdc,
           expiryTag,
           daysToExpiry: bestInstrument.tenorDays,
@@ -2447,6 +3867,15 @@ app.post("/pricing/ctc", async (req) => {
 });
 
 app.get("/risk/mtm", async () => {
+  if (!ALLOW_DERIBIT_PRIVATE_MTM) {
+    return {
+      status: "disabled",
+      reason: "private_mtm_disabled",
+      positionPnlUsdc: "0.0000",
+      hedgeMtmUsdc: "0.0000",
+      positions: []
+    };
+  }
   const positions = await deribit.getPositions("BTC");
   const positionPnl = positions.reduce((acc, pos) => {
     const pnl = pos.floating_profit_loss ?? pos.unrealized_pnl ?? 0;
@@ -2489,18 +3918,58 @@ type PutQuoteRequest = {
   accountId?: string;
   allowPremiumPassThrough?: boolean;
   allowPartialCoverage?: boolean;
+  _cacheBust?: boolean;
+  _fastPreview?: boolean;
+  _debugPassThrough?: boolean;
 };
 
 function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Record<string, unknown>> {
   const existing = quoteInflight.get(cacheKey);
   if (existing) return existing;
   const promise = (async () => {
-    const res = await app.inject({
-      method: "POST",
-      url: "/put/quote",
-      payload: body
-    });
-    return res.json() as Record<string, unknown>;
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/put/quote",
+        payload: body
+      });
+      let parsed: Record<string, unknown> | null = null;
+      try {
+        parsed = res.json() as Record<string, unknown>;
+      } catch {
+        parsed = null;
+      }
+      const statusCode = Number(res.statusCode || 0);
+      const response =
+        parsed && typeof parsed === "object"
+          ? { ...parsed }
+          : ({
+              status: statusCode >= 500 ? "error" : "no_quote",
+              reason: `quote_http_${statusCode || "unknown"}`
+            } as Record<string, unknown>);
+      if (statusCode >= 500) {
+        response["status"] = "error";
+        response["reason"] = String(response["reason"] || `quote_http_${statusCode}`);
+        response["message"] = String(
+          response["message"] || "Quote engine temporarily unavailable. Please retry."
+        );
+        response["retryable"] = true;
+      }
+      const shortLivedErrorTtlMs = 5000;
+      const isErrorResponse = String(response["status"] || "") === "error";
+      setQuoteCache(cacheKey, response, isErrorResponse ? shortLivedErrorTtlMs : undefined);
+      return response;
+    } catch (error: any) {
+      const fallback = {
+        status: "error",
+        reason: "quote_compute_failed",
+        message: "Quote engine temporarily unavailable. Please retry.",
+        retryable: true,
+        detail: error?.message ?? "unknown_error"
+      } as Record<string, unknown>;
+      setQuoteCache(cacheKey, fallback, 5000);
+      return fallback;
+    }
   })();
   quoteInflight.set(cacheKey, promise);
   promise.finally(() => quoteInflight.delete(cacheKey));
@@ -2509,27 +3978,38 @@ function startQuoteCompute(body: PutQuoteRequest, cacheKey: string): Promise<Rec
 
 app.post("/put/preview", async (req) => {
   const body = req.body as PutQuoteRequest;
+  body._fastPreview = true;
+  body._cacheBust = true;
   const cacheKey = buildQuoteCacheKey(body);
   const cached = getQuoteCache(cacheKey);
-  if (cached && isQuoteCacheFresh(cached)) {
+  if (!body._cacheBust && cached && isQuoteCacheFresh(cached)) {
     return { ...cached.response, cached: true, stale: false };
   }
-  if (cached && isQuoteCacheStale(cached)) {
-    startQuoteCompute(body, cacheKey);
-    return { ...cached.response, cached: true, stale: true };
+  const response = await startQuoteCompute(body, cacheKey);
+  const status = String((response as any)?.status ?? "unknown");
+  if (status === "no_quote" || status === "error" || status === "perp_fallback") {
+    const fullPayload: PutQuoteRequest = {
+      ...body,
+      _fastPreview: false,
+      _cacheBust: true
+    };
+    const fullCacheKey = buildQuoteCacheKey(fullPayload);
+    const fullResponse = await startQuoteCompute(fullPayload, fullCacheKey);
+    return {
+      ...fullResponse,
+      previewFallback: true,
+      cached: Boolean(cached),
+      stale: false
+    };
   }
-  if (cached && isQuoteCacheUsable(cached)) {
-    startQuoteCompute(body, cacheKey);
-    return { ...cached.response, cached: true, stale: true };
-  }
-  startQuoteCompute(body, cacheKey);
-  return { status: "pending", cached: false, stale: false };
+  return { ...response, cached: Boolean(cached), stale: false };
 });
 
 app.post("/put/quote", async (req) => {
   const body = req.body as PutQuoteRequest;
   const requestStart = Date.now();
   const requestTimestamp = new Date().toISOString();
+  Object.assign(riskControls, await loadRiskControls(RISK_CONTROLS_PATH));
   if (body.fixedPriceUsdc === undefined || body.fixedPriceUsdc === null) {
     body.fixedPriceUsdc = 0;
   }
@@ -2545,19 +4025,45 @@ app.post("/put/quote", async (req) => {
     responseAny.quoteIssuedAt = new Date(issuedAt).toISOString();
     responseAny.quoteExpiresAt = new Date(expiresAt).toISOString();
     const feeRaw = Number(responseAny.feeUsdc ?? 0);
+    const premiumTotalRaw = Number(
+      responseAny.premiumUsdc ?? responseAny.rollEstimatedPremiumUsdc ?? 0
+    );
+    const premiumPerUnitRaw = Number(responseAny.premiumPerUnitUsdc ?? 0);
+    const hedgeSizeRaw = Number(responseAny.hedgeSize ?? 0);
+    const premiumPerUnit =
+      Number.isFinite(premiumPerUnitRaw) && premiumPerUnitRaw > 0
+        ? new Decimal(premiumPerUnitRaw)
+        : Number.isFinite(premiumTotalRaw) &&
+            premiumTotalRaw > 0 &&
+            Number.isFinite(hedgeSizeRaw) &&
+            hedgeSizeRaw > 0
+          ? new Decimal(premiumTotalRaw).div(new Decimal(hedgeSizeRaw))
+          : undefined;
+    const instruments = extractQuoteInstruments(responseAny);
     if (Number.isFinite(feeRaw) && feeRaw > 0) {
       quoteLocks.set(quoteId, {
         feeUsdc: new Decimal(feeRaw),
+        premiumTotalUsdc:
+          Number.isFinite(premiumTotalRaw) && premiumTotalRaw > 0
+            ? new Decimal(premiumTotalRaw)
+            : undefined,
+        premiumPerUnitUsdc: premiumPerUnit,
+        hedgeSize:
+          Number.isFinite(hedgeSizeRaw) && hedgeSizeRaw > 0
+            ? new Decimal(hedgeSizeRaw)
+            : undefined,
         issuedAt,
         expiresAt,
-        tierName: String(body.tierName || "Unknown")
+        tierName: String(body.tierName || "Unknown"),
+        optionType: body.side === "short" ? "call" : "put",
+        instruments
       });
     }
     return responseAny as Record<string, unknown>;
   };
   if (cached && isQuoteCacheFresh(cached)) {
-    // Temporarily bypass cache for Bronze call testing or explicit cache busting
-    if (body._cacheBust || (body.tierName === "Pro (Bronze)" && body.side === "short")) {
+    // Bypass cache only for explicit cache busting.
+    if (body._cacheBust) {
       await audit("debug_cache_bypass", {
         tierName: body.tierName,
         side: body.side,
@@ -2567,6 +4073,7 @@ app.post("/put/quote", async (req) => {
       recordCacheHit(Date.now() - requestStart);
       return attachQuoteLock({
         ...cached.response,
+        policyVersion: PRICING_POLICY_VERSION,
         cached: true,
         responseTimeMs: Date.now() - requestStart,
         cachedAt: new Date(cached.ts).toISOString(),
@@ -2581,6 +4088,78 @@ app.post("/put/quote", async (req) => {
     cached: cached ? "yes" : "no",
     cacheBust: body._cacheBust ?? null
   });
+  const rejected = {
+    missingBook: 0,
+    spreadTooWide: 0,
+    sizeTooSmall: 0,
+    noBidAsk: 0,
+    slippageTooHigh: 0,
+    insufficientCoverage: 0
+  };
+  const quoteDiagnostics: any = {
+    version: 1,
+    stage: "init",
+    venueMode: venueConfig.mode,
+    venueFlags: {
+      bybitEnabled: venueConfig.bybit_enabled,
+      deribitEnabled: venueConfig.deribit_enabled,
+      dualVenueEnabled: venueConfig.dual_venue_enabled
+    },
+    request: {
+      tierName: body.tierName ?? null,
+      asset: body.asset ?? null,
+      side: body.side ?? null,
+      targetDays: body.targetDays ?? null,
+      expiryTag: body.expiryTag ?? null,
+      leverage: body.leverage ?? null,
+      optionType: null,
+      protectedNotionalUsdc: null,
+      tierMinNotionalUsdc: null,
+      fastPreview: body._fastPreview === true
+    },
+    instrumentUniverse: {
+      total: null,
+      optionTypeCount: null,
+      expiryCount: null
+    },
+    expiryCandidates: {
+      total: 0,
+      preferred: 0,
+      fallback: 0,
+      scanned: 0,
+      withStrikeCandidates: 0
+    },
+    strikeCandidates: {
+      generated: 0,
+      scanned: 0,
+      evaluated: 0,
+      truncated: 0,
+      budgetSkipped: 0
+    },
+    venueFetch: {
+      attempts: 0,
+      successes: 0,
+      emptyBooks: 0,
+      errors: 0
+    },
+    venueErrorSamples: [] as Array<{
+      expiryTag: string;
+      instrument: string;
+      message: string;
+    }>,
+    searchConfig: {
+      budgetMs: null,
+      strikeScanLimit: null,
+      strikeConcurrency: null
+    },
+    selectedCandidate: null,
+    failureStage: null
+  };
+  const pushVenueErrorSample = (sample: { expiryTag: string; instrument: string; message: string }) => {
+    if (!Array.isArray(quoteDiagnostics.venueErrorSamples)) return;
+    if (quoteDiagnostics.venueErrorSamples.length >= 8) return;
+    quoteDiagnostics.venueErrorSamples.push(sample);
+  };
   const attachVenueMetadata = (response: Record<string, unknown>) => {
     if ((response as any).optionVenue || (response as any).venueComparison) return response;
     const snapshot = (response as any).selectionSnapshot as { books?: Array<any> } | null;
@@ -2625,6 +4204,7 @@ app.post("/put/quote", async (req) => {
   const cacheAndReturn = async (response: Record<string, unknown>) => {
     const withVenue = attachVenueMetadata(response);
     const responseAny = withVenue as any;
+    const responseStatus = String(responseAny.status ?? "unknown");
     let strikeDetails = responseAny.strikeDetails ?? null;
     const strikeValue = Number(responseAny.strike ?? null);
     const targetStrikeValue = Number(responseAny.targetStrike ?? null);
@@ -2648,11 +4228,25 @@ app.post("/put/quote", async (req) => {
       expiryTag: responseAny.expiryTag ?? null,
       targetDays: responseAny.targetDays ?? null
     };
+    const diagnosticsPayload = {
+      ...quoteDiagnostics,
+      stage:
+        quoteDiagnostics.failureStage ??
+        (responseStatus === "no_quote" ? "no_quote" : quoteDiagnostics.stage),
+      rejected: { ...rejected },
+      venueErrorSamples: Array.isArray(quoteDiagnostics.venueErrorSamples)
+        ? [...quoteDiagnostics.venueErrorSamples]
+        : [],
+      responseStatus,
+      responseReason: responseAny.reason ?? null
+    };
     const withTiming = {
       ...withVenue,
       strikeDetails,
       venueSelection,
       expirySelection,
+      policyVersion: PRICING_POLICY_VERSION,
+      quoteDiagnostics: diagnosticsPayload,
       cached: false,
       responseTimeMs: Date.now() - requestStart,
       optimizationMode: responseAny.optimizationMode ?? null,
@@ -2677,31 +4271,57 @@ app.post("/put/quote", async (req) => {
         queryTimeMs: venueComparison.queryTimeMs ?? null
       });
     }
+    if ((withTiming as any).tenorSelection) {
+      await audit("tenor_selection", {
+        requestedDays: (withTiming as any).tenorSelection.requestedDays ?? null,
+        selectedDays: (withTiming as any).tenorSelection.selectedDays ?? null,
+        toleranceDays: (withTiming as any).tenorSelection.toleranceDays ?? null,
+        mode: (withTiming as any).tenorSelection.mode ?? null,
+        reason: (withTiming as any).tenorReason ?? null,
+        tierName: body.tierName ?? null
+      });
+    }
+    if (responseStatus === "no_quote" || responseStatus === "error") {
+      await audit("put_quote_diagnostics", diagnosticsPayload);
+    }
     setQuoteCache(cacheKey, withLock);
     recordCacheMiss(Date.now() - requestStart);
     return withLock;
   };
 
   const asset = (body.asset || "BTC").toUpperCase();
+  quoteDiagnostics.stage = "asset_validation";
+  quoteDiagnostics.request.asset = asset;
   if (asset !== "BTC") {
+    quoteDiagnostics.failureStage = "unsupported_asset";
     return cacheAndReturn({
       status: "no_quote",
       reason: "unsupported_asset"
     });
   }
-  const instruments = await deribit.listInstruments(asset);
-  const results = (instruments as any)?.result || [];
-  if (!results.length) {
-    return cacheAndReturn({
-      status: "no_quote",
-      reason: "unsupported_asset"
-    });
+  quoteDiagnostics.stage = "loading_instrument_universe";
+  let results: Array<any> = [];
+  try {
+    const instruments = await deribit.listInstruments(asset);
+    results = (instruments as any)?.result || [];
+  } catch (error: any) {
+    if (venueConfig.mode !== "bybit_only") {
+      quoteDiagnostics.failureStage = "instrument_universe_unavailable";
+      return cacheAndReturn({
+        status: "error",
+        reason: "instrument_universe_unavailable",
+        message: `Failed to load ${asset} instrument universe.`,
+        retryable: true,
+        detail: error?.message ?? "unknown_error"
+      });
+    }
+    results = [];
   }
-  if (!results.length) {
+  quoteDiagnostics.instrumentUniverse.total = results.length;
+  if (!results.length && venueConfig.mode !== "bybit_only") {
+    quoteDiagnostics.failureStage = "instrument_universe_empty";
     return cacheAndReturn({
       status: "no_quote",
-      expiryTag: "",
-      targetDays: 0,
       reason: "unsupported_asset"
     });
   }
@@ -2722,6 +4342,7 @@ app.post("/put/quote", async (req) => {
   const contractSize = new Decimal(body.contractSize ?? 1);
   const leverageCheck = normalizeLeverage(body.leverage);
   if (!leverageCheck.ok) {
+    quoteDiagnostics.failureStage = "invalid_leverage";
     return cacheAndReturn({
       status: "no_quote",
       reason: "invalid_leverage",
@@ -2733,44 +4354,63 @@ app.post("/put/quote", async (req) => {
     ? hedgeSizeFromDelta(new Decimal(positionSize), new Decimal(body.optionDelta))
     : hedgeSizeFromNotional(positionSize, contractSize);
   const requiredSize = Decimal.max(minSize, hedgeSize);
+  let hedgeSizeForQuote = requiredSize;
 
   const optionType = body.side === "short" ? "call" : "put";
+  quoteDiagnostics.request.optionType = optionType;
+  const optionTypeToken = optionType === "put" ? "put" : "call";
+  const optionTypeInstruments = results.filter(
+    (inst: any) => String(inst?.option_type || "").toLowerCase() === optionTypeToken
+  );
+  quoteDiagnostics.instrumentUniverse.optionTypeCount = optionTypeInstruments.length;
+  quoteDiagnostics.instrumentUniverse.expiryCount = new Set(
+    optionTypeInstruments
+      .map((inst: any) => deriveExpiryTag(String(inst?.instrument_name || "")))
+      .filter((tag: string) => Boolean(tag))
+  ).size;
   const spotPrice = new Decimal(body.spotPrice);
   const drawdownFloorPct = new Decimal(body.drawdownFloorPct);
+  const protectedNotionalUsdc = positionSize.abs().mul(spotPrice.abs());
+  quoteDiagnostics.request.protectedNotionalUsdc = protectedNotionalUsdc.toFixed(2);
   const targetStrike =
     optionType === "put"
       ? spotPrice.mul(new Decimal(1).minus(drawdownFloorPct))
       : spotPrice.mul(new Decimal(1).plus(drawdownFloorPct));
   const tierName = body.tierName || "Unknown";
-  if (tierName === "Pro (Bronze)" && optionType === "call") {
-    await audit("bronze_call_not_supported", {
+  quoteDiagnostics.request.tierName = tierName;
+  const tierMinNotionalUsdc = resolveTierMinNotionalUsdc(tierName);
+  if (tierMinNotionalUsdc) {
+    quoteDiagnostics.request.tierMinNotionalUsdc = tierMinNotionalUsdc.toFixed(2);
+  }
+  if (tierMinNotionalUsdc && isBelowTierMinNotional(protectedNotionalUsdc, tierMinNotionalUsdc)) {
+    quoteDiagnostics.failureStage = "tier_notional_min";
+    await audit("tier_notional_min_rejected", {
       tierName,
-      side: body.side,
-      optionType,
-      requestedLeverage: leverage
+      side: body.side ?? null,
+      protectedNotionalUsdc: protectedNotionalUsdc.toFixed(2),
+      minNotionalUsdc: tierMinNotionalUsdc.toFixed(2),
+      requestedTargetDays: body.targetDays ?? null
     });
     return cacheAndReturn({
-      status: "error",
-      error: "option_type_not_supported",
-      message:
-        "Bronze tier supports put protection (long positions) only. Call protection (short positions) not available.",
-      details: {
-        tierName,
-        requestedOptionType: optionType,
-        supportedTypes: ["put"],
-        reason: "Bronze tier optimized for long position protection due to cost dynamics"
-      },
+      status: "no_quote",
+      reason: "tier_notional_min",
+      message: `${tierName} requires at least $${tierMinNotionalUsdc.toFixed(
+        2
+      )} protected notional.`,
+      tierName,
+      protectedNotionalUsdc: protectedNotionalUsdc.toFixed(2),
+      minNotionalUsdc: tierMinNotionalUsdc.toFixed(2),
       suggestions: [
-        "Bronze tier: Use put protection for long positions (up to 10× leverage)",
-        "Short position protection not available at Bronze tier",
-        "Reduce position size or use unprotected shorts if comfortable with risk"
+        "Increase protected notional for this tier",
+        "Use a lower tier for smaller notionals"
       ]
     });
   }
   const tierLeverageLimits = riskControls.max_leverage_by_tier?.[tierName];
-  if (tierLeverageLimits && optionType === "put") {
+  if (tierLeverageLimits) {
     const maxLeverageForOption = tierLeverageLimits[optionType];
     if (Number.isFinite(maxLeverageForOption) && leverage > maxLeverageForOption) {
+      quoteDiagnostics.failureStage = "leverage_exceeded";
       await audit("leverage_validation_failed", {
         tierName,
         side: body.side,
@@ -2807,6 +4447,13 @@ app.post("/put/quote", async (req) => {
     maxFallbackDays,
     Math.max(1, Math.round(body.targetDays ?? expiryTargetDays ?? defaultTargetDays))
   );
+  const requestedTargetDays = targetDays;
+  const tenorToleranceDays = Math.max(
+    0,
+    Math.round(riskControls.tenor_preference_tolerance_days ?? 2)
+  );
+  quoteDiagnostics.stage = "building_expiry_candidates";
+  const fastPreview = body._fastPreview === true;
   const expirySearchOrder = body.expiryTag
     ? [{ expiryTag: body.expiryTag, targetDays: expiryTargetDays ?? targetDays }]
     : venueConfig.mode === "bybit_only"
@@ -2822,6 +4469,29 @@ app.post("/put/quote", async (req) => {
           maxPreferredDays,
           maxFallbackDays
         );
+  const preferredExpiryOrder = body.expiryTag
+    ? expirySearchOrder
+    : expirySearchOrder.filter(
+        (entry) => Math.abs((entry.targetDays ?? targetDays) - targetDays) <= tenorToleranceDays
+      );
+  const fallbackExpiryOrder = body.expiryTag
+    ? []
+    : expirySearchOrder.filter(
+        (entry) => Math.abs((entry.targetDays ?? targetDays) - targetDays) > tenorToleranceDays
+      );
+  quoteDiagnostics.expiryCandidates.total = expirySearchOrder.length;
+  quoteDiagnostics.expiryCandidates.preferred = preferredExpiryOrder.length;
+  quoteDiagnostics.expiryCandidates.fallback = fallbackExpiryOrder.length;
+  if (expirySearchOrder.length === 0) {
+    quoteDiagnostics.failureStage = "expiry_search_order_empty";
+  }
+  quoteDiagnostics.stage = "evaluating_expiry_candidates";
+  const orderedExpirySearchOrder = [...preferredExpiryOrder, ...fallbackExpiryOrder];
+  const fallbackStartIndex = preferredExpiryOrder.length;
+  const hasFallbackPool = fallbackExpiryOrder.length > 0;
+  const effectiveExpiryOrder = fastPreview
+    ? orderedExpirySearchOrder.slice(0, 1)
+    : orderedExpirySearchOrder;
   let chosenExecutionPlans:
     | Array<{ venue: string; instrument: string; side: "buy" | "sell"; size: Decimal; price: Decimal }>
     | null = null;
@@ -2829,6 +4499,7 @@ app.post("/put/quote", async (req) => {
   let bestCandidate: {
     expiryTag: string;
     targetDays: number;
+    instrumentName: string;
     premiumPerUnit: Decimal;
     premiumTotal: Decimal;
     availableSize: Decimal;
@@ -2837,44 +4508,78 @@ app.post("/put/quote", async (req) => {
     spreadPct: Decimal;
     rollMultiplier: number;
     allInPremium: Decimal;
+    hedgeSize: Decimal;
   } | null = null;
+  let bestPlanLegs:
+    | Array<{
+        instrument: string;
+        size: number;
+        venue?: string | null;
+        optionType?: "put" | "call" | null;
+        strike?: number | null;
+      }>
+    | null = null;
   let bestSnapshots: QuoteBookSnapshot[] | null = null;
-  const rejected = {
-    missingBook: 0,
-    spreadTooWide: 0,
-    sizeTooSmall: 0,
-    noBidAsk: 0,
-    slippageTooHigh: 0
-  };
 
   const liquidityOverrideEnabled = riskControls.liquidity_override_enabled ?? false;
   let liquidityOverrideUsed = false;
+  const searchBudgetMs = Math.max(250, Number(riskControls.option_search_budget_ms ?? 1200));
+  const searchStartedAt = Date.now();
+  const strikeScanLimit = Math.max(
+    1,
+    Math.min(40, Number.isFinite(QUOTE_STRIKE_SCAN_LIMIT) ? QUOTE_STRIKE_SCAN_LIMIT : 12)
+  );
+  const strikeConcurrency = Math.max(
+    1,
+    Math.min(12, Number.isFinite(QUOTE_STRIKE_CONCURRENCY) ? QUOTE_STRIKE_CONCURRENCY : 4)
+  );
+  quoteDiagnostics.searchConfig.budgetMs = searchBudgetMs;
+  quoteDiagnostics.searchConfig.strikeScanLimit = strikeScanLimit;
+  quoteDiagnostics.searchConfig.strikeConcurrency = strikeConcurrency;
 
-  for (const overridePass of [false, true]) {
+  const overridePasses = fastPreview ? [false] : [false, true];
+  let fastPreviewHit = false;
+  let tenorMode: "preferred" | "fallback" = "preferred";
+  let tenorFallbackUsed = false;
+  quoteDiagnostics.stage = "search_loop";
+  for (const overridePass of overridePasses) {
     if (overridePass && !liquidityOverrideEnabled) break;
     bestCandidate = null;
     bestSnapshots = null;
     chosenExecutionPlans = null;
     chosenSnapshots = null;
+    tenorMode = "preferred";
 
-    for (const entry of expirySearchOrder) {
+    for (let expiryIdx = 0; expiryIdx < effectiveExpiryOrder.length; expiryIdx += 1) {
+      if (
+        !fastPreview &&
+        hasFallbackPool &&
+        fallbackStartIndex > 0 &&
+        expiryIdx >= fallbackStartIndex &&
+        bestCandidate
+      ) {
+        tenorMode = "preferred";
+        break;
+      }
+      if (Date.now() - searchStartedAt > searchBudgetMs) {
+        quoteDiagnostics.failureStage = "search_budget_exhausted";
+        break;
+      }
+      const entry = effectiveExpiryOrder[expiryIdx];
       const expiryTag = entry.expiryTag;
       const days = entry.targetDays;
       if (!expiryTag) continue;
-
-      const plansByStrike = new Map<
-        string,
-        Array<{ venue: string; instrument: string; side: "buy" | "sell"; size: Decimal; price: Decimal }>
-      >();
+      quoteDiagnostics.expiryCandidates.scanned += 1;
       const snapshotsByStrike = new Map<string, QuoteBookSnapshot[]>();
-      const strikeCandidates =
+      const strikeLimit = fastPreview ? 6 : 40;
+      let strikeCandidates =
         venueConfig.mode === "bybit_only"
           ? await selectBybitStrikeCandidates(
               asset,
               expiryTag,
               optionType,
               targetStrike,
-              40
+              strikeLimit
             )
           : selectStrikeCandidates(
               results,
@@ -2882,8 +4587,26 @@ app.post("/put/quote", async (req) => {
               optionType,
               spotPrice,
               drawdownFloorPct,
-              40
+              strikeLimit
             );
+      if (
+        venueConfig.mode === "bybit_only" &&
+        strikeCandidates.length === 0 &&
+        venueConfig.deribit_enabled
+      ) {
+        strikeCandidates = selectStrikeCandidates(
+          results,
+          expiryTag,
+          optionType,
+          spotPrice,
+          drawdownFloorPct,
+          strikeLimit
+        );
+      }
+      quoteDiagnostics.strikeCandidates.generated += strikeCandidates.length;
+      if (strikeCandidates.length > 0) {
+        quoteDiagnostics.expiryCandidates.withStrikeCandidates += 1;
+      }
       const { maxSpreadPct, maxSlippagePct } = resolveLiquidityThresholds(
         days,
         overridePass,
@@ -2892,73 +4615,164 @@ app.post("/put/quote", async (req) => {
         useBodySpread,
         useBodySlippage
       );
+      const limitedCandidates = strikeCandidates.slice(0, strikeScanLimit);
+      quoteDiagnostics.strikeCandidates.scanned += limitedCandidates.length;
+      if (strikeCandidates.length > limitedCandidates.length) {
+        quoteDiagnostics.strikeCandidates.truncated += strikeCandidates.length - limitedCandidates.length;
+      }
+      const evaluations = await mapWithConcurrency(
+        limitedCandidates,
+        strikeConcurrency,
+        async (inst) => {
+          try {
+            quoteDiagnostics.strikeCandidates.evaluated += 1;
+            if (Date.now() - searchStartedAt > searchBudgetMs) {
+              quoteDiagnostics.strikeCandidates.budgetSkipped += 1;
+              return { kind: "budget" as const };
+            }
+            let quotes: Awaited<ReturnType<typeof getOptionVenueQuotes>> = [];
+            try {
+              quoteDiagnostics.venueFetch.attempts += 1;
+              quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+            } catch (error: any) {
+              quoteDiagnostics.venueFetch.errors += 1;
+              pushVenueErrorSample({
+                expiryTag,
+                instrument: inst.instrument_name,
+                message: String(error?.message ?? "venue_quote_error")
+              });
+              return { kind: "rejected" as const, reason: "missingBook" as const };
+            }
+            if (!quotes.length) {
+              quoteDiagnostics.venueFetch.emptyBooks += 1;
+              return { kind: "rejected" as const, reason: "missingBook" as const };
+            }
+            quoteDiagnostics.venueFetch.successes += 1;
+            const snapshots = quotes.map((quote) => ({
+              venue: quote.venue,
+              instrument: quote.instrument,
+              bidUsd: serializeDecimal(quote.book.bid, 6),
+              askUsd: serializeDecimal(quote.book.ask, 6),
+              bidSize: serializeDecimal(quote.book.bidSize, 6) ?? "0",
+              askSize: serializeDecimal(quote.book.askSize, 6) ?? "0",
+              spreadPct: serializeDecimal(quote.book.spreadPct, 6) ?? "0",
+              timestampMs: quote.book.timestampMs ?? null,
+              markPriceUsd: serializeDecimal(quote.book.markPriceUsd, 6)
+            }));
+            const strike = new Decimal(inst.strike);
+            const targetSize = resolveCoverageTargetSize({
+              spotPrice,
+              drawdownFloorPct,
+              optionType,
+              strike,
+              requiredSize,
+              minSize
+            });
+            if (!targetSize) {
+              return { kind: "rejected" as const, reason: "insufficientCoverage" as const };
+            }
+            const agg = aggregateOptionQuotes(quotes, "buy", targetSize);
+            if (!agg.bestBid || !agg.bestAsk) {
+              return { kind: "rejected" as const, reason: "noBidAsk" as const };
+            }
+            if (agg.spread.gt(maxSpreadPct)) {
+              return { kind: "rejected" as const, reason: "spreadTooWide" as const };
+            }
+            if (!agg.avgPrice || agg.filledSize.lte(0) || agg.filledSize.lt(targetSize)) {
+              return { kind: "rejected" as const, reason: "sizeTooSmall" as const };
+            }
+            const slippagePct = agg.avgPrice.minus(agg.bestAsk).div(agg.bestAsk);
+            if (slippagePct.gt(maxSlippagePct)) {
+              return { kind: "rejected" as const, reason: "slippageTooHigh" as const };
+            }
+            const premiumPerUnit = agg.avgPrice;
+            const premiumTotal = premiumPerUnit.mul(targetSize);
+            const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
+            const allInPremium = premiumTotal.mul(new Decimal(rollMultiplier));
+            return {
+              kind: "candidate" as const,
+              strikeKey: strike.toFixed(0),
+              snapshots,
+              plans: agg.plans,
+              candidate: {
+                expiryTag,
+                targetDays: days,
+                instrumentName: inst.instrument_name,
+                premiumPerUnit,
+                premiumTotal,
+                availableSize: agg.totalAskSize,
+                strike,
+                iv: Number.isFinite(body.ivSnapshot ?? NaN) ? Number(body.ivSnapshot) : 0,
+                spreadPct: agg.spread,
+                rollMultiplier,
+                allInPremium,
+                hedgeSize: targetSize
+              }
+            };
+          } catch (error: any) {
+            quoteDiagnostics.venueFetch.errors += 1;
+            pushVenueErrorSample({
+              expiryTag,
+              instrument: inst.instrument_name,
+              message: String(error?.message ?? "quote_eval_error")
+            });
+            return { kind: "rejected" as const, reason: "missingBook" as const };
+          }
+        }
+      );
 
-      for (const inst of strikeCandidates) {
-        const quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
-        if (!quotes.length) {
-          rejected.missingBook += 1;
+      for (const result of evaluations) {
+        if (result.kind === "budget") continue;
+        if (result.kind === "rejected") {
+          switch (result.reason) {
+            case "noBidAsk":
+              rejected.noBidAsk += 1;
+              break;
+            case "spreadTooWide":
+              rejected.spreadTooWide += 1;
+              break;
+            case "sizeTooSmall":
+              rejected.sizeTooSmall += 1;
+              break;
+            case "slippageTooHigh":
+              rejected.slippageTooHigh += 1;
+              break;
+            case "insufficientCoverage":
+              rejected.insufficientCoverage += 1;
+              break;
+            default:
+              rejected.missingBook += 1;
+              break;
+          }
           continue;
         }
-        const snapshots = quotes.map((quote) => ({
-          venue: quote.venue,
-          instrument: quote.instrument,
-          bidUsd: serializeDecimal(quote.book.bid, 6),
-          askUsd: serializeDecimal(quote.book.ask, 6),
-          bidSize: serializeDecimal(quote.book.bidSize, 6) ?? "0",
-          askSize: serializeDecimal(quote.book.askSize, 6) ?? "0",
-          spreadPct: serializeDecimal(quote.book.spreadPct, 6) ?? "0",
-          timestampMs: quote.book.timestampMs ?? null,
-          markPriceUsd: serializeDecimal(quote.book.markPriceUsd, 6)
-        }));
-        snapshotsByStrike.set(new Decimal(inst.strike).toFixed(0), snapshots);
-        const agg = aggregateOptionQuotes(quotes, "buy", requiredSize);
-        if (!agg.bestBid || !agg.bestAsk) {
-          rejected.noBidAsk += 1;
-          continue;
-        }
-        if (agg.spread.gt(maxSpreadPct)) {
-          rejected.spreadTooWide += 1;
-          continue;
-        }
-        if (!agg.avgPrice || agg.filledSize.lte(0)) {
-          rejected.sizeTooSmall += 1;
-          continue;
-        }
-        const slippagePct = agg.avgPrice.minus(agg.bestAsk).div(agg.bestAsk);
-        if (slippagePct.gt(maxSlippagePct)) {
-          rejected.slippageTooHigh += 1;
-          continue;
-        }
-
-        const ticker = await deribit.getTicker(inst.instrument_name);
-        const iv = Number((ticker as any)?.result?.mark_iv ?? 0);
-        const premiumPerUnit = agg.avgPrice;
-        const premiumTotal = premiumPerUnit.mul(requiredSize);
-        const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
-        const allInPremium = premiumTotal.mul(new Decimal(rollMultiplier));
-        if (!bestCandidate || allInPremium.lt(bestCandidate.allInPremium)) {
-          bestCandidate = {
-            expiryTag,
-            targetDays: days,
-            premiumPerUnit,
-            premiumTotal,
-            availableSize: agg.totalAskSize,
-            strike: new Decimal(inst.strike),
-            iv,
-            spreadPct: agg.spread,
-            rollMultiplier,
-            allInPremium
+        snapshotsByStrike.set(result.strikeKey, result.snapshots);
+        if (!bestCandidate || result.candidate.allInPremium.lt(bestCandidate.allInPremium)) {
+          bestCandidate = result.candidate;
+          quoteDiagnostics.selectedCandidate = {
+            expiryTag: result.candidate.expiryTag,
+            targetDays: result.candidate.targetDays,
+            strike: result.candidate.strike.toFixed(0),
+            instrument: result.candidate.instrumentName,
+            rollMultiplier: result.candidate.rollMultiplier
           };
-          bestSnapshots = snapshots;
-          chosenExecutionPlans = agg.plans;
+          tenorMode =
+            hasFallbackPool && expiryIdx >= fallbackStartIndex
+              ? "fallback"
+              : "preferred";
+          bestSnapshots = result.snapshots;
+          chosenExecutionPlans = result.plans;
           chosenSnapshots = snapshotsByStrike;
         }
-        plansByStrike.set(new Decimal(inst.strike).toFixed(0), agg.plans);
       }
+      if (fastPreviewHit) break;
     }
+    if (fastPreviewHit) break;
 
     if (bestCandidate) {
+      quoteDiagnostics.stage = "candidate_selected";
       liquidityOverrideUsed = overridePass;
+      tenorFallbackUsed = tenorMode === "fallback";
       const targetStrikeNumber = targetStrike.toNumber();
       const selectedStrikeNumber = bestCandidate.strike.toNumber();
       const strikeDelta = selectedStrikeNumber - targetStrikeNumber;
@@ -2977,6 +4791,9 @@ app.post("/put/quote", async (req) => {
   }
 
   const quote = bestCandidate;
+  if (quote?.hedgeSize) {
+    hedgeSizeForQuote = quote.hedgeSize;
+  }
   const survivalTolerance = new Decimal(
     riskControls.survival_tolerance_pct ?? 0.98
   );
@@ -2990,6 +4807,9 @@ app.post("/put/quote", async (req) => {
 
   if (!quote) {
     if (!bestCandidate || !bestCandidate.premiumPerUnit.gt(0)) {
+      if (!quoteDiagnostics.failureStage) {
+        quoteDiagnostics.failureStage = "no_candidate_after_search";
+      }
       await audit("put_quote_failed", {
         reason: "no_quote",
         expiryTag: body.expiryTag || "",
@@ -3021,7 +4841,6 @@ app.post("/put/quote", async (req) => {
       optionType
     });
     let feeUsdc = feeBase.feeUsdc;
-    const baseFeeUsdc = feeUsdc;
     const feeRegime = feeBase.feeRegime;
     const feeLeverage = feeBase.feeLeverage;
     const feeIv = feeBase.feeIv;
@@ -3034,27 +4853,17 @@ app.post("/put/quote", async (req) => {
       optionType
     });
     let feeReason = "flat_fee";
-    if (ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
+    if (tierName !== "Pro (Bronze)" && ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
       feeUsdc = ctcSafety.feeUsdc;
       feeReason = "ctc_safety";
     }
+    const baseFeeUsdc = feeUsdc;
     const premiumTotal = bestCandidate.premiumTotal;
     const allInPremium = bestCandidate.allInPremium;
     const markupPct = resolvePremiumMarkupPct(tierName, leverage);
     const passThroughFee = allInPremium.mul(new Decimal(1).add(markupPct));
     const premiumFloor = premiumFloorBreached(allInPremium, baseFeeUsdc);
-    const isPremiumTier =
-      tierName === "Pro (Silver)" ||
-      tierName === "Pro (Gold)" ||
-      tierName === "Pro (Platinum)";
     const allowPartialCoverage = tierName === "Pro (Bronze)" && body.allowPartialCoverage === true;
-    let subsidyNeeded = allInPremium.minus(feeUsdc);
-    let subsidyCheck = canApplySubsidy(
-      tierName,
-      body.accountId || null,
-      subsidyNeeded.toNumber(),
-      feeIv.scaled
-    );
     const passThroughEnabled = riskControls.enable_premium_pass_through !== false;
     const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
     const userOptedIn = body.allowPremiumPassThrough !== false;
@@ -3082,7 +4891,7 @@ app.post("/put/quote", async (req) => {
       drawdownFloorPct,
       optionType,
       strike: bestCandidate.strike,
-      hedgeSize: requiredSize,
+      hedgeSize: hedgeSizeForQuote,
       requiredSize,
       tolerancePct: survivalTolerance
     });
@@ -3094,13 +4903,9 @@ app.post("/put/quote", async (req) => {
           books: bestSnapshots
         }
       : null;
-    const canFullyCover = bestCandidate.availableSize.greaterThanOrEqualTo(requiredSize);
+    const canFullyCover = bestCandidate.availableSize.greaterThanOrEqualTo(hedgeSizeForQuote);
 
-    if (premiumFloor.breached) {
-      const minNotificationRatio = new Decimal(
-        riskControls.pass_through_min_notification_ratio ?? 1.5
-      );
-      const shouldNotify = premiumFloor.ratio.gte(minNotificationRatio);
+    if (premiumFloor.breached && !canPassThrough) {
       const optionSymbol = optionType === "put" ? "P" : "C";
       const optionInstrument = buildVenueInstrumentName(
         asset,
@@ -3108,463 +4913,22 @@ app.post("/put/quote", async (req) => {
         bestCandidate.strike.toFixed(0),
         optionSymbol
       );
-      const ratio = premiumFloor.ratio.toFixed(4);
-      const threshold = premiumFloor.threshold.toFixed(4);
-
-      if (canPassThrough && !passThroughCapped) {
-        const venueInfo = attachVenueMetadata({
-          selectionSnapshot: fallbackSnapshot,
-          hedgeSize: requiredSize.toFixed(4)
-        } as Record<string, unknown>);
-        await audit("premium_pass_through", {
-          type: "uncapped",
-          baseFee: baseFeeUsdc.toFixed(2),
-          allInPremium: allInPremium.toFixed(2),
-          markupPct: markupPct.mul(100).toFixed(2),
-          ratio,
-          threshold,
-          tierName,
-          leverage,
-          optionType,
-          instrument: optionInstrument,
-          optionVenue: (venueInfo as any).optionVenue ?? null,
-          venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
-        });
-        return cacheAndReturn({
-          status: "pass_through",
-          expiryTag: bestCandidate.expiryTag,
-          targetDays: bestCandidate.targetDays,
-          optionType,
-          strike: bestCandidate.strike.toFixed(0),
-          instrument: optionInstrument,
-          spotPrice: spotPrice.toNumber(),
-          drawdownFloorPct: drawdownFloorPct.toNumber(),
-          targetStrike: targetStrike.toNumber(),
-          premiumUsdc: premiumTotal.toFixed(2),
-          premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          subsidyUsdc: "0.00",
-          baseFeeUsdc: baseFeeUsdc.toFixed(2),
-          feeUsdc: passThroughFee.toFixed(2),
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
-          passThroughCapped: false,
-          reason: "premium_floor_pass_through",
-          liquidityOverride: liquidityOverrideUsed,
-          replication: fallbackReplication,
-          survivalCheck,
-          selectionSnapshot: fallbackSnapshot,
-          rollMultiplier: bestCandidate.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-          hedge: {
-            instrument: optionInstrument,
-            size: requiredSize.toFixed(4),
-            premiumUsdc: allInPremium.toFixed(2),
-            expiryTag: bestCandidate.expiryTag,
-            daysToExpiry: bestCandidate.targetDays,
-            strike: bestCandidate.strike.toFixed(0)
-          },
-          pricing: {
-            type: "pass_through",
-            baseFee: baseFeeUsdc.toFixed(2),
-            hedgePremium: allInPremium.toFixed(2),
-            totalFee: allInPremium.toFixed(2),
-            ratio,
-            threshold,
-            explanation:
-              `Market volatility requires premium ${premiumFloor.ratio.toFixed(2)}× base fee. ` +
-              `Charging actual hedge cost of $${allInPremium.toFixed(2)} for full protection.`
-          },
-          warning: shouldNotify
-            ? {
-                type: "premium_pass_through",
-                ratio,
-                threshold,
-                message:
-                  `Premium is ${premiumFloor.ratio.toFixed(2)}× the base fee due to market conditions. ` +
-                  `You'll be charged the actual hedge cost of $${allInPremium.toFixed(2)}.`
-              }
-            : undefined
-        });
-      }
-
-      if (canPassThrough && passThroughCapped && passThroughCapInfo.maxFee) {
-        const cappedFee = passThroughCapInfo.maxFee;
-        const subsidyNeededCapped = allInPremium.minus(cappedFee);
-        if (!isPremiumTier) {
-          const rejectReason = "premium_floor_pass_through_capped";
-          await audit("premium_floor_rejected", {
-            baseFee: baseFeeUsdc.toFixed(2),
-            allInPremium: allInPremium.toFixed(2),
-            ratio,
-            threshold,
-            reason: rejectReason,
-            canPassThrough,
-            capped: true,
-            capMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(4)
-              : null,
-            tierName,
-            leverage,
-            optionType,
-            instrument: optionInstrument
-          });
-          await audit("debug_feasibility_search_start", {
-            tierName,
-            optionType,
-            leverage,
-            targetDays,
-            premium: allInPremium.toFixed(2),
-            cap: cappedFee.toFixed(2)
-          });
-          // Bronze tier: calls (short positions) not supported
-          // Only puts (long positions) available at Bronze tier
-          const feasibility = null;
-          await audit("debug_feasibility_search_result", {
-            found: feasibility?.found ?? false,
-            suggestionType: feasibility?.suggestion?.type,
-            newLeverage: feasibility?.suggestion?.newLeverage,
-            newDuration: feasibility?.suggestion?.newDuration,
-            estimatedPremium: feasibility?.suggestion?.estimatedPremium?.toFixed(2)
-          });
-          const leverageSuggestion = Math.max(1, Math.floor(leverage / 2));
-          const suggestedCap = resolvePassThroughCapMultiplier(leverageSuggestion, tierName);
-          const currentDays = bestCandidate.targetDays;
-          const currentFloorPct = drawdownFloorPct.toNumber();
-          const enhancedMessage =
-            optionType === "call" && tierName === "Pro (Bronze)"
-              ? `Bronze tier call protection limit reached. Current request: ` +
-                `${leverage}× leverage, ${currentDays} days, ${(currentFloorPct * 100).toFixed(
-                  0
-                )}% floor.`
-              : "Protection cost exceeds Bronze tier limits for this request.";
-          const baseSuggestions = [
-            `Reduce leverage from ${leverage}× to ${leverageSuggestion}× ` +
-              `(cap ${suggestedCap ? `${suggestedCap.toFixed(1)}×` : "N/A"})`,
-            `Reduce protection duration from ${currentDays} days to ${Math.max(
-              1,
-              Math.floor(currentDays / 2)
-            )} days`,
-            `Increase drawdown floor to ${Math.min(0.25, currentFloorPct + 0.05).toFixed(2)}`,
-            "Reduce position size to lower premium"
-          ];
-          const dynamicSuggestions = baseSuggestions;
-          return cacheAndReturn({
-            status: "premium_floor",
-            expiryTag: bestCandidate.expiryTag,
-            targetDays: bestCandidate.targetDays,
-            optionType,
-            strike: bestCandidate.strike.toFixed(0),
-            instrument: optionInstrument,
-            spotPrice: spotPrice.toNumber(),
-            premiumUsdc: premiumTotal.toFixed(2),
-            premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-            hedgeSize: requiredSize.toFixed(4),
-            sizingMethod: body.optionDelta ? "delta" : "notional",
-            bufferTargetPct: "0.00",
-            markIv: feeIv.raw,
-            subsidyUsdc: "0.00",
-            baseFeeUsdc: baseFeeUsdc.toFixed(2),
-            feeUsdc: baseFeeUsdc.toFixed(2),
-            feeRegime: feeRegime.regime,
-            feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-            feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-            passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(4)
-              : null,
-            passThroughCapped: true,
-            reason: rejectReason,
-            liquidityOverride: liquidityOverrideUsed,
-            replication: fallbackReplication,
-            survivalCheck,
-            selectionSnapshot: fallbackSnapshot,
-            rollMultiplier: bestCandidate.rollMultiplier,
-            rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-            message: enhancedMessage,
-            details:
-              optionType === "call" && tierName === "Pro (Bronze)"
-                ? {
-                    requestedPremium: premiumTotal.toFixed(2),
-                    tierCap: cappedFee.toFixed(2),
-                    exceedAmount: premiumTotal.minus(cappedFee).toFixed(2),
-                    currentParams: {
-                      leverage,
-                      duration: currentDays,
-                      drawdownFloor: currentFloorPct
-                    }
-                  }
-                : undefined,
-            // No guaranteed_working_option for Bronze
-            pricing: {
-              baseFee: baseFeeUsdc.toFixed(2),
-              hedgePremium: allInPremium.toFixed(2),
-              ratio,
-              threshold,
-              capMultiplier: passThroughCapInfo.capMultiplier
-                ? passThroughCapInfo.capMultiplier.toFixed(2)
-                : "N/A",
-              explanation:
-                `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
-                `of ${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}×. ` +
-                `Reduce leverage, duration, or widen the floor to lower premium.`
-            },
-            warning: {
-              type: "premium_floor",
-              ratio,
-              threshold,
-              message:
-                "Premium too high for Bronze tier. Reduce leverage, duration, or widen the floor."
-            },
-            suggestions: dynamicSuggestions
-          });
-        }
-        const subsidyCheckCapped = subsidyNeededCapped.gt(0)
-          ? canApplySubsidy(
-              tierName,
-              body.accountId || null,
-              subsidyNeededCapped.toNumber(),
-              feeIv.scaled
-            )
-          : { allowed: true, reason: "ok" };
-        if (subsidyNeededCapped.gt(0) && !subsidyCheckCapped.allowed) {
-          const rejectReason = "premium_floor_pass_through_capped";
-          await audit("premium_floor_rejected", {
-            baseFee: baseFeeUsdc.toFixed(2),
-            allInPremium: allInPremium.toFixed(2),
-            ratio,
-            threshold,
-            reason: rejectReason,
-            canPassThrough,
-            capped: true,
-            capMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(4)
-              : null,
-            tierName,
-            leverage,
-            optionType,
-            instrument: optionInstrument
-          });
-          const leverageSuggestion = Math.max(1, Math.floor(leverage / 2));
-          const suggestedCap = resolvePassThroughCapMultiplier(leverageSuggestion, tierName);
-          return cacheAndReturn({
-            status: "premium_floor",
-            expiryTag: bestCandidate.expiryTag,
-            targetDays: bestCandidate.targetDays,
-            optionType,
-            strike: bestCandidate.strike.toFixed(0),
-            instrument: optionInstrument,
-            spotPrice: spotPrice.toNumber(),
-            premiumUsdc: premiumTotal.toFixed(2),
-            premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-            hedgeSize: requiredSize.toFixed(4),
-            sizingMethod: body.optionDelta ? "delta" : "notional",
-            bufferTargetPct: "0.00",
-            markIv: feeIv.raw,
-            subsidyUsdc: "0.00",
-            baseFeeUsdc: baseFeeUsdc.toFixed(2),
-            feeUsdc: baseFeeUsdc.toFixed(2),
-            feeRegime: feeRegime.regime,
-            feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-            feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-            passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(4)
-              : null,
-            passThroughCapped: true,
-            reason: rejectReason,
-            liquidityOverride: liquidityOverrideUsed,
-            replication: fallbackReplication,
-            survivalCheck,
-            selectionSnapshot: fallbackSnapshot,
-            rollMultiplier: bestCandidate.rollMultiplier,
-            rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-            pricing: {
-              baseFee: baseFeeUsdc.toFixed(2),
-              hedgePremium: allInPremium.toFixed(2),
-              ratio,
-              threshold,
-              capMultiplier: passThroughCapInfo.capMultiplier
-                ? passThroughCapInfo.capMultiplier.toFixed(2)
-                : "N/A",
-              explanation:
-                `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds maximum ` +
-                `${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
-                `Try: lower leverage, shorter duration, wider floor, or smaller size.`
-            },
-            warning: {
-              type: "premium_floor",
-              ratio,
-              threshold,
-              message:
-                `Premium too high for ${tierName} tier at ${leverage}× leverage. ` +
-                `Reduce leverage, duration, or widen the floor.`
-            },
-            suggestions: [
-              `Reduce leverage from ${leverage}× to ${leverageSuggestion}× ` +
-                `(cap ${suggestedCap ? `${suggestedCap.toFixed(1)}×` : "N/A"})`,
-              `Reduce protection duration from ${bestCandidate.targetDays} days to ${Math.max(
-                1,
-                Math.floor(bestCandidate.targetDays / 2)
-              )} days`,
-              "Increase drawdown floor percentage to reduce premium",
-              "Reduce position size to lower premium"
-            ]
-          });
-        }
-
-        const venueInfo = attachVenueMetadata({
-          selectionSnapshot: fallbackSnapshot,
-          hedgeSize: requiredSize.toFixed(4)
-        } as Record<string, unknown>);
-        await audit("premium_pass_through", {
-          type: "capped",
-          baseFee: baseFeeUsdc.toFixed(2),
-          allInPremium: allInPremium.toFixed(2),
-          cappedFee: cappedFee.toFixed(2),
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
-          ratio,
-          tierName,
-          leverage,
-          optionType,
-          instrument: optionInstrument,
-          optionVenue: (venueInfo as any).optionVenue ?? null,
-          venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
-        });
-        return cacheAndReturn({
-          status: "pass_through_capped",
-          expiryTag: bestCandidate.expiryTag,
-          targetDays: bestCandidate.targetDays,
-          optionType,
-          strike: bestCandidate.strike.toFixed(0),
-          instrument: optionInstrument,
-          spotPrice: spotPrice.toNumber(),
-          drawdownFloorPct: drawdownFloorPct.toNumber(),
-          targetStrike: targetStrike.toNumber(),
-          premiumUsdc: premiumTotal.toFixed(2),
-          premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          subsidyUsdc: subsidyNeededCapped.toFixed(2),
-          baseFeeUsdc: baseFeeUsdc.toFixed(2),
-          feeUsdc: cappedFee.toFixed(2),
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
-          passThroughCapped: true,
-          reason: "premium_floor_pass_through_capped",
-          liquidityOverride: liquidityOverrideUsed,
-          replication: fallbackReplication,
-          survivalCheck,
-          selectionSnapshot: fallbackSnapshot,
-          rollMultiplier: bestCandidate.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-          hedge: {
-            instrument: optionInstrument,
-            size: requiredSize.toFixed(4),
-            premiumUsdc: allInPremium.toFixed(2),
-            expiryTag: bestCandidate.expiryTag,
-            daysToExpiry: bestCandidate.targetDays,
-            strike: bestCandidate.strike.toFixed(0)
-          },
-          pricing: {
-            type: "pass_through_capped",
-            baseFee: baseFeeUsdc.toFixed(2),
-            hedgePremium: allInPremium.toFixed(2),
-            cappedFee: cappedFee.toFixed(2),
-            capMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(2)
-              : "N/A",
-            platformSubsidy: subsidyNeededCapped.toFixed(2),
-            totalFee: cappedFee.toFixed(2),
-            ratio,
-            threshold,
-            explanation:
-              `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds ${tierName} tier cap. ` +
-              `Fee capped at $${cappedFee.toFixed(2)} ` +
-              `(${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× base). ` +
-              `Platform subsidizing $${subsidyNeededCapped.toFixed(2)} for full protection.`
-          },
-          warning: shouldNotify
-            ? {
-                type: "premium_capped",
-                ratio,
-                threshold,
-                message:
-                  `Premium exceeds tier cap. Fee capped at $${cappedFee.toFixed(2)}. ` +
-                  `You're still fully protected.`
-              }
-            : undefined
-        });
-      }
-
-      const rejectReason = passThroughCapped
-        ? "premium_floor_pass_through_capped"
-        : "premium_floor_no_pass_through";
       await audit("premium_floor_rejected", {
         baseFee: baseFeeUsdc.toFixed(2),
         allInPremium: allInPremium.toFixed(2),
-        ratio,
-        threshold,
-        reason: rejectReason,
+        ratio: premiumFloor.ratio.toFixed(4),
+        threshold: premiumFloor.threshold.toFixed(4),
+        reason: "premium_floor_no_pass_through",
         canPassThrough,
-        capped: passThroughCapped,
-        capMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
+        capped: false,
+        capMultiplier: null,
         tierName,
         leverage,
         optionType,
         instrument: optionInstrument
       });
-      await audit("debug_feasibility_search_start", {
-        tierName,
-        optionType,
-        leverage,
-        targetDays,
-        premium: allInPremium.toFixed(2),
-        cap: passThroughCapInfo.maxFee ? passThroughCapInfo.maxFee.toFixed(2) : null
-      });
-      // Bronze tier: calls (short positions) not supported
-      // Only puts (long positions) available at Bronze tier
-      const feasibility = null;
-      await audit("debug_feasibility_search_result", {
-        found: feasibility?.found ?? false,
-        suggestionType: feasibility?.suggestion?.type,
-        newLeverage: feasibility?.suggestion?.newLeverage,
-        newDuration: feasibility?.suggestion?.newDuration,
-        estimatedPremium: feasibility?.suggestion?.estimatedPremium?.toFixed(2)
-      });
       const currentDays = bestCandidate.targetDays;
       const currentFloorPct = drawdownFloorPct.toNumber();
-      const baseSuggestions = passThroughCapped
-        ? [
-            `Reduce leverage from ${leverage}× to ${Math.max(1, Math.floor(leverage / 2))}×`,
-            `Reduce protection duration from ${currentDays} days to ${Math.max(
-              1,
-              Math.floor(currentDays / 2)
-            )} days`,
-            "Increase drawdown floor percentage to reduce premium",
-            "Reduce position size to lower premium"
-          ]
-        : [
-            "Reduce leverage or duration to lower premium",
-            "Increase drawdown floor percentage to reduce premium",
-            "Contact support to enable premium pass-through"
-          ];
-      const dynamicSuggestions = baseSuggestions;
       return cacheAndReturn({
         status: "premium_floor",
         expiryTag: bestCandidate.expiryTag,
@@ -3575,7 +4939,7 @@ app.post("/put/quote", async (req) => {
         spotPrice: spotPrice.toNumber(),
         premiumUsdc: premiumTotal.toFixed(2),
         premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-        hedgeSize: requiredSize.toFixed(4),
+        hedgeSize: hedgeSizeForQuote.toFixed(4),
         sizingMethod: body.optionDelta ? "delta" : "notional",
         bufferTargetPct: "0.00",
         markIv: feeIv.raw,
@@ -3585,170 +4949,134 @@ app.post("/put/quote", async (req) => {
         feeRegime: feeRegime.regime,
         feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
         feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
-        passThroughCapped: passThroughCapped,
-        reason: rejectReason,
+        passThroughCapMultiplier: null,
+        passThroughCapped: false,
+        reason: "premium_floor_no_pass_through",
         liquidityOverride: liquidityOverrideUsed,
         replication: fallbackReplication,
         survivalCheck,
         selectionSnapshot: fallbackSnapshot,
         rollMultiplier: bestCandidate.rollMultiplier,
         rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-        // No guaranteed_working_option for Bronze
         pricing: {
           baseFee: baseFeeUsdc.toFixed(2),
           hedgePremium: allInPremium.toFixed(2),
-          ratio,
-          threshold,
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(2)
-            : "N/A",
-          explanation: passThroughCapped
-            ? `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds maximum ` +
-              `${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× cap for ${tierName} at ${leverage}× leverage. ` +
-              `Try: lower leverage, shorter duration, wider floor, or smaller size.`
-            : `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds threshold. ` +
-              `Pass-through not enabled. Contact support if you need higher limits.`
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4),
+          explanation:
+            `Premium ${premiumFloor.ratio.toFixed(2)}\u00d7 base fee exceeds threshold. ` +
+            `Enable pass-through or reduce leverage, duration, floor strictness, or size.`
         },
         warning: {
           type: "premium_floor",
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4),
+          message: `Premium ${premiumFloor.ratio.toFixed(2)}\u00d7 base fee cannot be accommodated.`
+        },
+        suggestions: [
+          `Reduce leverage from ${leverage}\u00d7 to ${Math.max(1, Math.floor(leverage / 2))}\u00d7`,
+          `Reduce protection duration from ${currentDays} days to ${Math.max(1, Math.floor(currentDays / 2))} days`,
+          `Increase drawdown floor to ${Math.min(0.25, currentFloorPct + 0.05).toFixed(2)}`,
+          "Reduce position size to lower premium"
+        ]
+      });
+    }
+
+    if (canPassThrough && passThroughFee.gt(feeUsdc)) {
+      const optionSymbol = optionType === "put" ? "P" : "C";
+      const optionInstrument = buildVenueInstrumentName(
+        asset,
+        bestCandidate.expiryTag,
+        bestCandidate.strike.toFixed(0),
+        optionSymbol
+      );
+      const ratio = premiumFloor.ratio.toFixed(4);
+      const threshold = premiumFloor.threshold.toFixed(4);
+      const minNotificationRatio = new Decimal(
+        riskControls.pass_through_min_notification_ratio ?? 1.5
+      );
+      const shouldNotify = premiumFloor.ratio.gte(minNotificationRatio);
+      const venueInfo = attachVenueMetadata({
+        selectionSnapshot: fallbackSnapshot,
+        hedgeSize: requiredSize.toFixed(4)
+      } as Record<string, unknown>);
+      await audit("premium_pass_through", {
+        type: "uncapped",
+        baseFee: baseFeeUsdc.toFixed(2),
+        allInPremium: allInPremium.toFixed(2),
+        markupPct: markupPct.mul(100).toFixed(2),
+        ratio,
+        threshold,
+        tierName,
+        leverage,
+        optionType,
+        instrument: optionInstrument,
+        optionVenue: (venueInfo as any).optionVenue ?? null,
+        venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
+      });
+      return cacheAndReturn({
+        status: "pass_through",
+        expiryTag: bestCandidate.expiryTag,
+        targetDays: bestCandidate.targetDays,
+        optionType,
+        strike: bestCandidate.strike.toFixed(0),
+        instrument: optionInstrument,
+        spotPrice: spotPrice.toNumber(),
+        drawdownFloorPct: drawdownFloorPct.toNumber(),
+        targetStrike: targetStrike.toNumber(),
+        premiumUsdc: premiumTotal.toFixed(2),
+        premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
+        hedgeSize: requiredSize.toFixed(4),
+        sizingMethod: body.optionDelta ? "delta" : "notional",
+        bufferTargetPct: "0.00",
+        markIv: feeIv.raw,
+        subsidyUsdc: "0.00",
+        baseFeeUsdc: baseFeeUsdc.toFixed(2),
+        feeUsdc: passThroughFee.toFixed(2),
+        feeRegime: feeRegime.regime,
+        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
+        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
+        passThroughCapMultiplier: null,
+        passThroughCapped: false,
+        reason: premiumFloor.breached ? "premium_floor_pass_through" : "pass_through",
+        liquidityOverride: liquidityOverrideUsed,
+        replication: fallbackReplication,
+        survivalCheck,
+        selectionSnapshot: fallbackSnapshot,
+        rollMultiplier: bestCandidate.rollMultiplier,
+        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
+        hedge: {
+          instrument: optionInstrument,
+          size: requiredSize.toFixed(4),
+          premiumUsdc: allInPremium.toFixed(2),
+          expiryTag: bestCandidate.expiryTag,
+          daysToExpiry: bestCandidate.targetDays,
+          strike: bestCandidate.strike.toFixed(0)
+        },
+        pricing: {
+          type: "pass_through",
+          baseFee: baseFeeUsdc.toFixed(2),
+          hedgePremium: allInPremium.toFixed(2),
+          totalFee: passThroughFee.toFixed(2),
+          markupPct: markupPct.mul(100).toFixed(2),
+          markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
           ratio,
           threshold,
-          message: passThroughCapped
-            ? `Premium too high for ${tierName} tier at ${leverage}× leverage. ` +
-              `Reduce leverage, duration, or widen the floor.`
-            : `Premium ${premiumFloor.ratio.toFixed(2)}× base fee cannot be accommodated.`
+          explanation:
+            `Market volatility requires premium ${premiumFloor.ratio.toFixed(2)}\u00d7 base fee. ` +
+            `Charging premium + markup = $${passThroughFee.toFixed(2)} for full protection.`
         },
-        suggestions: dynamicSuggestions
+        warning: premiumFloor.breached && shouldNotify
+          ? {
+              type: "premium_pass_through",
+              ratio,
+              threshold,
+              message:
+                `Premium is ${premiumFloor.ratio.toFixed(2)}\u00d7 the base fee due to market conditions. ` +
+                `You'll be charged premium + markup = $${passThroughFee.toFixed(2)}.`
+            }
+          : undefined
       });
-    }
-
-    if (subsidyNeeded.gt(0) && subsidyCheck.allowed && canFullyCover) {
-      const optionSymbol = optionType === "put" ? "P" : "C";
-      const optionInstrument = buildVenueInstrumentName(
-        asset,
-        bestCandidate.expiryTag,
-        bestCandidate.strike.toFixed(0),
-        optionSymbol
-      );
-      return cacheAndReturn({
-        status: "subsidized",
-        expiryTag: bestCandidate.expiryTag,
-        targetDays: bestCandidate.targetDays,
-        optionType,
-        strike: bestCandidate.strike.toFixed(0),
-        instrument: optionInstrument,
-        premiumUsdc: premiumTotal.toFixed(2),
-        premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-        hedgeSize: requiredSize.toFixed(4),
-        sizingMethod: body.optionDelta ? "delta" : "notional",
-        bufferTargetPct: "0.00",
-        markIv: feeIv.raw,
-        subsidyUsdc: subsidyNeeded.toFixed(2),
-        feeUsdc: feeUsdc.toFixed(2),
-        feeRegime: feeRegime.regime,
-        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
-        passThroughCapped: passThroughCapped,
-        reason: "subsidized",
-        capBreached: false,
-        liquidityOverride: liquidityOverrideUsed,
-        replication: fallbackReplication,
-        survivalCheck,
-        selectionSnapshot: fallbackSnapshot,
-        rollMultiplier: bestCandidate.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-      });
-    }
-
-    if (subsidyNeeded.gt(0) && canFullyCover && canCoverageOverride(tierName)) {
-      const optionSymbol = optionType === "put" ? "P" : "C";
-      const optionInstrument = buildVenueInstrumentName(
-        asset,
-        bestCandidate.expiryTag,
-        bestCandidate.strike.toFixed(0),
-        optionSymbol
-      );
-      return cacheAndReturn({
-        status: "subsidized",
-        expiryTag: bestCandidate.expiryTag,
-        targetDays: bestCandidate.targetDays,
-        optionType,
-        strike: bestCandidate.strike.toFixed(0),
-        instrument: optionInstrument,
-        premiumUsdc: premiumTotal.toFixed(2),
-        premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-        hedgeSize: requiredSize.toFixed(4),
-        sizingMethod: body.optionDelta ? "delta" : "notional",
-        bufferTargetPct: "0.00",
-        markIv: feeIv.raw,
-        subsidyUsdc: subsidyNeeded.toFixed(2),
-        feeUsdc: feeUsdc.toFixed(2),
-        feeRegime: feeRegime.regime,
-        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
-        passThroughCapped: passThroughCapped,
-        reason: "coverage_override",
-        capBreached: true,
-        subsidyCapReason: subsidyCheck.reason,
-        liquidityOverride: liquidityOverrideUsed,
-        replication: fallbackReplication,
-        survivalCheck,
-        selectionSnapshot: fallbackSnapshot,
-        rollMultiplier: bestCandidate.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-      });
-    }
-
-    if (canPassThrough && allInPremium.gt(feeUsdc)) {
-      const passThroughCapInfoLate = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
-      if (!passThroughCapInfoLate.capped) {
-        const optionSymbol = optionType === "put" ? "P" : "C";
-        const optionInstrument = buildVenueInstrumentName(
-          asset,
-          bestCandidate.expiryTag,
-          bestCandidate.strike.toFixed(0),
-          optionSymbol
-        );
-        return cacheAndReturn({
-          status: "pass_through",
-          expiryTag: bestCandidate.expiryTag,
-          targetDays: bestCandidate.targetDays,
-          optionType,
-          strike: bestCandidate.strike.toFixed(0),
-          instrument: optionInstrument,
-          premiumUsdc: premiumTotal.toFixed(2),
-          premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          subsidyUsdc: "0.00",
-          feeUsdc: allInPremium.toFixed(2),
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfoLate.capMultiplier
-            ? passThroughCapInfoLate.capMultiplier.toFixed(4)
-            : null,
-          passThroughCapped: false,
-        reason: "pass_through",
-          liquidityOverride: liquidityOverrideUsed,
-          replication: fallbackReplication,
-          survivalCheck,
-          selectionSnapshot: fallbackSnapshot,
-          rollMultiplier: bestCandidate.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-        });
-      }
     }
 
     const affordableSize = feeUsdc.div(
@@ -3766,7 +5094,7 @@ app.post("/put/quote", async (req) => {
           canPassThrough,
           capped: passThroughCapped,
           capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
+            ? formatCapMultiplier(passThroughCapInfo)
             : null,
           tierName,
           leverage,
@@ -3780,7 +5108,7 @@ app.post("/put/quote", async (req) => {
           strike: bestCandidate.strike.toFixed(0),
           premiumUsdc: bestCandidate.premiumPerUnit.mul(partialSize).toFixed(2),
           premiumPerUnitUsdc: bestCandidate.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
+          hedgeSize: hedgeSizeForQuote.toFixed(4),
           sizingMethod: body.optionDelta ? "delta" : "notional",
           bufferTargetPct: "0.00",
           markIv: feeIv.raw,
@@ -3790,9 +5118,7 @@ app.post("/put/quote", async (req) => {
           feeRegime: feeRegime.regime,
           feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
           feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
+          passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
           passThroughCapped: passThroughCapped,
           reason: "partial_not_allowed",
           liquidityOverride: liquidityOverrideUsed,
@@ -3842,9 +5168,7 @@ app.post("/put/quote", async (req) => {
         feeRegime: feeRegime.regime,
         feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
         feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
+        passThroughCapMultiplier: formatCapMultiplier(passThroughCapInfo),
         passThroughCapped: passThroughCapped,
         reason: "partial",
         liquidityOverride: liquidityOverrideUsed,
@@ -3892,11 +5216,15 @@ app.post("/put/quote", async (req) => {
   const bufferTargetPct = baseBuffer.plus(leverageBuffer).plus(ivBuffer);
   const bufferTargetPctCapped = Decimal.min(bufferTargetPct, new Decimal(0.15));
 
-  const notionalUsdc = positionSize.mul(new Decimal(body.spotPrice)).mul(new Decimal(leverage)).toNumber();
+  const notionalUsdc = protectedNotionalUsdc.toNumber();
   let feeUsdc = feeBase.feeUsdc;
-  const baseFeeUsdc = feeUsdc;
   const feeRegime = feeBase.feeRegime;
   const feeLeverage = feeBase.feeLeverage;
+  const baseFeeUsdc = feeBase.feeUsdc;
+  const allInPremium = quote.allInPremium;
+  const markupPct = resolvePremiumMarkupPct(tierName, leverage);
+  const passThroughFee = allInPremium.mul(new Decimal(1).add(markupPct));
+  const premiumFloor = premiumFloorBreached(allInPremium, baseFeeUsdc);
   const ctcSafety = calculateCtcSafetyFee({
     tierName,
     drawdownPct: drawdownFloorPct,
@@ -3905,28 +5233,61 @@ app.post("/put/quote", async (req) => {
     leverage,
     optionType
   });
-  let feeReason = "flat_fee";
-  if (ctcSafety.feeUsdc && ctcSafety.feeUsdc.gt(feeUsdc)) {
-    feeUsdc = ctcSafety.feeUsdc;
-    feeReason = "ctc_safety";
+  const ctcAssessment = assessCtcShadow({
+    ctcFeeUsdc: ctcSafety.feeUsdc,
+    baseFeeUsdc,
+    hedgePremiumUsdc: allInPremium,
+    protectedNotionalUsdc
+  });
+  const ctcShadow = serializeCtcShadow(ctcAssessment);
+  if (ctcAssessment.rawFeeUsdc) {
+    await audit("ctc_shadow", {
+      tierName,
+      leverage,
+      optionType,
+      ctcShadow
+    });
   }
-  const allInPremium = quote.allInPremium;
-  const markupPct = resolvePremiumMarkupPct(tierName, leverage);
-  const passThroughFee = allInPremium.mul(new Decimal(1).add(markupPct));
-  const premiumFloor = premiumFloorBreached(allInPremium, baseFeeUsdc);
-  const isPremiumTier =
-    tierName === "Pro (Silver)" ||
-    tierName === "Pro (Gold)" ||
-    tierName === "Pro (Platinum)";
-  const allowPartialCoverage = tierName === "Pro (Bronze)" && body.allowPartialCoverage === true;
-  const passThroughEnabled = riskControls.enable_premium_pass_through !== false;
-  const requiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
-  const userOptedIn = body.allowPremiumPassThrough !== false;
-  const canPassThrough = passThroughEnabled && (!requiresUserOptIn || userOptedIn);
-  const passThroughCapInfo = applyPassThroughCap(feeUsdc, allInPremium, leverage, tierName);
+  if (ctcAssessment.reject) {
+    return cacheAndReturn({
+      status: "no_quote",
+      reason: "ctc_shadow_guard",
+      message: "CTC safety model exceeded guardrails for this quote.",
+      ctcShadow,
+      targetDays: quote.targetDays || 0,
+      tenorReason: tenorFallbackUsed ? "tenor_fallback" : null
+    });
+  }
+  // Pilot policy lock: customer fee is always max(floor fee, hedge premium + markup).
+  feeUsdc = Decimal.max(baseFeeUsdc, passThroughFee);
+  let feeReason = passThroughFee.gt(baseFeeUsdc)
+    ? premiumFloor.breached
+      ? "premium_floor_pass_through"
+      : "premium_markup"
+    : "base_fee";
+  const passThroughEnabled = true;
+  const requiresUserOptIn = false;
+  const userOptedIn = true;
+  const canPassThrough = true;
+  const passThroughCapInfo = applyPassThroughCap(
+    baseFeeUsdc,
+    allInPremium,
+    leverage,
+    tierName,
+    feeIv.scaled ?? 0
+  );
   const passThroughCapped = passThroughCapInfo.maxFee
     ? passThroughFee.gt(passThroughCapInfo.maxFee)
     : false;
+  if (
+    ctcAssessment.priceOverrideEnabled &&
+    ctcAssessment.boundedFeeUsdc &&
+    ctcAssessment.boundedFeeUsdc.gt(feeUsdc)
+  ) {
+    feeUsdc = ctcAssessment.boundedFeeUsdc;
+    feeReason = "ctc_safety";
+  }
+  // Premium caps removed by policy: pass-through is uncapped.
   await audit("pass_through_gate", {
     passThroughEnabled,
     requiresUserOptIn,
@@ -3934,475 +5295,10 @@ app.post("/put/quote", async (req) => {
     canPassThrough,
     tierName,
     leverage,
-    premiumRatio: premiumFloor.ratio.toFixed(4)
+    premiumRatio: premiumFloor.ratio.toFixed(4),
+    policy: "pilot_locked_formula"
   });
   const canFullyCoverQuote = quote.availableSize.greaterThanOrEqualTo(requiredSize);
-  if (premiumFloor.breached && canPassThrough && passThroughCapped && passThroughCapInfo.maxFee) {
-    const cappedFee = passThroughCapInfo.maxFee;
-    const optionSymbol = optionType === "put" ? "P" : "C";
-    const optionInstrument = buildVenueInstrumentName(
-      asset,
-      quote.expiryTag || "",
-      quote.strike.toFixed(0),
-      optionSymbol
-    );
-    const subsidyNeededFull = allInPremium.minus(cappedFee);
-    if (isPremiumTier) {
-      const venueInfo = attachVenueMetadata({
-        selectionSnapshot: bestSnapshots
-          ? {
-              expiryTag: quote.expiryTag,
-              targetDays: quote.targetDays,
-              strike: quote.strike.toFixed(0),
-              books: bestSnapshots
-            }
-          : null,
-        hedgeSize: requiredSize.toFixed(4)
-      } as Record<string, unknown>);
-      await audit("premium_pass_through", {
-        type: "capped_with_subsidy",
-        baseFee: feeBase.feeUsdc.toFixed(2),
-        allInPremium: allInPremium.toFixed(2),
-        cappedFee: cappedFee.toFixed(2),
-        platformSubsidy: subsidyNeededFull.toFixed(2),
-        capMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(2)
-          : null,
-        ratio: premiumFloor.ratio.toFixed(4),
-        tierName,
-        leverage,
-        optionType,
-        instrument: optionInstrument,
-        hedgeSize: requiredSize.toFixed(4),
-        fullProtection: true,
-        optionVenue: (venueInfo as any).optionVenue ?? null,
-        venueSavingsUsdc: (venueInfo as any).venueComparison?.savingsUsdc ?? "0.00"
-      });
-      return cacheAndReturn({
-        status: "pass_through_capped",
-        optionType,
-        venue: "deribit",
-        strike: quote.strike.toFixed(0),
-        premiumUsdc: quote.premiumTotal.toFixed(2),
-        premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-        hedgeSize: requiredSize.toFixed(4),
-        sizingMethod: body.optionDelta ? "delta" : "notional",
-        bufferTargetPct: "0.00",
-        markIv: feeIv.raw,
-        expiryTag: quote.expiryTag || "",
-        targetDays: quote.targetDays || 0,
-        instrument: optionInstrument,
-        feeUsdc: cappedFee.toFixed(2),
-        subsidyUsdc: subsidyNeededFull.toFixed(2),
-        feeRegime: feeRegime.regime,
-        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
-        passThroughCapped: true,
-        reason: "pass_through_capped_subsidized",
-        liquidityOverride: liquidityOverrideUsed,
-        replication: replicationMeta,
-        survivalCheck: buildSurvivalCheck({
-          spotPrice,
-          drawdownFloorPct,
-          optionType,
-          strike: quote.strike,
-          hedgeSize: requiredSize,
-          requiredSize,
-          tolerancePct: survivalTolerance
-        }),
-        selectionSnapshot: bestSnapshots
-          ? {
-              expiryTag: quote.expiryTag,
-              targetDays: quote.targetDays,
-              strike: quote.strike.toFixed(0),
-              books: bestSnapshots
-            }
-          : null,
-        rollMultiplier: quote.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-        coveragePct: "100.00",
-        feeDiscountPct: (riskControls.partial_coverage_discount_pct ?? 0) * 100,
-        pricing: {
-          baseFee: feeBase.feeUsdc.toFixed(2),
-          hedgePremium: allInPremium.toFixed(2),
-          cappedFee: cappedFee.toFixed(2),
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(2)
-            : "N/A",
-          platformSubsidy: subsidyNeededFull.toFixed(2),
-          ratio: premiumFloor.ratio.toFixed(4),
-          threshold: premiumFloor.threshold.toFixed(4),
-          explanation:
-            `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds ${tierName} tier cap. ` +
-            `Fee capped at $${cappedFee.toFixed(2)} ` +
-            `(${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}× base). ` +
-            `Platform subsidizing $${subsidyNeededFull.toFixed(2)} for full protection.`
-        },
-        warning: {
-          type: "premium_capped_full_protection",
-          ratio: premiumFloor.ratio.toFixed(4),
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(2)
-            : "N/A",
-          message:
-            `Premium exceeds tier cap. Fee capped at $${cappedFee.toFixed(2)}. ` +
-            `You're fully protected (100% hedge). Platform covers excess.`
-        }
-      });
-    }
-    if (!allowPartialCoverage) {
-      await audit("premium_floor_rejected", {
-        baseFee: feeBase.feeUsdc.toFixed(2),
-        allInPremium: allInPremium.toFixed(2),
-        ratio: premiumFloor.ratio.toFixed(4),
-        threshold: premiumFloor.threshold.toFixed(4),
-        reason: "premium_floor_pass_through_capped",
-        canPassThrough,
-        capped: true,
-        capMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(2)
-          : null,
-        tierName,
-        leverage,
-        optionType,
-        instrument: optionInstrument
-      });
-      return cacheAndReturn({
-        status: "premium_floor",
-        reason: "premium_floor_pass_through_capped",
-        optionType,
-        venue: "deribit",
-        strike: quote.strike.toFixed(0),
-        premiumUsdc: quote.premiumTotal.toFixed(2),
-        premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-        hedgeSize: requiredSize.toFixed(4),
-        sizingMethod: body.optionDelta ? "delta" : "notional",
-        bufferTargetPct: "0.00",
-        markIv: feeIv.raw,
-        expiryTag: quote.expiryTag || "",
-        targetDays: quote.targetDays || 0,
-        instrument: optionInstrument,
-        feeUsdc: cappedFee.toFixed(2),
-        subsidyUsdc: "0.00",
-        feeRegime: feeRegime.regime,
-        feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-        feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-        passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(4)
-          : null,
-        passThroughCapped: true,
-        liquidityOverride: liquidityOverrideUsed,
-        replication: replicationMeta,
-        survivalCheck: buildSurvivalCheck({
-          spotPrice,
-          drawdownFloorPct,
-          optionType,
-          strike: quote.strike,
-          hedgeSize: requiredSize,
-          requiredSize,
-          tolerancePct: survivalTolerance
-        }),
-        selectionSnapshot: bestSnapshots
-          ? {
-              expiryTag: quote.expiryTag,
-              targetDays: quote.targetDays,
-              strike: quote.strike.toFixed(0),
-              books: bestSnapshots
-            }
-          : null,
-        rollMultiplier: quote.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-        pricing: {
-          baseFee: feeBase.feeUsdc.toFixed(2),
-          hedgePremium: allInPremium.toFixed(2),
-          ratio: premiumFloor.ratio.toFixed(4),
-          threshold: premiumFloor.threshold.toFixed(4),
-          capMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(2)
-            : "N/A",
-          explanation:
-            `Premium ${premiumFloor.ratio.toFixed(2)}× base fee exceeds Bronze tier cap ` +
-            `of ${passThroughCapInfo.capMultiplier?.toFixed(1) || "N/A"}×. ` +
-            `Reduce leverage, duration, or widen the floor to lower premium.`
-        },
-        warning: {
-          type: "premium_floor",
-          ratio: premiumFloor.ratio.toFixed(4),
-          threshold: premiumFloor.threshold.toFixed(4),
-          message:
-            "Premium too high for Bronze tier. Reduce leverage, duration, or widen the floor."
-        },
-        suggestions: [
-          `Reduce leverage from ${leverage}× to ${Math.max(1, Math.floor(leverage / 2))}×`,
-          `Reduce protection duration from ${quote.targetDays || 0} days to ${Math.max(
-            1,
-            Math.floor((quote.targetDays || 0) / 2)
-          )} days`,
-          "Increase drawdown floor percentage to reduce premium",
-          "Reduce position size to lower premium"
-        ]
-      });
-    }
-    feeUsdc = cappedFee;
-    const bronzeFixedCapped = applyBronzeFixedFee(tierName, leverage, feeUsdc, optionType);
-    feeUsdc = bronzeFixedCapped.fee;
-    const subsidyNeeded = allInPremium.minus(feeUsdc);
-    const subsidyCheck = canApplySubsidy(
-      tierName,
-      body.accountId || null,
-      subsidyNeeded.toNumber(),
-      feeIv.scaled
-    );
-    if (subsidyNeeded.gt(0)) {
-      const affordableSize = feeUsdc.div(
-        quote.premiumPerUnit.mul(new Decimal(quote.rollMultiplier))
-      );
-      const partialSize = Decimal.min(quote.availableSize, affordableSize);
-      if (partialSize.greaterThanOrEqualTo(minSize)) {
-        if (!allowPartialCoverage) {
-          return cacheAndReturn({
-            status: "premium_floor",
-            reason: "partial_not_allowed",
-            optionType,
-            venue: "deribit",
-            strike: quote.strike.toFixed(0),
-            premiumUsdc: quote.premiumPerUnit.mul(partialSize).toFixed(2),
-            premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-            hedgeSize: requiredSize.toFixed(4),
-            sizingMethod: body.optionDelta ? "delta" : "notional",
-            bufferTargetPct: "0.00",
-            markIv: feeIv.raw,
-            expiryTag: quote.expiryTag || "",
-            targetDays: quote.targetDays || 0,
-            instrument: optionInstrument,
-            feeUsdc: feeUsdc.toFixed(2),
-            subsidyUsdc: "0.00",
-            feeRegime: feeRegime.regime,
-            feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-            feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-            passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-              ? passThroughCapInfo.capMultiplier.toFixed(4)
-              : null,
-            passThroughCapped: true,
-            liquidityOverride: liquidityOverrideUsed,
-            replication: replicationMeta,
-            survivalCheck: buildSurvivalCheck({
-              spotPrice,
-              drawdownFloorPct,
-              optionType,
-              strike: quote.strike,
-              hedgeSize: requiredSize,
-              requiredSize,
-              tolerancePct: survivalTolerance
-            }),
-            selectionSnapshot: bestSnapshots
-              ? {
-                  expiryTag: quote.expiryTag,
-                  targetDays: quote.targetDays,
-                  strike: quote.strike.toFixed(0),
-                  books: bestSnapshots
-                }
-              : null,
-            rollMultiplier: quote.rollMultiplier,
-            rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-            pricing: {
-              baseFee: feeBase.feeUsdc.toFixed(2),
-              hedgePremium: allInPremium.toFixed(2),
-              ratio: premiumFloor.ratio.toFixed(4),
-              threshold: premiumFloor.threshold.toFixed(4),
-              capMultiplier: passThroughCapInfo.capMultiplier
-                ? passThroughCapInfo.capMultiplier.toFixed(2)
-                : "N/A",
-              explanation:
-                "Partial coverage not allowed for this tier. Reduce leverage or duration to lower premium."
-            },
-            warning: {
-              type: "premium_floor",
-              ratio: premiumFloor.ratio.toFixed(4),
-              threshold: premiumFloor.threshold.toFixed(4),
-              message: "Partial coverage not allowed for this tier."
-            }
-          });
-        }
-        const coverageRatio = partialSize.div(requiredSize);
-        const discountedFee = applyPartialDiscount(feeUsdc, coverageRatio);
-        return cacheAndReturn({
-          status: "partial",
-          optionType,
-          venue: "deribit",
-          strike: quote.strike.toFixed(0),
-          premiumUsdc: quote.premiumPerUnit.mul(partialSize).toFixed(2),
-          premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-          hedgeSize: partialSize.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          expiryTag: quote.expiryTag || "",
-          targetDays: quote.targetDays || 0,
-          instrument: optionInstrument,
-          feeUsdc: discountedFee.toFixed(2),
-          subsidyUsdc: "0.00",
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
-          passThroughCapped: true,
-          reason: "pass_through_capped_partial",
-          liquidityOverride: liquidityOverrideUsed,
-          replication: replicationMeta,
-          survivalCheck: buildSurvivalCheck({
-            spotPrice,
-            drawdownFloorPct,
-            optionType,
-            strike: quote.strike,
-            hedgeSize: partialSize,
-            requiredSize,
-            tolerancePct: survivalTolerance
-          }),
-          selectionSnapshot: bestSnapshots
-            ? {
-                expiryTag: quote.expiryTag,
-                targetDays: quote.targetDays,
-                strike: quote.strike.toFixed(0),
-                books: bestSnapshots
-              }
-            : null,
-          rollMultiplier: quote.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2),
-          coveragePct: coverageRatio.mul(100).toFixed(2),
-          feeDiscountPct: (riskControls.partial_coverage_discount_pct ?? 0) * 100
-        });
-      }
-      if (subsidyNeeded.gt(0) && subsidyCheck.allowed && canFullyCoverQuote) {
-        return cacheAndReturn({
-          status: "subsidized",
-          optionType,
-          venue: "deribit",
-          strike: quote.strike.toFixed(0),
-          premiumUsdc: quote.premiumTotal.toFixed(2),
-          premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          expiryTag: quote.expiryTag || "",
-          targetDays: quote.targetDays || 0,
-          instrument: optionInstrument,
-          feeUsdc: feeUsdc.toFixed(2),
-          subsidyUsdc: subsidyNeeded.toFixed(2),
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
-          passThroughCapped: true,
-          reason: "pass_through_capped_subsidized",
-          liquidityOverride: liquidityOverrideUsed,
-          replication: replicationMeta,
-          survivalCheck: buildSurvivalCheck({
-            spotPrice,
-            drawdownFloorPct,
-            optionType,
-            strike: quote.strike,
-            hedgeSize: requiredSize,
-            requiredSize,
-            tolerancePct: survivalTolerance
-          }),
-          selectionSnapshot: bestSnapshots
-            ? {
-                expiryTag: quote.expiryTag,
-                targetDays: quote.targetDays,
-                strike: quote.strike.toFixed(0),
-                books: bestSnapshots
-              }
-            : null,
-          rollMultiplier: quote.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-        });
-      }
-      if (subsidyNeeded.gt(0) && canFullyCoverQuote && canCoverageOverride(tierName)) {
-        return cacheAndReturn({
-          status: "subsidized",
-          optionType,
-          venue: "deribit",
-          strike: quote.strike.toFixed(0),
-          premiumUsdc: quote.premiumTotal.toFixed(2),
-          premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
-          hedgeSize: requiredSize.toFixed(4),
-          sizingMethod: body.optionDelta ? "delta" : "notional",
-          bufferTargetPct: "0.00",
-          markIv: feeIv.raw,
-          expiryTag: quote.expiryTag || "",
-          targetDays: quote.targetDays || 0,
-          instrument: optionInstrument,
-          feeUsdc: feeUsdc.toFixed(2),
-          subsidyUsdc: subsidyNeeded.toFixed(2),
-          feeRegime: feeRegime.regime,
-          feeRegimeMultiplier: feeRegime.multiplier ? feeRegime.multiplier.toFixed(4) : null,
-          feeLeverageMultiplier: feeLeverage.multiplier ? feeLeverage.multiplier.toFixed(4) : null,
-          passThroughCapMultiplier: passThroughCapInfo.capMultiplier
-            ? passThroughCapInfo.capMultiplier.toFixed(4)
-            : null,
-          passThroughCapped: true,
-          reason: "pass_through_capped_override",
-          capBreached: true,
-          subsidyCapReason: subsidyCheck.reason,
-          liquidityOverride: liquidityOverrideUsed,
-          replication: replicationMeta,
-          survivalCheck: buildSurvivalCheck({
-            spotPrice,
-            drawdownFloorPct,
-            optionType,
-            strike: quote.strike,
-            hedgeSize: requiredSize,
-            requiredSize,
-            tolerancePct: survivalTolerance
-          }),
-          selectionSnapshot: bestSnapshots
-            ? {
-                expiryTag: quote.expiryTag,
-                targetDays: quote.targetDays,
-                strike: quote.strike.toFixed(0),
-                books: bestSnapshots
-              }
-            : null,
-          rollMultiplier: quote.rollMultiplier,
-          rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-        });
-      }
-      return cacheAndReturn({
-        status: "perp_fallback",
-        expiryTag: quote.expiryTag || "",
-        targetDays: quote.targetDays || 0,
-        rejected: {
-          missingBook: 0,
-          spreadTooWide: 0,
-          sizeTooSmall: 0,
-          noBidAsk: 0,
-          slippageTooHigh: 0
-        },
-        reason: "pass_through_capped_perp_fallback",
-        liquidityOverride: liquidityOverrideUsed,
-        replication: replicationMeta,
-        selectionSnapshot: bestSnapshots
-          ? {
-              expiryTag: quote.expiryTag,
-              targetDays: quote.targetDays,
-              strike: quote.strike.toFixed(0),
-              books: bestSnapshots
-            }
-          : null,
-        rollMultiplier: quote.rollMultiplier,
-        rollEstimatedPremiumUsdc: allInPremium.toFixed(2)
-      });
-    }
-  }
   const cap = riskControls.net_exposure_cap_usdc[tierName] ?? Number.POSITIVE_INFINITY;
   const state = getRiskState(tierName);
 
@@ -4420,7 +5316,8 @@ app.post("/put/quote", async (req) => {
   if (iv && iv > riskControls.volatility_throttle_iv) {
     hedgeFactor = Math.min(hedgeFactor, riskControls.hedge_reduction_factor);
   }
-  hedgeFactor = Math.max(1, hedgeFactor);
+  const allowHedgeReduction = riskControls.enable_hedge_reduction === true;
+  hedgeFactor = allowHedgeReduction ? Math.min(1, hedgeFactor) : Math.max(1, hedgeFactor);
 
   const optionSymbol = optionType === "put" ? "P" : "C";
   const optionInstrument = buildVenueInstrumentName(
@@ -4433,14 +5330,15 @@ app.post("/put/quote", async (req) => {
   const response = {
     status: "ok",
     optionType,
-    venue: "deribit",
+    venue: chosenExecutionPlans?.[0]?.venue ?? null,
     strike: quote.strike.toFixed(0),
     premiumUsdc: quote.premiumTotal.toFixed(2),
     premiumPerUnitUsdc: quote.premiumPerUnit.toFixed(2),
     score: null,
     liquidityOverride: liquidityOverrideUsed,
+    coverageLegs: bestPlanLegs ?? null,
     hedgeSize: (() => {
-      const adjusted = hedgeSize.mul(hedgeFactor);
+      const adjusted = hedgeSizeForQuote.mul(hedgeFactor);
       const available = quote.availableSize;
       return capHedgeSize(adjusted, available).toFixed(4);
     })(),
@@ -4449,6 +5347,13 @@ app.post("/put/quote", async (req) => {
     markIv: feeIv.raw,
     expiryTag: quote.expiryTag || "",
     targetDays: quote.targetDays || 0,
+    tenorReason: tenorFallbackUsed ? "tenor_fallback" : null,
+    tenorSelection: {
+      requestedDays: requestedTargetDays,
+      selectedDays: quote.targetDays || 0,
+      toleranceDays: tenorToleranceDays,
+      mode: tenorFallbackUsed ? "fallback" : "preferred"
+    },
     instrument: optionInstrument,
     executionPlan: chosenExecutionPlans
       ? chosenExecutionPlans.map((plan) => ({
@@ -4469,6 +5374,26 @@ app.post("/put/quote", async (req) => {
     requiredSize,
     tolerancePct: survivalTolerance
   });
+  if (!isSurvivalSatisfied(survivalCheck)) {
+    quoteDiagnostics.failureStage = "insufficient_floor_coverage";
+    await audit("put_quote_failed", {
+      reason: "insufficient_floor_coverage",
+      optionType,
+      tierName,
+      leverage,
+      requiredSize: requiredSize.toFixed(6),
+      quotedHedgeSize: response.hedgeSize,
+      survivalCheck
+    });
+    return cacheAndReturn({
+      status: "no_quote",
+      reason: "insufficient_floor_coverage",
+      message: "Selected hedge cannot satisfy floor coverage at requested parameters.",
+      requiredHedgeSize: requiredSize.toFixed(6),
+      quotedHedgeSize: response.hedgeSize,
+      survivalCheck
+    });
+  }
   const selectedSnapshot = bestSnapshots
     ? {
         expiryTag: quote.expiryTag,
@@ -4491,72 +5416,44 @@ app.post("/put/quote", async (req) => {
   response["feeLeverageMultiplier"] = feeLeverage.multiplier
     ? feeLeverage.multiplier.toFixed(4)
     : null;
-  response["passThroughCapMultiplier"] = passThroughCapInfo.capMultiplier
-    ? passThroughCapInfo.capMultiplier.toFixed(4)
-    : null;
+  response["passThroughCapMultiplier"] = formatCapMultiplier(passThroughCapInfo);
   response["passThroughCapped"] = passThroughCapped;
   response["subsidyUsdc"] = "0.00";
+  response["ctcShadow"] = ctcShadow;
+  const shouldPassThrough = feeReason !== "ctc_safety" && passThroughFee.gt(baseFeeUsdc);
+  const pricingReason =
+    ctcAssessment.wouldOverride && !ctcAssessment.priceOverrideEnabled
+      ? "ctc_shadow_only"
+      : feeReason;
+  response["pricingReason"] = pricingReason;
   response["reason"] = feeReason;
   const minNotificationRatio = new Decimal(
     riskControls.pass_through_min_notification_ratio ?? 1.5
   );
   const shouldNotify = premiumFloor.ratio.gte(minNotificationRatio);
-  if (premiumFloor.breached) {
-    if (canPassThrough && !passThroughCapped) {
-      response["status"] = "pass_through";
-      response["feeUsdc"] = passThroughFee.toFixed(2);
-      response["reason"] = "premium_floor_pass_through";
-      response["pricing"] = {
-        type: "pass_through",
-        baseFee: feeBase.feeUsdc.toFixed(2),
-        hedgePremium: allInPremium.toFixed(2),
-        totalFee: passThroughFee.toFixed(2),
-        markupPct: markupPct.mul(100).toFixed(2),
-        markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
-        ratio: premiumFloor.ratio.toFixed(4),
-        threshold: premiumFloor.threshold.toFixed(4)
-      };
-      response["warning"] = shouldNotify
-        ? {
-            type: "premium_pass_through",
-            ratio: premiumFloor.ratio.toFixed(4),
-            threshold: premiumFloor.threshold.toFixed(4)
-          }
-        : undefined;
-    } else if (canPassThrough && passThroughCapped && passThroughCapInfo.maxFee) {
-      response["status"] = "pass_through_capped";
-      response["feeUsdc"] = passThroughCapInfo.maxFee.toFixed(2);
-      response["reason"] = "premium_floor_pass_through_capped";
-      response["pricing"] = {
-        type: "pass_through_capped",
-        baseFee: feeBase.feeUsdc.toFixed(2),
-        hedgePremium: allInPremium.toFixed(2),
-        cappedFee: passThroughCapInfo.maxFee.toFixed(2),
-        capMultiplier: passThroughCapInfo.capMultiplier
-          ? passThroughCapInfo.capMultiplier.toFixed(2)
-          : null,
-        markupPct: markupPct.mul(100).toFixed(2),
-        ratio: premiumFloor.ratio.toFixed(4),
-        threshold: premiumFloor.threshold.toFixed(4)
-      };
-      response["warning"] = shouldNotify
-        ? {
-            type: "premium_capped",
-            ratio: premiumFloor.ratio.toFixed(4),
-            threshold: premiumFloor.threshold.toFixed(4)
-          }
-        : undefined;
-    } else {
-      response["status"] = "premium_floor";
-      response["reason"] = passThroughCapped
-        ? "premium_floor_pass_through_capped"
-        : "premium_floor";
-      response["warning"] = {
-        type: "premium_floor",
-        ratio: premiumFloor.ratio.toFixed(4),
-        threshold: premiumFloor.threshold.toFixed(4)
-      };
-    }
+  if (shouldPassThrough) {
+    response["status"] = "pass_through";
+    response["feeUsdc"] = passThroughFee.toFixed(2);
+    response["reason"] = premiumFloor.breached ? "premium_floor_pass_through" : "pass_through";
+    response["pricing"] = {
+      type: "pass_through",
+      baseFee: feeBase.feeUsdc.toFixed(2),
+      hedgePremium: allInPremium.toFixed(2),
+      totalFee: passThroughFee.toFixed(2),
+      markupPct: markupPct.mul(100).toFixed(2),
+      markupUsdc: passThroughFee.minus(allInPremium).toFixed(2),
+      ratio: premiumFloor.ratio.toFixed(4),
+      threshold: premiumFloor.threshold.toFixed(4)
+    };
+    response["warning"] = premiumFloor.breached && shouldNotify
+      ? {
+          type: "premium_pass_through",
+          ratio: premiumFloor.ratio.toFixed(4),
+          threshold: premiumFloor.threshold.toFixed(4)
+        }
+      : undefined;
+  } else {
+    response["status"] = "ok";
   }
   await audit("put_quote", response);
   return cacheAndReturn(response);
@@ -4691,13 +5588,24 @@ app.post("/put/auto-renew", async (req) => {
     expiryTag?: string;
     targetDays?: number;
     amount: number;
+    leverage?: number;
     renewWindowMinutes?: number;
     expiryIso?: string;
     side?: "long" | "short";
     coverageId?: string;
     accountId?: string;
     allowPremiumPassThrough?: boolean;
+    autoRenew?: boolean;
   };
+
+  if (body.autoRenew === false) {
+    const response = { status: "disabled", reason: "auto_renew_off" };
+    await audit("put_renew_skipped", {
+      coverageId: body.coverageId ?? null,
+      reason: "auto_renew_off"
+    });
+    return response;
+  }
 
   if (body.expiryIso && body.renewWindowMinutes) {
     const expiry = new Date(body.expiryIso);
@@ -4713,17 +5621,68 @@ app.post("/put/auto-renew", async (req) => {
   if (asset !== "BTC") {
     return { status: "no_quote", reason: "unsupported_asset" };
   }
-  const instruments = await deribit.listInstruments(asset);
-  const results = (instruments as any)?.result || [];
+  let results: Array<any> = [];
+  try {
+    const instruments = await deribit.listInstruments(asset);
+    results = (instruments as any)?.result || [];
+  } catch (error: any) {
+    if (venueConfig.mode !== "bybit_only") {
+      return {
+        status: "error",
+        reason: "instrument_universe_unavailable",
+        message: "Failed to load renewal instrument universe.",
+        retryable: true,
+        detail: error?.message ?? "unknown_error"
+      };
+    }
+    results = [];
+  }
   const optionType = body.side === "short" ? "call" : "put";
   const baseMaxSpreadPct = riskControls.max_spread_pct ?? 0.05;
   const baseMaxSlippagePct = riskControls.max_slippage_pct ?? 0.01;
   const useBodySpread = false;
   const useBodySlippage = false;
-  const requiredSize = new Decimal(body.amount ?? 0);
+  const minSize = new Decimal(riskControls.min_option_size ?? 0.01);
+  const requestedSize = new Decimal(body.amount ?? 0);
+  const ledgerCoverage = body.coverageId ? coverageLedger.get(body.coverageId) : null;
+  const ledgerRequiredSize = ledgerCoverage?.positions?.length
+    ? ledgerCoverage.positions.reduce((acc, pos) => {
+        const notional = new Decimal(pos.marginUsd || 0).mul(new Decimal(pos.leverage || 1));
+        const sizeUnits = pos.entryPrice ? notional.div(new Decimal(pos.entryPrice)) : new Decimal(0);
+        return acc.add(sizeUnits);
+      }, new Decimal(0))
+    : null;
+  const baseRequiredSize = Decimal.max(minSize, ledgerRequiredSize ?? requestedSize);
+  const requiredSize = baseRequiredSize;
+  let hedgeSizeForRenew = requiredSize;
   const spotPrice = new Decimal(body.spotPrice);
   const drawdownFloorPct = new Decimal(body.drawdownFloorPct);
+  const targetStrike =
+    optionType === "put"
+      ? spotPrice.mul(new Decimal(1).minus(drawdownFloorPct))
+      : spotPrice.mul(new Decimal(1).plus(drawdownFloorPct));
   const tierName = body.tierName || "Unknown";
+  const protectedNotionalUsdc = requiredSize.abs().mul(spotPrice.abs());
+  const tierMinNotionalUsdc = resolveTierMinNotionalUsdc(tierName);
+  if (tierMinNotionalUsdc && isBelowTierMinNotional(protectedNotionalUsdc, tierMinNotionalUsdc)) {
+    await audit("put_renew_skipped", {
+      coverageId: body.coverageId ?? null,
+      reason: "tier_notional_min",
+      tierName,
+      protectedNotionalUsdc: protectedNotionalUsdc.toFixed(2),
+      minNotionalUsdc: tierMinNotionalUsdc.toFixed(2)
+    });
+    return {
+      status: "no_quote",
+      reason: "tier_notional_min",
+      tierName,
+      protectedNotionalUsdc: protectedNotionalUsdc.toFixed(2),
+      minNotionalUsdc: tierMinNotionalUsdc.toFixed(2),
+      message: `${tierName} requires at least $${tierMinNotionalUsdc.toFixed(
+        2
+      )} protected notional for renewal.`
+    };
+  }
   const expiryTargetDays = body.expiryTag
     ? targetDaysForExpiryTag(results, body.expiryTag)
     : null;
@@ -4734,19 +5693,39 @@ app.post("/put/auto-renew", async (req) => {
     maxFallbackDays,
     Math.max(1, Math.round(body.targetDays ?? expiryTargetDays ?? defaultTargetDays))
   );
+  const requestedTargetDays = targetDays;
+  const tenorToleranceDays = Math.max(
+    0,
+    Math.round(riskControls.tenor_preference_tolerance_days ?? 2)
+  );
   const expirySearchOrder = body.expiryTag
     ? [{ expiryTag: body.expiryTag, targetDays: expiryTargetDays ?? targetDays }]
-    : await buildExpirySearchOrder(
-        results,
-        optionType,
-        spotPrice,
-        drawdownFloorPct,
-        requiredSize,
-        new Decimal(baseMaxSpreadPct ?? 0.05),
-        targetDays,
-        maxPreferredDays,
-        maxFallbackDays
+    : venueConfig.mode === "bybit_only"
+      ? buildBybitExpirySearchOrder(targetDays, 3)
+      : await buildExpirySearchOrder(
+          results,
+          optionType,
+          spotPrice,
+          drawdownFloorPct,
+          requiredSize,
+          new Decimal(baseMaxSpreadPct ?? 0.05),
+          targetDays,
+          maxPreferredDays,
+          maxFallbackDays
+        );
+  const preferredExpiryOrder = body.expiryTag
+    ? expirySearchOrder
+    : expirySearchOrder.filter(
+        (entry) => Math.abs((entry.targetDays ?? targetDays) - targetDays) <= tenorToleranceDays
       );
+  const fallbackExpiryOrder = body.expiryTag
+    ? []
+    : expirySearchOrder.filter(
+        (entry) => Math.abs((entry.targetDays ?? targetDays) - targetDays) > tenorToleranceDays
+      );
+  const orderedExpirySearchOrder = [...preferredExpiryOrder, ...fallbackExpiryOrder];
+  const fallbackStartIndex = preferredExpiryOrder.length;
+  const hasFallbackPool = fallbackExpiryOrder.length > 0;
   let chosenExecutionPlans:
     | Array<{ venue: string; instrument: string; side: "buy" | "sell"; size: Decimal; price: Decimal }>
     | null = null;
@@ -4754,6 +5733,7 @@ app.post("/put/auto-renew", async (req) => {
   let bestCandidate: {
     expiryTag: string;
     targetDays: number;
+    instrumentName: string;
     premiumPerUnit: Decimal;
     premiumTotal: Decimal;
     availableSize: Decimal;
@@ -4762,10 +5742,19 @@ app.post("/put/auto-renew", async (req) => {
     spreadPct: Decimal;
     rollMultiplier: number;
     allInPremium: Decimal;
+    hedgeSize: Decimal;
   } | null = null;
   let bestSnapshots: QuoteBookSnapshot[] | null = null;
   const liquidityOverrideEnabled = riskControls.liquidity_override_enabled ?? false;
   let liquidityOverrideUsed = false;
+  const renewSearchBudgetMs = Math.max(250, Number(riskControls.option_search_budget_ms ?? 1200));
+  const renewSearchStartedAt = Date.now();
+  const renewStrikeScanLimit = Math.max(
+    1,
+    Math.min(30, Number.isFinite(QUOTE_STRIKE_SCAN_LIMIT) ? QUOTE_STRIKE_SCAN_LIMIT : 12)
+  );
+  let tenorMode: "preferred" | "fallback" = "preferred";
+  let tenorFallbackUsed = false;
 
   for (const overridePass of [false, true]) {
     if (overridePass && !liquidityOverrideEnabled) break;
@@ -4773,24 +5762,55 @@ app.post("/put/auto-renew", async (req) => {
     bestSnapshots = null;
     chosenExecutionPlans = null;
     chosenSnapshots = null;
+    tenorMode = "preferred";
 
-    for (const entry of expirySearchOrder) {
+    for (let expiryIdx = 0; expiryIdx < orderedExpirySearchOrder.length; expiryIdx += 1) {
+      if (
+        hasFallbackPool &&
+        fallbackStartIndex > 0 &&
+        expiryIdx >= fallbackStartIndex &&
+        bestCandidate
+      ) {
+        tenorMode = "preferred";
+        break;
+      }
+      if (Date.now() - renewSearchStartedAt > renewSearchBudgetMs) break;
+      const entry = orderedExpirySearchOrder[expiryIdx];
       const expiryTag = entry.expiryTag;
       const days = entry.targetDays;
       if (!expiryTag) continue;
-      const plansByStrike = new Map<
-        string,
-        Array<{ venue: string; instrument: string; side: "buy" | "sell"; size: Decimal; price: Decimal }>
-      >();
       const snapshotsByStrike = new Map<string, QuoteBookSnapshot[]>();
-      const strikeCandidates = selectStrikeCandidates(
-        results,
-        expiryTag,
-        optionType,
-        spotPrice,
-        drawdownFloorPct,
-        30
-      );
+      let strikeCandidates =
+        venueConfig.mode === "bybit_only"
+          ? await selectBybitStrikeCandidates(
+              asset,
+              expiryTag,
+              optionType,
+              targetStrike,
+              30
+            )
+          : selectStrikeCandidates(
+              results,
+              expiryTag,
+              optionType,
+              spotPrice,
+              drawdownFloorPct,
+              30
+            );
+      if (
+        venueConfig.mode === "bybit_only" &&
+        strikeCandidates.length === 0 &&
+        venueConfig.deribit_enabled
+      ) {
+        strikeCandidates = selectStrikeCandidates(
+          results,
+          expiryTag,
+          optionType,
+          spotPrice,
+          drawdownFloorPct,
+          30
+        );
+      }
       const { maxSpreadPct, maxSlippagePct } = resolveLiquidityThresholds(
         days,
         overridePass,
@@ -4800,9 +5820,42 @@ app.post("/put/auto-renew", async (req) => {
         useBodySlippage
       );
 
-      for (const inst of strikeCandidates) {
-        const quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+      for (const inst of strikeCandidates.slice(0, renewStrikeScanLimit)) {
+        if (Date.now() - renewSearchStartedAt > renewSearchBudgetMs) break;
+        let quotes: Awaited<ReturnType<typeof getOptionVenueQuotes>> = [];
+        try {
+          quotes = await getOptionVenueQuotes(inst.instrument_name, spotPrice);
+        } catch {
+          continue;
+        }
         if (!quotes.length) continue;
+        const strike = new Decimal(inst.strike);
+        const coverageSize = requiredHedgeSizeForFullCoverage({
+          spotPrice,
+          drawdownFloorPct,
+          optionType,
+          strike,
+          requiredSize
+        });
+        if (!coverageSize) continue;
+        const targetSize = Decimal.max(minSize, coverageSize);
+        let agg = aggregateOptionQuotes(quotes, "buy", targetSize);
+        if (
+          venueConfig.mode === "bybit_only" &&
+          agg.filledSize.lt(targetSize) &&
+          venueConfig.deribit_enabled
+        ) {
+          const deribitQuote = await fetchDeribitQuoteForInstrument(inst.instrument_name, spotPrice);
+          if (deribitQuote) {
+            quotes = [...quotes, deribitQuote];
+            agg = aggregateOptionQuotes(quotes, "buy", targetSize);
+          }
+        }
+        if (!agg.bestBid || !agg.bestAsk) continue;
+        if (agg.spread.gt(maxSpreadPct)) continue;
+        if (!agg.avgPrice || agg.filledSize.lte(0) || agg.filledSize.lt(targetSize)) continue;
+        const slippagePct = agg.avgPrice.minus(agg.bestAsk).div(agg.bestAsk);
+        if (slippagePct.gt(maxSlippagePct)) continue;
         const snapshots = quotes.map((quote) => ({
           venue: quote.venue,
           instrument: quote.instrument,
@@ -4814,43 +5867,38 @@ app.post("/put/auto-renew", async (req) => {
           timestampMs: quote.book.timestampMs ?? null,
           markPriceUsd: serializeDecimal(quote.book.markPriceUsd, 6)
         }));
-        snapshotsByStrike.set(new Decimal(inst.strike).toFixed(0), snapshots);
-        const agg = aggregateOptionQuotes(quotes, "buy", requiredSize);
-        if (!agg.bestBid || !agg.bestAsk) continue;
-        if (agg.spread.gt(maxSpreadPct)) continue;
-        if (!agg.avgPrice || agg.filledSize.lte(0)) continue;
-        const slippagePct = agg.avgPrice.minus(agg.bestAsk).div(agg.bestAsk);
-        if (slippagePct.gt(maxSlippagePct)) continue;
+        snapshotsByStrike.set(strike.toFixed(0), snapshots);
 
-        const ticker = await deribit.getTicker(inst.instrument_name);
-        const iv = Number((ticker as any)?.result?.mark_iv ?? 0);
         const premiumPerUnit = agg.avgPrice;
-        const premiumTotal = premiumPerUnit.mul(requiredSize);
+        const premiumTotal = premiumPerUnit.mul(targetSize);
         const rollMultiplier = Math.max(1, Math.ceil(targetDays / days));
         const allInPremium = premiumTotal.mul(new Decimal(rollMultiplier));
         if (!bestCandidate || allInPremium.lt(bestCandidate.allInPremium)) {
           bestCandidate = {
             expiryTag,
             targetDays: days,
+            instrumentName: inst.instrument_name,
             premiumPerUnit,
             premiumTotal,
             availableSize: agg.totalAskSize,
             strike: new Decimal(inst.strike),
-            iv,
+            iv: Number.isFinite(body.ivSnapshot ?? NaN) ? Number(body.ivSnapshot) : 0,
             spreadPct: agg.spread,
             rollMultiplier,
-            allInPremium
+            allInPremium,
+            hedgeSize: targetSize
           };
+          tenorMode = hasFallbackPool && expiryIdx >= fallbackStartIndex ? "fallback" : "preferred";
           bestSnapshots = snapshots;
           chosenExecutionPlans = agg.plans;
           chosenSnapshots = snapshotsByStrike;
         }
-        plansByStrike.set(new Decimal(inst.strike).toFixed(0), agg.plans);
       }
     }
 
     if (bestCandidate) {
       liquidityOverrideUsed = overridePass;
+      tenorFallbackUsed = tenorMode === "fallback";
       break;
     }
   }
@@ -4868,9 +5916,8 @@ app.post("/put/auto-renew", async (req) => {
     : null;
 
   let renewReason = "flat_fee";
-  let subsidyUsdc = new Decimal(0);
   let effectiveFeeUsdc = new Decimal(body.fixedPriceUsdc);
-  let effectiveSize = requiredSize;
+  let effectiveSize = hedgeSizeForRenew;
   let effectiveExpiryTag = quote?.expiryTag || body.expiryTag || "";
   let effectiveStrike: Decimal | null = quote?.strike ?? null;
   let effectivePremiumUsdc = quote?.premiumTotal ?? new Decimal(0);
@@ -4885,7 +5932,7 @@ app.post("/put/auto-renew", async (req) => {
         drawdownFloorPct,
         optionType,
         strike: quote.strike,
-        hedgeSize: requiredSize,
+        hedgeSize: hedgeSizeForRenew,
         requiredSize,
         tolerancePct: survivalTolerance
       })
@@ -4896,7 +5943,8 @@ app.post("/put/auto-renew", async (req) => {
     await audit("put_renew_failed", { reason: "no_quote", liquidityOverride: liquidityOverrideUsed });
     return { status: "no_quote", liquidityOverride: liquidityOverrideUsed };
   }
-  const leverageCheck = normalizeLeverage(body.leverage);
+  const renewLeverageInput = body.leverage ?? ledgerCoverage?.positions?.[0]?.leverage;
+  const leverageCheck = normalizeLeverage(renewLeverageInput);
   if (!leverageCheck.ok) {
     return {
       status: "no_quote",
@@ -4916,10 +5964,21 @@ app.post("/put/auto-renew", async (req) => {
     ivCandidate: quote?.iv,
     optionType
   });
-  effectiveFeeUsdc = renewFeeBase.feeUsdc;
+  const renewBaseFeeUsdc = renewFeeBase.feeUsdc;
+  effectiveFeeUsdc = renewBaseFeeUsdc;
   const renewFeeRegime = renewFeeBase.feeRegime;
   const renewFeeLeverage = renewFeeBase.feeLeverage;
   effectiveIv = renewFeeBase.feeIv.scaled;
+  const renewPremiumFloor = premiumFloorBreached(effectiveAllInPremium, renewBaseFeeUsdc);
+  const renewMarkupPct = resolvePremiumMarkupPct(tierName, renewLeverage);
+  const renewPassThroughFee = effectiveAllInPremium.mul(new Decimal(1).add(renewMarkupPct));
+  // Pilot policy lock for renewals: max(floor fee, hedge premium + markup)
+  effectiveFeeUsdc = Decimal.max(renewBaseFeeUsdc, renewPassThroughFee);
+  renewReason = renewPassThroughFee.gt(renewBaseFeeUsdc)
+    ? renewPremiumFloor.breached
+      ? "premium_floor_pass_through"
+      : "pass_through"
+    : "base_fee";
   const renewSafety = calculateCtcSafetyFee({
     tierName,
     drawdownPct: drawdownFloorPct,
@@ -4928,30 +5987,49 @@ app.post("/put/auto-renew", async (req) => {
     leverage: renewLeverage,
     optionType
   });
-  if (renewSafety.feeUsdc && renewSafety.feeUsdc.gt(effectiveFeeUsdc)) {
-    effectiveFeeUsdc = renewSafety.feeUsdc;
+  const renewCtcAssessment = assessCtcShadow({
+    ctcFeeUsdc: renewSafety.feeUsdc,
+    baseFeeUsdc: renewBaseFeeUsdc,
+    hedgePremiumUsdc: effectiveAllInPremium,
+    protectedNotionalUsdc: requiredSize.mul(spotPrice)
+  });
+  const renewCtcShadow = serializeCtcShadow(renewCtcAssessment);
+  if (renewCtcAssessment.rawFeeUsdc) {
+    await audit("ctc_shadow", {
+      tierName,
+      leverage: renewLeverage,
+      optionType,
+      ctcShadow: renewCtcShadow,
+      context: "auto_renew"
+    });
+  }
+  if (renewCtcAssessment.reject) {
+    return {
+      status: "no_quote",
+      reason: "ctc_shadow_guard",
+      liquidityOverride: liquidityOverrideUsed,
+      ctcShadow: renewCtcShadow
+    };
+  }
+  if (
+    renewCtcAssessment.priceOverrideEnabled &&
+    renewCtcAssessment.boundedFeeUsdc &&
+    renewCtcAssessment.boundedFeeUsdc.gt(effectiveFeeUsdc)
+  ) {
+    effectiveFeeUsdc = renewCtcAssessment.boundedFeeUsdc;
     renewReason = "ctc_safety";
   }
-  const renewPremiumFloor = premiumFloorBreached(effectiveAllInPremium, effectiveFeeUsdc);
-  const renewMarkupPct = resolvePremiumMarkupPct(tierName, renewLeverage);
-  const renewPassThroughFee = effectiveAllInPremium.mul(new Decimal(1).add(renewMarkupPct));
-  const renewPassThroughEnabled = riskControls.enable_premium_pass_through !== false;
-  const renewRequiresUserOptIn = riskControls.require_user_opt_in_for_pass_through === true;
-  const renewUserOptedIn = body.allowPremiumPassThrough !== false;
-  const renewCanPassThrough =
-    renewPassThroughEnabled && (!renewRequiresUserOptIn || renewUserOptedIn);
-  let subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
-  let subsidyCheck = canApplySubsidy(
-    tierName,
-    body.accountId || null,
-    subsidyNeeded.toNumber(),
-    effectiveIv
-  );
+  // Premium caps removed by policy: pass-through is uncapped.
+  const renewPassThroughEnabled = true;
+  const renewRequiresUserOptIn = false;
+  const renewUserOptedIn = true;
+  const renewCanPassThrough = true;
   const renewPassThroughCap = applyPassThroughCap(
-    effectiveFeeUsdc,
+    renewBaseFeeUsdc,
     effectiveAllInPremium,
     renewLeverage,
-    tierName
+    tierName,
+    effectiveIv ?? 0
   );
   const renewPassThroughCapped = renewPassThroughCap.maxFee
     ? renewPassThroughFee.gt(renewPassThroughCap.maxFee)
@@ -4963,119 +6041,30 @@ app.post("/put/auto-renew", async (req) => {
     canPassThrough: renewCanPassThrough,
     tierName,
     leverage: renewLeverage,
-    premiumRatio: renewPremiumFloor.ratio.toFixed(4)
+    premiumRatio: renewPremiumFloor.ratio.toFixed(4),
+    policy: "pilot_locked_formula"
   });
-  const canFullyCover = effectiveAvailableSize
-    ? effectiveAvailableSize.greaterThanOrEqualTo(requiredSize)
-    : false;
-  if (renewPremiumFloor.breached && renewReason !== "pass_through") {
-    if (renewCanPassThrough && !renewPassThroughCapped) {
-      renewReason = "pass_through";
-      effectiveFeeUsdc = renewPassThroughFee;
-    } else if (renewCanPassThrough && renewPassThroughCapped && renewPassThroughCap.maxFee) {
-      renewReason = "pass_through_capped";
-      effectiveFeeUsdc = renewPassThroughCap.maxFee;
-      subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
-      subsidyCheck = canApplySubsidy(
-        tierName,
-        body.accountId || null,
-        subsidyNeeded.toNumber(),
-        effectiveIv
+
+  if (renewReason !== "pass_through" && effectiveAllInPremium.gt(effectiveFeeUsdc)) {
+    const minSize = new Decimal(riskControls.min_option_size ?? 0.01);
+    const affordableSize = effectiveFeeUsdc.div(
+      quote.premiumPerUnit.mul(new Decimal(effectiveRollMultiplier))
+    );
+    const partialSize = Decimal.min(quote.availableSize, affordableSize);
+    if (partialSize.greaterThanOrEqualTo(minSize)) {
+      renewReason = "partial";
+      effectiveSize = partialSize;
+      effectivePremiumUsdc = quote.premiumPerUnit.mul(partialSize);
+      effectiveFeeUsdc = applyPartialDiscount(
+        effectiveFeeUsdc,
+        partialSize.div(requiredSize)
       );
     } else {
-      return {
-        status: "premium_floor",
-        reason: renewPassThroughCapped
-          ? "premium_floor_pass_through_capped"
-          : "premium_floor",
-        liquidityOverride: liquidityOverrideUsed,
-        feeRegime: renewFeeRegime.regime,
-        feeRegimeMultiplier: renewFeeRegime.multiplier
-          ? renewFeeRegime.multiplier.toFixed(4)
-          : null,
-        feeLeverageMultiplier: renewFeeLeverage.multiplier
-          ? renewFeeLeverage.multiplier.toFixed(4)
-          : null,
-        passThroughCapMultiplier: renewPassThroughCap.capMultiplier
-          ? renewPassThroughCap.capMultiplier.toFixed(4)
-          : null,
-        passThroughCapped: renewPassThroughCapped,
-        warning: {
-          type: "premium_floor",
-          ratio: renewPremiumFloor.ratio.toFixed(4),
-          threshold: renewPremiumFloor.threshold.toFixed(4)
-        }
-      };
+      await audit("put_renew_failed", { reason: "perp_fallback" });
+      return { status: "perp_fallback" };
     }
   }
-  if (renewReason !== "pass_through") {
-    if (renewReason === "pass_through_capped" && subsidyNeeded.gt(0)) {
-      const minSize = new Decimal(riskControls.min_option_size ?? 0.01);
-      const affordableSize = effectiveFeeUsdc.div(
-        quote.premiumPerUnit.mul(new Decimal(effectiveRollMultiplier))
-      );
-      const partialSize = Decimal.min(quote.availableSize, affordableSize);
-      if (partialSize.greaterThanOrEqualTo(minSize)) {
-        renewReason = "partial";
-        effectiveSize = partialSize;
-        effectivePremiumUsdc = quote.premiumPerUnit.mul(partialSize);
-        effectiveFeeUsdc = applyPartialDiscount(
-          effectiveFeeUsdc,
-          partialSize.div(requiredSize)
-        );
-      }
-    }
-    if (renewReason !== "partial") {
-      if (subsidyNeeded.gt(0) && subsidyCheck.allowed && canFullyCover) {
-        renewReason = "subsidized";
-        subsidyUsdc = subsidyNeeded;
-      } else if (subsidyNeeded.gt(0) && canFullyCover && canCoverageOverride(tierName)) {
-        renewReason = "coverage_override";
-        subsidyUsdc = subsidyNeeded;
-      } else if (renewCanPassThrough && effectiveAllInPremium.gt(effectiveFeeUsdc)) {
-        const lateCap = applyPassThroughCap(
-          effectiveFeeUsdc,
-          effectiveAllInPremium,
-          renewLeverage,
-          tierName
-        );
-        const latePassThroughFee = effectiveAllInPremium.mul(new Decimal(1).add(renewMarkupPct));
-        const lateCapped = lateCap.maxFee ? latePassThroughFee.gt(lateCap.maxFee) : false;
-        if (!lateCapped) {
-          renewReason = "pass_through";
-          effectiveFeeUsdc = latePassThroughFee;
-        } else if (lateCap.maxFee) {
-          renewReason = "pass_through_capped";
-          effectiveFeeUsdc = lateCap.maxFee;
-          subsidyNeeded = effectiveAllInPremium.minus(effectiveFeeUsdc);
-          subsidyCheck = canApplySubsidy(
-            tierName,
-            body.accountId || null,
-            subsidyNeeded.toNumber(),
-            effectiveIv
-          );
-        }
-      } else if (subsidyNeeded.gt(0)) {
-        const minSize = new Decimal(riskControls.min_option_size ?? 0.01);
-        const affordableSize = effectiveFeeUsdc.div(
-          quote.premiumPerUnit.mul(new Decimal(effectiveRollMultiplier))
-        );
-        const partialSize = Decimal.min(quote.availableSize, affordableSize);
-        if (partialSize.greaterThanOrEqualTo(minSize)) {
-          renewReason = "partial";
-          effectiveSize = partialSize;
-          effectivePremiumUsdc = quote.premiumPerUnit.mul(partialSize);
-          effectiveFeeUsdc = applyPartialDiscount(
-            effectiveFeeUsdc,
-            partialSize.div(requiredSize)
-          );
-        } else {
-          await audit("put_renew_failed", { reason: "perp_fallback" });
-          return { status: "perp_fallback" };
-        }
-      }
-    }
-  }
+
   const feeUsdc = Number(effectiveFeeUsdc.toFixed(2));
   const premiumUsdc = Number(effectivePremiumUsdc.toFixed(2));
   const cap = riskControls.net_exposure_cap_usdc[tierName] ?? Number.POSITIVE_INFINITY;
@@ -5097,12 +6086,15 @@ app.post("/put/auto-renew", async (req) => {
   }
 
   const optionSymbol = optionType === "put" ? "P" : "C";
-  const optionInstrument = buildVenueInstrumentName(
-    asset,
-    effectiveExpiryTag,
-    (effectiveStrike ?? new Decimal(0)).toFixed(0),
-    optionSymbol
-  );
+  const plannedInstrument = chosenExecutionPlans?.[0]?.instrument;
+  const optionInstrument =
+    plannedInstrument ??
+    buildVenueInstrumentName(
+      asset,
+      effectiveExpiryTag,
+      (effectiveStrike ?? new Decimal(0)).toFixed(0),
+      optionSymbol
+    );
 
   const desiredAmount = effectiveSize.mul(hedgeFactor);
   const cappedAmount = capHedgeSize(desiredAmount, effectiveAvailableSize ?? undefined);
@@ -5116,10 +6108,29 @@ app.post("/put/auto-renew", async (req) => {
     requiredSize: effectiveSize,
     tolerancePct: survivalTolerance
   });
+  if (!isSurvivalSatisfied(finalSurvivalCheck)) {
+    await audit("put_renew_failed", {
+      reason: "insufficient_floor_coverage",
+      tierName,
+      optionType,
+      requiredSize: effectiveSize.toFixed(6),
+      quotedHedgeSize: cappedAmount.toFixed(6),
+      survivalCheck: finalSurvivalCheck
+    });
+    return {
+      status: "no_quote",
+      reason: "insufficient_floor_coverage",
+      message: "Renewal hedge cannot satisfy floor coverage at requested parameters.",
+      requiredHedgeSize: effectiveSize.toFixed(6),
+      quotedHedgeSize: cappedAmount.toFixed(6),
+      survivalCheck: finalSurvivalCheck
+    };
+  }
   if (finalSurvivalCheck) {
     renewalSurvivalCheck = finalSurvivalCheck;
   }
-  const renewVenue = venueConfig.mode === "bybit_only" ? "bybit" : "deribit";
+  const renewVenue =
+    chosenExecutionPlans?.[0]?.venue ?? (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
   const renewInstrument =
     renewVenue === "bybit" && !optionInstrument.endsWith("-USDT")
       ? `${optionInstrument}-USDT`
@@ -5138,9 +6149,12 @@ app.post("/put/auto-renew", async (req) => {
     (buyOption as any)?.result?.price ??
     (buyOption as any)?.fillPrice ??
     null;
-  const renewPremiumUsdc = renewFill
-    ? Number(new Decimal(renewFill).mul(new Decimal(body.spotPrice)).mul(cappedAmount))
-    : null;
+  const renewPremiumUsdc = resolveOptionPremiumUsdc({
+    fillPrice: renewFill,
+    filledAmount: cappedAmount.toNumber(),
+    spotPrice: body.spotPrice,
+    isBybitExecution: renewVenue === "bybit"
+  });
   if (!renewalSnapshot && quote && effectiveStrike) {
     const strikeKey = effectiveStrike.toFixed(0);
     renewalSnapshot = {
@@ -5151,16 +6165,28 @@ app.post("/put/auto-renew", async (req) => {
     };
   }
 
+  const renewPricingReason =
+    renewCtcAssessment.wouldOverride && !renewCtcAssessment.priceOverrideEnabled
+      ? "ctc_shadow_only"
+      : renewReason;
   const response = {
-    status: renewReason,
+    status: renewReason === "premium_floor_pass_through" ? "pass_through" : renewReason,
+    reason: renewReason,
     venue: renewVenue,
+    tenorReason: tenorFallbackUsed ? "tenor_fallback" : null,
+    tenorSelection: {
+      requestedDays: requestedTargetDays,
+      selectedDays: quote?.targetDays ?? targetDays,
+      toleranceDays: tenorToleranceDays,
+      mode: tenorFallbackUsed ? "fallback" : "preferred"
+    },
     replication: renewalReplication,
     survivalCheck: renewalSurvivalCheck,
     selectionSnapshot: renewalSnapshot,
     rollMultiplier: effectiveRollMultiplier,
     rollEstimatedPremiumUsdc: effectiveAllInPremium.toFixed(2),
     liquidityOverride: liquidityOverrideUsed,
-    subsidyUsdc: subsidyUsdc.toFixed(2),
+    subsidyUsdc: "0.00",
     feeUsdc: effectiveFeeUsdc.toFixed(2),
     feeRegime: renewFeeRegime.regime,
     feeRegimeMultiplier: renewFeeRegime.multiplier
@@ -5172,8 +6198,9 @@ app.post("/put/auto-renew", async (req) => {
     passThroughCapMultiplier: renewPassThroughCap.capMultiplier
       ? renewPassThroughCap.capMultiplier.toFixed(4)
       : null,
-    passThroughCapped: renewPassThroughCap.capped,
-    capBreached: renewReason === "coverage_override",
+    passThroughCapped: renewPassThroughCapped,
+    pricingReason: renewPricingReason,
+    ctcShadow: renewCtcShadow,
     executionPlan: chosenExecutionPlans
       ? chosenExecutionPlans.map((plan) => ({
           venue: plan.venue,
@@ -5189,6 +6216,9 @@ app.post("/put/auto-renew", async (req) => {
     },
     orders: { buyOption }
   };
+  const renewPremiumValueRaw = renewPremiumUsdc ?? effectivePremiumUsdc.toFixed(2);
+  const renewPremiumValue = Number(renewPremiumValueRaw);
+  const renewCashflowUsdc = Number.isFinite(renewPremiumValue) ? renewPremiumValue : null;
   await audit("hedge_order", {
     instrument: optionInstrument,
     side: "buy",
@@ -5200,35 +6230,75 @@ app.post("/put/auto-renew", async (req) => {
     status: renewStatus || "submitted",
     fillPrice: renewFill,
     premiumUsdc: renewPremiumUsdc ?? effectivePremiumUsdc.toFixed(2),
+    cashflowUsdc: renewCashflowUsdc,
     feeUsdc,
-    subsidyUsdc: subsidyUsdc.toFixed(2),
+    quotedFeeUsdc: feeUsdc,
+    collectedFeeUsdc: 0,
+    hedgeSpendUsdc: renewPremiumUsdc ?? Number(effectivePremiumUsdc.toFixed(2)),
+    grossMarginUsdc:
+      Number.isFinite(Number(feeUsdc)) &&
+      Number.isFinite(Number(renewPremiumUsdc ?? Number(effectivePremiumUsdc.toFixed(2))))
+        ? Number(feeUsdc) - Number(renewPremiumUsdc ?? Number(effectivePremiumUsdc.toFixed(2)))
+        : null,
+    subsidyUsdc: "0.00",
     reason: renewReason,
-    venue: "deribit"
+    pricingReason: renewPricingReason,
+    venue: renewVenue
   });
   if (renewStatus === "paper_filled" || renewStatus === "filled" || renewStatus === "ok") {
     const accounting = applyRiskAccounting(
       tierName,
       feeUsdc,
       Number(renewPremiumUsdc ?? effectivePremiumUsdc.toFixed(2)),
-      notionalUsdc
+      notionalUsdc,
+      0,
+      "coverage"
     );
     await audit("liquidity_update", {
       coverageId: body.coverageId || null,
       tier: tierName,
       feeUsdc,
       premiumUsdc: renewPremiumUsdc ?? Number(effectivePremiumUsdc.toFixed(2)),
-      subsidyUsdc: subsidyUsdc.toFixed(2),
+      subsidyUsdc: "0.00",
       notionalUsdc,
       delta: accounting.liquidityDelta,
       totals: liquiditySummary()
     });
-    if (subsidyUsdc.gt(0)) {
-      recordSubsidy(tierName, body.accountId || null, subsidyUsdc.toNumber());
-    }
+  }
+  const renewExecuted =
+    renewStatus === "paper_filled" || renewStatus === "filled" || renewStatus === "ok";
+  const expiryDate = effectiveExpiryTag ? parseExpiryTagToDate(effectiveExpiryTag) : null;
+  const renewalExpiryIso = expiryDate ? expiryDate.toISOString() : body.expiryIso || "";
+  if (body.coverageId && renewExecuted) {
+    const existing = coverageLedger.get(body.coverageId);
+    const existingCollectedRaw = Number(existing?.collectedFeeUsdc ?? 0);
+    const existingCollectedUsdc = Number.isFinite(existingCollectedRaw) ? existingCollectedRaw : 0;
+    const collectedFeeUsdc = existingCollectedUsdc + feeUsdc;
+    const hedgeSpendUsdc = renewPremiumUsdc ?? Number(effectivePremiumUsdc.toFixed(2));
+    const grossMarginUsdc = collectedFeeUsdc - hedgeSpendUsdc;
+    upsertCoverageLedger({
+      coverageId: body.coverageId,
+      expiryIso: renewalExpiryIso,
+      hedgeInstrument: renewInstrument,
+      hedgeSize: cappedAmount.toNumber(),
+      hedgeType: "option",
+      optionType,
+      strike: effectiveStrike ? Number(effectiveStrike.toFixed(0)) : null,
+      selectedVenue: renewVenue,
+      markSource: renewVenue === "bybit" || renewVenue === "deribit" ? renewVenue : null,
+      quotedFeeUsdc: feeUsdc,
+      collectedFeeUsdc,
+      hedgeSpendUsdc,
+      grossMarginUsdc,
+      pricingReason: renewPricingReason,
+      autoRenew: true,
+      status: "active"
+    });
+    await saveCoverageLedger();
   }
   await audit("coverage_renewed", {
     tier: tierName,
-    expiryIso: body.expiryIso,
+    expiryIso: renewalExpiryIso || body.expiryIso,
     instrument: optionInstrument,
     coverageId: body.coverageId || null
   });
@@ -5277,6 +6347,8 @@ app.post("/loop/tick", async (req) => {
     notionalUsdc?: number;
     hedgeType?: string;
     tierName?: string;
+    selectedVenue?: string;
+    autoRenew?: boolean;
     assets?: string[];
     spotByAsset?: Record<string, number>;
     exposures?: Array<{
@@ -5286,15 +6358,18 @@ app.post("/loop/tick", async (req) => {
       size: number;
       leverage: number;
     }>;
+    skipNetExposure?: boolean;
     positionSide?: "long" | "short";
     optionType?: "put" | "call";
   };
+
+  Object.assign(riskControls, await loadRiskControls(RISK_CONTROLS_PATH));
 
   const combined = getCombinedExposureBook();
   const baseExposures =
     combined.exposures.length > 0 ? combined.exposures : body.exposures ?? [];
   const assetsFromExposure = Array.from(new Set(baseExposures.map((pos) => pos.asset)));
-  const assets = ["BTC"];
+  const assets = assetsFromExposure.length ? assetsFromExposure : ["BTC"];
   const assetsQuery = assets ? `&assets=${encodeURIComponent(assets.join(","))}` : "";
   const risk = await app.inject({
     method: "GET",
@@ -5302,7 +6377,7 @@ app.post("/loop/tick", async (req) => {
       body.drawdownLimitUsdc
     )}&initialBalanceUsdc=${encodeURIComponent(body.initialBalanceUsdc)}&cashUsdc=${encodeURIComponent(
       body.initialBalanceUsdc
-    )}&positionPnlUsdc=0&hedgeMtmUsdc=0${assetsQuery}`
+    )}${assetsQuery}`
   });
 
   const riskPayload = risk.json() as {
@@ -5310,13 +6385,72 @@ app.post("/loop/tick", async (req) => {
   };
 
   const coverage = body.coverageId ? activeCoverages.get(body.coverageId) : null;
+  if (body.coverageId && typeof body.autoRenew === "boolean") {
+    const existing = coverageLedger.get(body.coverageId);
+    if (!existing || existing.autoRenew !== body.autoRenew) {
+      upsertCoverageLedger({ coverageId: body.coverageId, autoRenew: body.autoRenew });
+      await saveCoverageLedger();
+    }
+  }
   const inferredPositionSide =
     body.positionSide || (coverage?.positions?.[0]?.side as "long" | "short" | undefined) || "long";
   const inferredOptionType = body.optionType || (inferredPositionSide === "short" ? "call" : "put");
   const inferredHedgeType = body.hedgeType || "option";
 
-  const decision = evaluateRollingHedge({
-    bufferPct: new Decimal(riskPayload.drawdownBufferPct).div(100),
+  const baseBufferPct = new Decimal(riskPayload.drawdownBufferPct).div(100);
+  let bufferPct = baseBufferPct;
+  let bufferSource: "risk_summary" | "coverage_ledger" | "mtm_snapshot" | "mtm_stale" | "mtm_invalid" =
+    "risk_summary";
+  let mtmAgeMs: number | null = null;
+  const useMtmBuffer = riskControls.loop_use_mtm_buffer === true;
+  const maxAgeMs = riskControls.loop_mtm_max_age_ms ?? 0;
+  if (useMtmBuffer && body.coverageId) {
+    const ledgerEntry = coverageLedger.get(body.coverageId);
+    const ledgerBuffer = ledgerEntry?.lastMtm?.bufferUsdc;
+    const ledgerTs = ledgerEntry?.lastMtm?.ts;
+    const initialBalance = new Decimal(body.initialBalanceUsdc || "0");
+    if (ledgerTs) {
+      const ledgerAge = Date.now() - Date.parse(ledgerTs);
+      if (Number.isFinite(ledgerAge)) {
+        mtmAgeMs = ledgerAge;
+      }
+    }
+    if (ledgerBuffer !== undefined && ledgerBuffer !== null && initialBalance.gt(0)) {
+      if (maxAgeMs > 0 && mtmAgeMs !== null && mtmAgeMs > maxAgeMs) {
+        bufferSource = "mtm_stale";
+      } else {
+        bufferPct = new Decimal(ledgerBuffer).div(initialBalance);
+        bufferSource = "coverage_ledger";
+      }
+    }
+  }
+  if (useMtmBuffer && bufferSource === "risk_summary" && lastMtmSnapshot) {
+    const ageMs = Date.now() - lastMtmSnapshotAt;
+    if (Number.isFinite(ageMs)) {
+      mtmAgeMs = ageMs;
+    }
+    if (maxAgeMs <= 0 || ageMs <= maxAgeMs) {
+      const drawdownLimit = new Decimal(body.drawdownLimitUsdc || "0");
+      const initialBalance = new Decimal(body.initialBalanceUsdc || "0");
+      if (initialBalance.gt(0)) {
+        bufferPct = lastMtmSnapshot.equityUsdc.minus(drawdownLimit).div(initialBalance);
+        bufferSource = "mtm_snapshot";
+      } else {
+        bufferSource = "mtm_invalid";
+      }
+    } else {
+      bufferSource = "mtm_stale";
+    }
+  }
+  if (
+    useMtmBuffer &&
+    bufferSource === "risk_summary" &&
+    (mtmAgeMs !== null || lastMtmSnapshot)
+  ) {
+    bufferSource = "mtm_invalid";
+  }
+  let decision = evaluateRollingHedge({
+    bufferPct,
     hedgeState: {
       bufferTargetPct: new Decimal(body.bufferTargetPct),
       hysteresisPct: new Decimal(body.hysteresisPct)
@@ -5327,8 +6461,83 @@ app.post("/loop/tick", async (req) => {
     currentOptionType: inferredOptionType,
     hedgeType: inferredHedgeType
   });
+  const ledgerAutoRenew = body.coverageId
+    ? coverageLedger.get(body.coverageId)?.autoRenew
+    : undefined;
+  const autoRenewEnabled =
+    body.autoRenew !== undefined ? body.autoRenew : ledgerAutoRenew ?? true;
+  if (!autoRenewEnabled && decision.renew) {
+    await audit("put_renew_skipped", {
+      coverageId: body.coverageId ?? null,
+      reason: "auto_renew_off"
+    });
+    decision = {
+      ...decision,
+      renew: false,
+      reason: "auto_renew_off"
+    };
+  }
 
-  let renewalResult: unknown = { status: "skipped" };
+  const hedgeCooldownMs = riskControls.hedge_action_cooldown_ms ?? 60000;
+  const estimatePremiumEnabled = riskControls.estimate_premium_on_missing === true;
+  const staleMtmThresholdMs =
+    riskControls.loop_stale_mtm_cooldown_ms ?? riskControls.loop_mtm_max_age_ms ?? 0;
+  const blockOnStaleMtm = riskControls.loop_block_on_stale_mtm === true;
+  const mtmStaleByAge =
+    staleMtmThresholdMs > 0 && mtmAgeMs !== null && mtmAgeMs > staleMtmThresholdMs;
+  const mtmBlocked =
+    blockOnStaleMtm &&
+    (bufferSource === "mtm_stale" || bufferSource === "mtm_invalid" || mtmStaleByAge);
+  const minHedgeNotional = riskControls.min_hedge_notional_usdc ?? 0;
+  const loopAccountingEnabled = riskControls.loop_accounting_enabled === true;
+  const coverageKey = body.coverageId || body.accountId || "unknown";
+  const lastHedgeAt = hedgeActionCooldownByCoverage.get(coverageKey) ?? 0;
+  const withinCooldown =
+    hedgeCooldownMs > 0 && Date.now() - lastHedgeAt < hedgeCooldownMs;
+  const ledgerNotional =
+    body.coverageId && coverageLedger.has(body.coverageId)
+      ? coverageLedger.get(body.coverageId)?.notionalUsdc ?? null
+      : null;
+  const notionalUsdc = Number(body.notionalUsdc ?? ledgerNotional ?? 0);
+  const requireNotional = riskControls.loop_require_notional_usdc === true;
+  const missingNotional =
+    requireNotional && (!Number.isFinite(notionalUsdc) || notionalUsdc <= 0);
+  const belowNotional =
+    Number.isFinite(notionalUsdc) &&
+    minHedgeNotional > 0 &&
+    notionalUsdc > 0 &&
+    notionalUsdc < minHedgeNotional;
+
+  const phase3RolloutEnabled = riskControls.phase3_rollout_enabled ?? false;
+  const phase3SafetyGuardEnabled = riskControls.phase3_safety_guard_enabled ?? true;
+  const requestedIntermittentAnalytics = riskControls.intermittent_analytics_enabled ?? false;
+  const requestedSelectionShadow = riskControls.intermittent_selection_shadow_enabled ?? false;
+  const requestedSelectionLive = riskControls.intermittent_selection_live_enabled ?? false;
+  const requestedProfitThresholds = riskControls.intermittent_profit_threshold_enabled ?? false;
+  const selectionShadowEnabled =
+    phase3RolloutEnabled &&
+    (requestedSelectionShadow || (phase3SafetyGuardEnabled && requestedSelectionLive));
+  const selectionLiveEnabled =
+    phase3RolloutEnabled && !phase3SafetyGuardEnabled && requestedSelectionLive;
+  const profitThresholdsEnabled = phase3RolloutEnabled && requestedProfitThresholds;
+  const profitThresholdsEnforced =
+    phase3RolloutEnabled &&
+    requestedProfitThresholds &&
+    (!phase3SafetyGuardEnabled || riskControls.intermittent_profit_enforce_override === true);
+  const intermittentConfig = {
+    rolloutEnabled: phase3RolloutEnabled,
+    safetyGuardEnabled: phase3SafetyGuardEnabled,
+    analytics: phase3RolloutEnabled && requestedIntermittentAnalytics,
+    selectionShadow: selectionShadowEnabled,
+    selectionLive: selectionLiveEnabled,
+    profitThresholdsEnabled,
+    profitThresholdsEnforced,
+    profitMinImprovementUsdc: riskControls.intermittent_profit_min_improvement_usdc ?? 0,
+    profitMinImprovementRatio: riskControls.intermittent_profit_min_improvement_ratio ?? 0,
+    profitCriticalBufferPct: riskControls.intermittent_profit_critical_buffer_pct ?? 0
+  };
+
+  let renewalResult: unknown = { status: autoRenewEnabled ? "skipped" : "disabled" };
   if (decision.renew) {
     renewalResult = await runAutoRenewJob(
       {
@@ -5350,44 +6559,652 @@ app.post("/loop/tick", async (req) => {
   }
 
   if (decision.hedgeAction === "increase") {
-    await audit("hedge_action", {
-      action: "increase",
-      reason: decision.reason,
-      instrument: body.hedgeInstrument,
-      size: body.hedgeSize,
-      coverageId: body.coverageId || null,
-      notionalUsdc: body.notionalUsdc ?? null,
-      hedgeType: inferredHedgeType,
-      positionSide: inferredPositionSide,
-      recommendedSide: decision.recommendedSide
-    });
-    const hedgeVenue = venueConfig.mode === "bybit_only" ? "bybit" : "deribit";
-    const hedgeInstrument =
-      hedgeVenue === "bybit" &&
-      typeof body.hedgeInstrument === "string" &&
-      !body.hedgeInstrument.endsWith("-USDT")
-        ? `${body.hedgeInstrument}-USDT`
-        : body.hedgeInstrument;
-    await executionRegistry.placeOrder(hedgeVenue, {
-      instrument: hedgeInstrument,
-      amount: body.hedgeSize,
-      side: decision.recommendedSide,
-      type: "market",
-      spotPrice: body.spotPrice
-    });
-    await audit("hedge_order", {
-      instrument: body.hedgeInstrument,
-      side: decision.recommendedSide,
-      amount: body.hedgeSize,
-      type: "market",
-      coverageId: body.coverageId || null,
-      notionalUsdc: body.notionalUsdc ?? null,
-      hedgeType: inferredHedgeType,
-      positionSide: inferredPositionSide
-    });
+    if (inferredHedgeType !== "option") {
+      await audit("hedge_action_skipped", {
+        action: "increase",
+        reason: "options_only",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null
+      });
+    } else if (withinCooldown || belowNotional || missingNotional || mtmBlocked) {
+      await audit("hedge_action_skipped", {
+        action: "increase",
+        reason: withinCooldown
+          ? "cooldown"
+          : mtmBlocked
+            ? "mtm_stale"
+            : missingNotional
+              ? "missing_notional"
+              : "min_notional",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null,
+        cooldownMs: hedgeCooldownMs,
+        bufferSource,
+        mtmAgeMs: mtmAgeMs ?? null
+      });
+    } else {
+      let executionInstrument = body.hedgeInstrument;
+      const requestedHedgeSize = Number(body.hedgeSize ?? 0);
+      let executionSize = requestedHedgeSize;
+      const sizeTolerancePctRaw = Number(
+        riskControls.intermittent_selection_size_tolerance_pct ?? 0.2
+      );
+      const sizeTolerancePct =
+        Number.isFinite(sizeTolerancePctRaw) && sizeTolerancePctRaw >= 0
+          ? sizeTolerancePctRaw
+          : 0;
+      let sizeSelectionApplied = false;
+      let sizeDeltaPct: number | null = null;
+      let selectionMode: "disabled" | "shadow" | "live" = "disabled";
+      let selectionError: string | null = null;
+      let candidateQuoteStatus: string | null = null;
+      let expectedImprovementUsdc: number | null = null;
+      let expectedCostUsdc: number | null = null;
+      let candidatePlan: {
+        instrument: string;
+        venue: string | null;
+        strike: number | null;
+        hedgeSize: number | null;
+        premiumPerUnitUsdc: number | null;
+        premiumTotalUsdc: number | null;
+        coverageRatio: number | null;
+      } | null = null;
+      let profitCheck = { allowed: true, reason: "disabled" };
+      const shouldComputeCandidate =
+        intermittentConfig.selectionShadow ||
+        intermittentConfig.selectionLive ||
+        intermittentConfig.profitThresholdsEnabled ||
+        intermittentConfig.analytics;
+      if (shouldComputeCandidate) {
+        selectionMode = intermittentConfig.selectionLive
+          ? "live"
+          : intermittentConfig.selectionShadow
+            ? "shadow"
+            : "disabled";
+        const ledgerEntry = body.coverageId ? coverageLedger.get(body.coverageId) : null;
+        const position = ledgerEntry?.positions?.[0] ?? coverage?.positions?.[0] ?? null;
+        const tierName = ledgerEntry?.tier ?? body.tierName ?? "Unknown";
+        if (position) {
+          const positionSize =
+            position.entryPrice > 0
+              ? (position.marginUsd * position.leverage) / position.entryPrice
+              : 0;
+          const drawdownLimitUsdc = Number(body.drawdownLimitUsdc ?? 0);
+          const initialBalanceUsdc = Number(body.initialBalanceUsdc ?? 0);
+          const equityUsd = Number(ledgerEntry?.equityUsd ?? 0);
+          const floorUsd = Number(ledgerEntry?.floorUsd ?? 0);
+          let drawdownFloorPctValue: number | null = null;
+          if (equityUsd > 0 && floorUsd > 0) {
+            drawdownFloorPctValue = 1 - floorUsd / equityUsd;
+          } else if (initialBalanceUsdc > 0 && drawdownLimitUsdc > 0) {
+            drawdownFloorPctValue = 1 - drawdownLimitUsdc / initialBalanceUsdc;
+          }
+          if (
+            drawdownFloorPctValue !== null &&
+            Number.isFinite(drawdownFloorPctValue) &&
+            drawdownFloorPctValue > 0
+          ) {
+            const asset = position.asset || "BTC";
+            let spotPriceNumber = Number(body.spotByAsset?.[asset] ?? 0);
+            if (!spotPriceNumber) {
+              const spot = await fetchSpotPrice(asset);
+              spotPriceNumber = spot ? spot.toNumber() : 0;
+            }
+            if (spotPriceNumber > 0 && positionSize > 0) {
+              const targetDays = (() => {
+                const expiryMs = Date.parse(body.expiryIso);
+                if (Number.isFinite(expiryMs)) {
+                  const days = Math.ceil((expiryMs - Date.now()) / (24 * 60 * 60 * 1000));
+                  return Math.max(1, days);
+                }
+                return riskControls.default_target_days ?? 7;
+              })();
+              const quoteRes = await app.inject({
+                method: "POST",
+                url: "/put/quote",
+                payload: {
+                  tierName,
+                  asset,
+                  spotPrice: spotPriceNumber,
+                  drawdownFloorPct: drawdownFloorPctValue,
+                  positionSize,
+                  fixedPriceUsdc: 0,
+                  contractSize: 1,
+                  leverage: position.leverage,
+                  side: position.side,
+                  coverageId: body.coverageId ?? "intermittent",
+                  targetDays,
+                  allowPremiumPassThrough: true,
+                  _fastPreview: true
+                }
+              });
+              const quoteData = quoteRes.json() as Record<string, any>;
+              candidateQuoteStatus = String(quoteData?.status ?? "unknown");
+              if (
+                candidateQuoteStatus !== "no_quote" &&
+                candidateQuoteStatus !== "perp_fallback" &&
+                quoteData?.instrument
+              ) {
+                const candidateInstrument = String(quoteData.instrument);
+                const parsed = parseOptionInstrument(candidateInstrument);
+                const strikeValue =
+                  quoteData?.strike !== undefined && quoteData?.strike !== null
+                    ? Number(quoteData.strike)
+                    : parsed.strike;
+                candidatePlan = {
+                  instrument: candidateInstrument,
+                  venue: quoteData?.optionVenue ?? quoteData?.venueSelection?.selected ?? null,
+                  strike: Number.isFinite(strikeValue ?? NaN) ? (strikeValue as number) : null,
+                  hedgeSize:
+                    quoteData?.hedgeSize !== undefined && quoteData?.hedgeSize !== null
+                      ? Number(quoteData.hedgeSize)
+                      : null,
+                  premiumPerUnitUsdc:
+                    quoteData?.premiumPerUnitUsdc !== undefined && quoteData?.premiumPerUnitUsdc !== null
+                      ? Number(quoteData.premiumPerUnitUsdc)
+                      : null,
+                  premiumTotalUsdc:
+                    quoteData?.rollEstimatedPremiumUsdc ??
+                    quoteData?.premiumUsdc ??
+                    null,
+                  coverageRatio:
+                    quoteData?.survivalCheck?.coverageRatio !== undefined
+                      ? Number(quoteData.survivalCheck.coverageRatio)
+                      : null
+                };
+                const candidateHedgeSize =
+                  candidatePlan.hedgeSize !== null && Number.isFinite(candidatePlan.hedgeSize)
+                    ? candidatePlan.hedgeSize
+                    : null;
+                if (candidateHedgeSize && candidateHedgeSize > 0 && executionSize > 0) {
+                  sizeDeltaPct = Math.abs(candidateHedgeSize - executionSize) / executionSize;
+                  if (
+                    intermittentConfig.selectionLive &&
+                    Number.isFinite(sizeDeltaPct) &&
+                    sizeDeltaPct <= sizeTolerancePct
+                  ) {
+                    executionSize = candidateHedgeSize;
+                    sizeSelectionApplied = true;
+                  }
+                }
+                if (candidatePlan.strike !== null) {
+                  const intrinsic = computeIntrinsicAtFloor({
+                    spotPrice: new Decimal(spotPriceNumber),
+                    drawdownFloorPct: new Decimal(drawdownFloorPctValue),
+                    optionType: inferredOptionType,
+                    strike: new Decimal(candidatePlan.strike)
+                  });
+                  expectedImprovementUsdc = intrinsic.mul(new Decimal(executionSize)).toNumber();
+                }
+                if (candidatePlan.premiumPerUnitUsdc && candidatePlan.premiumPerUnitUsdc > 0) {
+                  expectedCostUsdc = candidatePlan.premiumPerUnitUsdc * executionSize;
+                } else if (
+                  candidatePlan.premiumTotalUsdc &&
+                  candidatePlan.hedgeSize &&
+                  candidatePlan.hedgeSize > 0
+                ) {
+                  expectedCostUsdc =
+                    Number(candidatePlan.premiumTotalUsdc) *
+                    (executionSize / candidatePlan.hedgeSize);
+                }
+              }
+            } else {
+              selectionError = "spot_or_size_unavailable";
+            }
+          } else {
+            selectionError = "drawdown_floor_unavailable";
+          }
+        } else {
+          selectionError = "position_unavailable";
+        }
+      }
+      if (intermittentConfig.profitThresholdsEnabled) {
+        const critical = new Decimal(intermittentConfig.profitCriticalBufferPct || 0);
+        if (critical.gt(0) && bufferPct.lte(critical)) {
+          profitCheck = { allowed: true, reason: "critical_buffer" };
+        } else if (expectedImprovementUsdc === null || expectedCostUsdc === null) {
+          profitCheck = { allowed: true, reason: "insufficient_data" };
+        } else {
+          const improvement = new Decimal(expectedImprovementUsdc);
+          const cost = new Decimal(expectedCostUsdc);
+          const minImprovement = new Decimal(intermittentConfig.profitMinImprovementUsdc || 0);
+          const minRatio = new Decimal(intermittentConfig.profitMinImprovementRatio || 0);
+          if (minImprovement.gt(0) && improvement.lt(minImprovement)) {
+            profitCheck = { allowed: false, reason: "min_improvement" };
+          } else if (minRatio.gt(0) && improvement.lt(cost.mul(minRatio))) {
+            profitCheck = { allowed: false, reason: "improvement_ratio" };
+          } else {
+            profitCheck = { allowed: true, reason: "ok" };
+          }
+        }
+      }
+      if (intermittentConfig.analytics) {
+        await audit("intermittent_hedge_eval", {
+          coverageId: body.coverageId || null,
+          bufferPct: bufferPct.toFixed(4),
+          bufferSource,
+          mtmAgeMs: mtmAgeMs ?? null,
+          bufferTargetPct: body.bufferTargetPct,
+          hysteresisPct: body.hysteresisPct,
+          decision: decision.hedgeAction,
+          reason: decision.reason,
+          phase3RolloutEnabled: intermittentConfig.rolloutEnabled,
+          phase3SafetyGuardEnabled: intermittentConfig.safetyGuardEnabled,
+          requestedHedgeSize: Number.isFinite(requestedHedgeSize) ? requestedHedgeSize : null,
+          selectedHedgeSize: Number.isFinite(executionSize) ? executionSize : null,
+          sizeDeltaPct: sizeDeltaPct !== null ? Number(sizeDeltaPct.toFixed(4)) : null,
+          sizeSelectionApplied,
+          selectionMode,
+          selectionError,
+          quoteStatus: candidateQuoteStatus,
+          candidatePlan,
+          expectedImprovementUsdc: expectedImprovementUsdc ?? null,
+          expectedCostUsdc: expectedCostUsdc ?? null,
+          profitCheck: intermittentConfig.profitThresholdsEnabled
+            ? profitCheck
+            : { allowed: true, reason: "disabled" }
+        });
+      }
+      if (intermittentConfig.selectionLive && candidatePlan?.instrument) {
+        executionInstrument = candidatePlan.instrument;
+      }
+      if (intermittentConfig.profitThresholdsEnforced && !profitCheck.allowed) {
+        await audit("hedge_action_skipped", {
+          action: "increase",
+          reason: `profit_threshold_${profitCheck.reason}`,
+          coverageId: body.coverageId || null,
+          notionalUsdc: body.notionalUsdc ?? null,
+          expectedImprovementUsdc: expectedImprovementUsdc ?? null,
+          expectedCostUsdc: expectedCostUsdc ?? null
+        });
+      } else {
+        await audit("hedge_action", {
+          action: "increase",
+          reason: decision.reason,
+          instrument: executionInstrument,
+          size: executionSize,
+          coverageId: body.coverageId || null,
+          notionalUsdc: body.notionalUsdc ?? null,
+          hedgeType: inferredHedgeType,
+          positionSide: inferredPositionSide,
+          recommendedSide: decision.recommendedSide
+        });
+      const selectedVenue =
+        intermittentConfig.selectionLive && candidatePlan?.venue
+          ? candidatePlan.venue
+          : typeof body.selectedVenue === "string"
+            ? body.selectedVenue
+            : null;
+      const ledgerVenue = body.coverageId
+        ? coverageLedger.get(body.coverageId)?.selectedVenue
+        : null;
+      const inferredVenue = inferVenueFromInstrument(executionInstrument);
+      const hedgeVenue =
+        selectedVenue ||
+        ledgerVenue ||
+        inferredVenue ||
+        (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
+      const hedgeInstrument =
+        hedgeVenue === "bybit" &&
+        typeof executionInstrument === "string" &&
+        !executionInstrument.endsWith("-USDT")
+          ? `${executionInstrument}-USDT`
+          : executionInstrument;
+      const inferredAsset = parseInstrumentAsset(hedgeInstrument) || "BTC";
+      const orderResult = await executionRegistry.placeOrder(hedgeVenue, {
+        instrument: hedgeInstrument,
+        amount: executionSize,
+        side: decision.recommendedSide,
+        type: "market",
+        spotPrice: body.spotPrice
+      });
+      let executedSize = Number(executionSize ?? 0);
+      const orderStatus = String((orderResult as any)?.status || "");
+      let fillPriceUsdc: Decimal | null = null;
+      let executedPremiumUsdc: number | null = null;
+      if (orderResult && typeof orderResult === "object") {
+        const filled =
+          (orderResult as any).filledAmount ??
+          (orderResult as any).result?.filledAmount ??
+          (orderResult as any).filled_amount;
+        if (Number.isFinite(filled)) {
+          executedSize = Number(filled);
+        }
+      }
+      const fillPrice =
+        (orderResult as any)?.result?.average_price ??
+        (orderResult as any)?.result?.price ??
+        (orderResult as any)?.fillPrice ??
+        null;
+      const executed =
+        orderStatus === "paper_filled" || orderStatus === "filled" || orderStatus === "ok";
+      if (executed && fillPrice && executedSize > 0) {
+        const isBybitExec = hedgeVenue === "bybit";
+        let spotPriceNumber = Number(body.spotByAsset?.[inferredAsset] ?? body.spotPrice ?? 0);
+        if (!spotPriceNumber && !isBybitExec) {
+          const spot = await fetchSpotPrice(inferredAsset);
+          spotPriceNumber = spot ? spot.toNumber() : 0;
+        }
+        fillPriceUsdc =
+          inferredHedgeType === "option"
+            ? isBybitExec
+              ? new Decimal(fillPrice)
+              : spotPriceNumber
+                ? new Decimal(fillPrice).mul(new Decimal(spotPriceNumber))
+                : null
+            : new Decimal(fillPrice);
+        if (fillPriceUsdc) {
+          executedPremiumUsdc = fillPriceUsdc.mul(new Decimal(executedSize)).toNumber();
+          const sizeDelta = new Decimal(executedSize).mul(
+            decision.recommendedSide === "buy" ? 1 : -1
+          );
+          updateHedgeLedger({
+            instrument: hedgeInstrument,
+            sizeDelta,
+            fillPriceUsdc
+          });
+          await saveHedgeLedger();
+        }
+      }
+      if (body.coverageId && typeof hedgeInstrument === "string" && executedSize > 0) {
+        const existing = coverageLedger.get(body.coverageId);
+        let coverageLegs = existing?.coverageLegs;
+        if (
+          (!coverageLegs || coverageLegs.length === 0) &&
+          existing?.hedgeInstrument &&
+          existing?.hedgeSize
+        ) {
+          const seedParsed = parseOptionInstrument(existing.hedgeInstrument);
+          const seedVenue =
+            existing.selectedVenue ?? inferVenueFromInstrument(existing.hedgeInstrument);
+          coverageLegs = mergeCoverageLegs(coverageLegs, {
+            instrument: existing.hedgeInstrument,
+            size: Number(existing.hedgeSize ?? 0),
+            venue: seedVenue,
+            optionType: existing.optionType ?? seedParsed.optionType,
+            strike: existing.strike ?? seedParsed.strike
+          });
+        }
+        const parsed = parseOptionInstrument(hedgeInstrument);
+        const legVenue = hedgeVenue ?? inferVenueFromInstrument(hedgeInstrument);
+        coverageLegs = mergeCoverageLegs(coverageLegs, {
+          instrument: hedgeInstrument,
+          size: executedSize,
+          venue: legVenue,
+          optionType: parsed.optionType,
+          strike: parsed.strike
+        });
+        upsertCoverageLedger({
+          coverageId: body.coverageId,
+          coverageLegs
+        });
+        await saveCoverageLedger();
+      }
+      let estimatedPremiumUsdc: number | null = null;
+      if (executed && executedPremiumUsdc === null && estimatePremiumEnabled) {
+        try {
+          const spotPriceNumber = Number(body.spotByAsset?.[inferredAsset] ?? body.spotPrice ?? 0);
+          const spot = spotPriceNumber
+            ? new Decimal(spotPriceNumber)
+            : await fetchSpotPrice(inferredAsset);
+          const mark = await fetchCoverageOptionMarkUsdc(hedgeVenue, hedgeInstrument, spot || new Decimal(0));
+          if (mark && mark.isFinite() && mark.gt(0)) {
+            estimatedPremiumUsdc = mark.mul(new Decimal(executedSize)).toNumber();
+          }
+        } catch {
+          estimatedPremiumUsdc = null;
+        }
+      }
+      const loopPremiumForAudit = executedPremiumUsdc ?? estimatedPremiumUsdc;
+      const loopCashflowUsdc =
+        loopPremiumForAudit !== null && loopPremiumForAudit !== undefined
+          ? decision.recommendedSide === "sell"
+            ? -Number(loopPremiumForAudit)
+            : Number(loopPremiumForAudit)
+          : null;
+      await audit("hedge_order", {
+        instrument: executionInstrument,
+        side: decision.recommendedSide,
+        amount: executedSize || executionSize,
+        type: "market",
+        coverageId: body.coverageId || null,
+        notionalUsdc: body.notionalUsdc ?? null,
+        hedgeType: inferredHedgeType,
+        positionSide: inferredPositionSide,
+        premiumUsdc: executedPremiumUsdc ?? null,
+        estimatedPremiumUsdc,
+        cashflowUsdc: loopCashflowUsdc,
+        fillPrice: fillPrice ?? null,
+        venue: hedgeVenue
+      });
+      const loopPremiumForAccounting =
+        executedPremiumUsdc !== null ? executedPremiumUsdc : estimatedPremiumUsdc;
+      if (executed && loopAccountingEnabled && body.tierName && loopPremiumForAccounting !== null) {
+        const accounting = applyRiskAccounting(
+          body.tierName,
+          0,
+          Number(loopPremiumForAccounting),
+          Number(notionalUsdc),
+          0,
+          "coverage"
+        );
+        await audit("liquidity_update", {
+          coverageId: body.coverageId || null,
+          tier: body.tierName,
+          feeUsdc: 0,
+          premiumUsdc: Number(loopPremiumForAccounting),
+          notionalUsdc,
+          delta: accounting.liquidityDelta,
+          totals: liquiditySummary(),
+          reason: "loop_tick"
+        });
+      }
+      hedgeActionCooldownByCoverage.set(coverageKey, Date.now());
+      }
+    }
+  } else if (decision.hedgeAction === "decrease") {
+    if (riskControls.loop_enable_decrease !== true) {
+      await audit("hedge_action_skipped", {
+        action: "decrease",
+        reason: "decrease_disabled",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null
+      });
+    } else if (inferredHedgeType !== "option") {
+      await audit("hedge_action_skipped", {
+        action: "decrease",
+        reason: "options_only",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null
+      });
+    } else if (withinCooldown || belowNotional || missingNotional) {
+      await audit("hedge_action_skipped", {
+        action: "decrease",
+        reason: withinCooldown ? "cooldown" : missingNotional ? "missing_notional" : "min_notional",
+        coverageId: body.coverageId || null,
+        notionalUsdc: notionalUsdc || null,
+        cooldownMs: hedgeCooldownMs
+      });
+    } else {
+      const executionInstrument = body.hedgeInstrument;
+      const requestedHedgeSize = Number(body.hedgeSize ?? 0);
+      const ledgerEntry = executionInstrument ? hedgeLedger.get(executionInstrument) : null;
+      const currentSize = ledgerEntry?.size ?? new Decimal(0);
+      const availableSize = currentSize.abs();
+      const reduceSize =
+        Number.isFinite(requestedHedgeSize) && requestedHedgeSize > 0
+          ? Decimal.min(availableSize, new Decimal(requestedHedgeSize)).toNumber()
+          : 0;
+      if (!executionInstrument || reduceSize <= 0) {
+        await audit("hedge_action_skipped", {
+          action: "decrease",
+          reason: "no_position_to_reduce",
+          coverageId: body.coverageId || null,
+          notionalUsdc: notionalUsdc || null
+        });
+      } else {
+        const closeSide = currentSize.gt(0) ? "sell" : "buy";
+        const selectedVenue =
+          typeof body.selectedVenue === "string"
+            ? body.selectedVenue
+            : body.coverageId
+              ? coverageLedger.get(body.coverageId)?.selectedVenue
+              : null;
+        const inferredVenue = inferVenueFromInstrument(executionInstrument);
+        const hedgeVenue =
+          selectedVenue ||
+          inferredVenue ||
+          (venueConfig.mode === "bybit_only" ? "bybit" : "deribit");
+        const hedgeInstrument =
+          hedgeVenue === "bybit" &&
+          typeof executionInstrument === "string" &&
+          !executionInstrument.endsWith("-USDT")
+            ? `${executionInstrument}-USDT`
+            : executionInstrument;
+        const inferredAsset = parseInstrumentAsset(hedgeInstrument) || "BTC";
+        await audit("hedge_action", {
+          action: "decrease",
+          reason: decision.reason,
+          instrument: executionInstrument,
+          size: reduceSize,
+          coverageId: body.coverageId || null,
+          notionalUsdc: body.notionalUsdc ?? null,
+          hedgeType: inferredHedgeType,
+          positionSide: inferredPositionSide,
+          recommendedSide: closeSide
+        });
+        const orderResult = await executionRegistry.placeOrder(hedgeVenue, {
+          instrument: hedgeInstrument,
+          amount: reduceSize,
+          side: closeSide,
+          type: "market",
+          spotPrice: body.spotPrice
+        });
+        let executedSize = Number(reduceSize ?? 0);
+        const orderStatus = String((orderResult as any)?.status || "");
+        let fillPriceUsdc: Decimal | null = null;
+        let executedPremiumUsdc: number | null = null;
+        if (orderResult && typeof orderResult === "object") {
+          const filled =
+            (orderResult as any).filledAmount ??
+            (orderResult as any).result?.filledAmount ??
+            (orderResult as any).filled_amount;
+          if (Number.isFinite(filled)) {
+            executedSize = Number(filled);
+          }
+        }
+        const fillPrice =
+          (orderResult as any)?.result?.average_price ??
+          (orderResult as any)?.result?.price ??
+          (orderResult as any)?.fillPrice ??
+          null;
+        const executed =
+          orderStatus === "paper_filled" || orderStatus === "filled" || orderStatus === "ok";
+        if (executed && fillPrice && executedSize > 0) {
+          const isBybitExec = hedgeVenue === "bybit";
+          let spotPriceNumber = Number(body.spotByAsset?.[inferredAsset] ?? body.spotPrice ?? 0);
+          if (!spotPriceNumber && !isBybitExec) {
+            const spot = await fetchSpotPrice(inferredAsset);
+            spotPriceNumber = spot ? spot.toNumber() : 0;
+          }
+          fillPriceUsdc =
+            inferredHedgeType === "option"
+              ? isBybitExec
+                ? new Decimal(fillPrice)
+                : spotPriceNumber
+                  ? new Decimal(fillPrice).mul(new Decimal(spotPriceNumber))
+                  : null
+              : new Decimal(fillPrice);
+          if (fillPriceUsdc) {
+            executedPremiumUsdc = fillPriceUsdc.mul(new Decimal(executedSize)).toNumber();
+            const sizeDelta = new Decimal(executedSize).mul(closeSide === "buy" ? 1 : -1);
+            updateHedgeLedger({
+              instrument: hedgeInstrument,
+              sizeDelta,
+              fillPriceUsdc
+            });
+            await saveHedgeLedger();
+            if (body.coverageId && typeof hedgeInstrument === "string") {
+              const parsed = parseOptionInstrument(hedgeInstrument);
+              const legVenue = hedgeVenue ?? inferVenueFromInstrument(hedgeInstrument);
+              const sizeDeltaValue = sizeDelta.toNumber();
+              const existing = coverageLedger.get(body.coverageId);
+              const coverageLegs = mergeCoverageLegs(existing?.coverageLegs, {
+                instrument: hedgeInstrument,
+                size: sizeDeltaValue,
+                venue: legVenue,
+                optionType: parsed.optionType,
+                strike: parsed.strike
+              });
+              upsertCoverageLedger({
+                coverageId: body.coverageId,
+                coverageLegs
+              });
+              await saveCoverageLedger();
+            }
+          }
+        }
+        let estimatedPremiumUsdc: number | null = null;
+        if (executed && executedPremiumUsdc === null && estimatePremiumEnabled) {
+          try {
+            const spotPriceNumber = Number(body.spotByAsset?.[inferredAsset] ?? body.spotPrice ?? 0);
+            const spot = spotPriceNumber
+              ? new Decimal(spotPriceNumber)
+              : await fetchSpotPrice(inferredAsset);
+            const mark = await fetchCoverageOptionMarkUsdc(hedgeVenue, hedgeInstrument, spot || new Decimal(0));
+            if (mark && mark.isFinite() && mark.gt(0)) {
+              estimatedPremiumUsdc = mark.mul(new Decimal(executedSize)).toNumber();
+            }
+          } catch {
+            estimatedPremiumUsdc = null;
+          }
+        }
+        const basePremiumUsdc =
+          executedPremiumUsdc !== null ? executedPremiumUsdc : estimatedPremiumUsdc;
+        const signedPremiumUsdc =
+          basePremiumUsdc !== null && closeSide === "sell" ? -basePremiumUsdc : basePremiumUsdc;
+        await audit("hedge_order", {
+          instrument: executionInstrument,
+          side: closeSide,
+          amount: executedSize || reduceSize,
+          type: "market",
+          coverageId: body.coverageId || null,
+          notionalUsdc: body.notionalUsdc ?? null,
+          hedgeType: inferredHedgeType,
+          positionSide: inferredPositionSide,
+          premiumUsdc: signedPremiumUsdc ?? null,
+          estimatedPremiumUsdc: estimatedPremiumUsdc ?? null,
+          cashflowUsdc: signedPremiumUsdc ?? null,
+          fillPrice: fillPrice ?? null,
+          venue: hedgeVenue
+        });
+        if (executed && loopAccountingEnabled && body.tierName && signedPremiumUsdc !== null) {
+          const accounting = applyRiskAccounting(
+            body.tierName,
+            0,
+            Number(signedPremiumUsdc),
+            Number(notionalUsdc),
+            0,
+            "coverage"
+          );
+          await audit("liquidity_update", {
+            coverageId: body.coverageId || null,
+            tier: body.tierName,
+            feeUsdc: 0,
+            premiumUsdc: Number(signedPremiumUsdc),
+            notionalUsdc,
+            delta: accounting.liquidityDelta,
+            totals: liquiditySummary(),
+            reason: "loop_tick"
+          });
+        }
+        hedgeActionCooldownByCoverage.set(coverageKey, Date.now());
+      }
+    }
   }
 
-  if (baseExposures.length > 0) {
+  const skipNetExposure = APP_MODE === "demo" && body.skipNetExposure === true;
+  if (!skipNetExposure && baseExposures.length > 0) {
     const exposures = baseExposures.filter((pos) => pos.asset === "BTC");
     const coverageIds = ["platform-risk"];
     const netExposure = calculateNetExposure(
@@ -5404,7 +7221,28 @@ app.post("/loop/tick", async (req) => {
     const tierName = body.tierName || "Unknown";
     const state = getRiskState(tierName);
     const liquidity = liquiditySummary();
-    for (const plan of plans) {
+    const netCooldownMs = riskControls.net_exposure_cooldown_ms ?? 60000;
+    const netMinNotional = riskControls.net_exposure_min_notional_usdc ?? 0;
+    const netKey = `${tierName}-net-exposure`;
+    const lastNetAt = netExposureCooldownByTier.get(netKey) ?? 0;
+    const netWithinCooldown =
+      netCooldownMs > 0 && Date.now() - lastNetAt < netCooldownMs;
+    if (netWithinCooldown) {
+      await audit("hedge_action_skipped", {
+        action: "net_exposure",
+        reason: "cooldown",
+        tierName,
+        cooldownMs: netCooldownMs
+      });
+    } else {
+      let netExecuted = false;
+      for (const plan of plans) {
+      if (
+        netMinNotional > 0 &&
+        plan.targetNotional.abs().lt(new Decimal(netMinNotional))
+      ) {
+        continue;
+      }
       const spotOverride = body.spotByAsset?.[plan.asset];
       let spotPrice = Number(spotOverride || 0);
       if (!spotPrice) {
@@ -5444,6 +7282,20 @@ app.post("/loop/tick", async (req) => {
         liquidity.revenueUsdc * riskControls.risk_budget_pct_max - liquidity.hedgeSpendUsdc
       );
       const hedgeBudgetRemaining = Math.max(liquidityBudget, revenueBudget);
+      const budgetGuardEnabled = riskControls.net_exposure_budget_guard_enabled === true;
+      const minBudget = riskControls.net_exposure_min_budget_usdc ?? 0;
+      if (budgetGuardEnabled && (hedgeBudgetRemaining <= 0 || hedgeBudgetRemaining < minBudget)) {
+        await audit("hedge_action_skipped", {
+          action: "net_exposure",
+          reason: "budget_guard",
+          tierName,
+          hedgeBudgetRemaining,
+          liquidityBudget,
+          revenueBudget,
+          minBudget
+        });
+        continue;
+      }
 
       const maxPreferredDays = riskControls.max_target_days ?? 7;
       const maxFallbackDays = riskControls.fallback_target_days ?? 14;
@@ -5471,6 +7323,9 @@ app.post("/loop/tick", async (req) => {
         .mul(new Decimal(0.0015))
         .toNumber();
       const effectiveBudget = hedgeBudgetRemaining + recoverableMarginUsdc;
+      const netCoverageId = riskControls.net_exposure_force_coverage_id === true
+        ? `net-${plan.asset}`
+        : body.coverageId || `net-${plan.asset}`;
 
       let optionChosen: {
         instrument: string;
@@ -5670,7 +7525,8 @@ app.post("/loop/tick", async (req) => {
             hedgeType: "option",
             hedgeFactor: hedgeFactor.toNumber(),
             fundingRate,
-            coverageIds
+            coverageIds,
+            coverageId: netCoverageId
           });
           const res = await app.inject({
             method: "POST",
@@ -5680,7 +7536,7 @@ app.post("/loop/tick", async (req) => {
               amount: candidate.sizeUnits.toNumber(),
               side: "buy",
               type: "market",
-              coverageId: body.coverageId || `net-${plan.asset}`,
+              coverageId: netCoverageId,
               notionalUsdc: plan.targetNotional.abs().toNumber(),
               hedgeType: "option",
               optionType,
@@ -5695,6 +7551,7 @@ app.post("/loop/tick", async (req) => {
           const status = String(payload?.status || "");
           if (status === "paper_filled" || status === "filled" || status === "ok") {
             optionChosen = candidate;
+            netExecuted = true;
             break;
           }
           const reason = String(payload?.reason || "");
@@ -5725,7 +7582,8 @@ app.post("/loop/tick", async (req) => {
           hedgeType: "option",
           hedgeFactor: hedgeFactor.toNumber(),
           fundingRate,
-          coverageIds
+          coverageIds,
+          coverageId: netCoverageId
         });
         await app.inject({
           method: "POST",
@@ -5735,7 +7593,7 @@ app.post("/loop/tick", async (req) => {
             amount: optionChosen.sizeUnits.toNumber(),
             side: "buy",
             type: "market",
-            coverageId: body.coverageId || `net-${plan.asset}`,
+            coverageId: netCoverageId,
             notionalUsdc: plan.targetNotional.abs().toNumber(),
             hedgeType: "option",
             optionType,
@@ -5746,6 +7604,7 @@ app.post("/loop/tick", async (req) => {
             floorPrice: strikeTarget.toNumber()
           }
         });
+        netExecuted = true;
         continue;
       }
 
@@ -5770,27 +7629,57 @@ app.post("/loop/tick", async (req) => {
         hedgeType: "perp",
         hedgeFactor: hedgeFactor.toNumber(),
         fundingRate,
-        coverageIds
-      });
-      await executionRegistry.placeOrder(routedPlan.venue || "deribit", {
-        instrument,
-        amount: routedPlan.size.toNumber(),
-        side: perpSide,
-        type: "market"
-      });
-      await audit("hedge_order", {
-        instrument,
-        side: perpSide,
-        amount: routedPlan.size.toNumber(),
-        type: "market",
-        notionalUsdc: plan.targetNotional.abs().toNumber(),
-        hedgeType: "perp",
-        hedgeFactor: hedgeFactor.toNumber(),
-        fundingRate,
         coverageIds,
-        venue: routedPlan.venue
+        coverageId: netCoverageId
       });
+      if (riskControls.net_exposure_perp_accounting_enabled === true) {
+        const res = await app.inject({
+          method: "POST",
+          url: "/deribit/order",
+          payload: {
+            instrument,
+            amount: routedPlan.size.toNumber(),
+            side: perpSide,
+            type: "market",
+            coverageId: netCoverageId,
+            notionalUsdc: plan.targetNotional.abs().toNumber(),
+            hedgeType: "perp",
+            feeUsdc: 0,
+            tierName,
+            spotPrice,
+            venue: routedPlan.venue
+          }
+        });
+        const payload = res.json() as Record<string, unknown>;
+        const status = String(payload?.status || "");
+        netExecuted = status === "paper_filled" || status === "filled" || status === "ok";
+      } else {
+        await executionRegistry.placeOrder(routedPlan.venue || "deribit", {
+          instrument,
+          amount: routedPlan.size.toNumber(),
+          side: perpSide,
+          type: "market"
+        });
+        await audit("hedge_order", {
+          instrument,
+          side: perpSide,
+          amount: routedPlan.size.toNumber(),
+          type: "market",
+          notionalUsdc: plan.targetNotional.abs().toNumber(),
+          hedgeType: "perp",
+          hedgeFactor: hedgeFactor.toNumber(),
+          fundingRate,
+          coverageIds,
+          coverageId: netCoverageId,
+          venue: routedPlan.venue
+        });
+        netExecuted = true;
+      }
     }
+    if (netExecuted) {
+      netExposureCooldownByTier.set(netKey, Date.now());
+    }
+  }
   }
 
   if (body.alertWebhookUrl) {
@@ -5843,6 +7732,22 @@ app.post("/audit/export", async (req) => {
   const positions = Array.isArray((body as any).portfolio?.positions)
     ? ((body as any).portfolio.positions as CoveragePosition[])
     : [];
+  const hedge = ((body as any).hedge as Record<string, unknown> | undefined) ?? {};
+  const hedgeInstrument = typeof hedge.instrument === "string" ? hedge.instrument : null;
+  const hedgeVenue =
+    typeof (body as any).selectedVenue === "string"
+      ? String((body as any).selectedVenue)
+      : typeof hedge.venue === "string"
+        ? String(hedge.venue)
+        : inferVenueFromInstrument(hedgeInstrument);
+  const hedgeSize =
+    hedge.hedgeSize !== undefined && hedge.hedgeSize !== null ? Number(hedge.hedgeSize) : null;
+  const hedgeType =
+    typeof hedge.hedgeType === "string" ? (hedge.hedgeType as "option" | "perp") : null;
+  const optionType =
+    typeof hedge.optionType === "string" ? (hedge.optionType as "put" | "call") : null;
+  const strikeValue =
+    hedge.strike !== undefined && hedge.strike !== null ? Number(hedge.strike) : null;
   if (coverageIdValue && expiryValue && positions.length > 0) {
     activeCoverages.set(coverageIdValue, {
       coverageId: coverageIdValue,
@@ -5850,6 +7755,61 @@ app.post("/audit/export", async (req) => {
       positions
     });
     await saveCoverages();
+  }
+  if (coverageIdValue) {
+    const existingLedger = coverageLedger.get(coverageIdValue);
+    const existingCollectedRaw = Number(existingLedger?.collectedFeeUsdc ?? 0);
+    const existingCollectedUsdc = Number.isFinite(existingCollectedRaw) ? existingCollectedRaw : 0;
+    const collectedFeeUsdc = existingCollectedUsdc + (feeUsd > 0 ? feeUsd : 0);
+    const quotedFeeRaw = Number((body as any).totalFeeUsd ?? (body as any).feeUsd ?? NaN);
+    const quotedFeeUsdc =
+      Number.isFinite(quotedFeeRaw) && quotedFeeRaw > 0
+        ? quotedFeeRaw
+        : existingLedger?.quotedFeeUsdc ?? null;
+    const hedgeSpendRaw = Number((hedge as any).premiumUsdc ?? NaN);
+    const hedgeSpendUsdc =
+      Number.isFinite(hedgeSpendRaw) && hedgeSpendRaw >= 0
+        ? hedgeSpendRaw
+        : existingLedger?.hedgeSpendUsdc ?? null;
+    const grossMarginUsdc =
+      Number.isFinite(collectedFeeUsdc) && Number.isFinite(Number(hedgeSpendUsdc ?? NaN))
+        ? collectedFeeUsdc - Number(hedgeSpendUsdc)
+        : null;
+    const pricingReason =
+      typeof (body as any).pricingReason === "string"
+        ? String((body as any).pricingReason)
+        : typeof (body as any).reason === "string"
+          ? String((body as any).reason)
+          : existingLedger?.pricingReason ?? null;
+    const entry = upsertCoverageLedger({
+      coverageId: coverageIdValue,
+      expiryIso: expiryValue || "",
+      positions,
+      accountId: (body as any).accountId ?? null,
+      tier: tierName,
+      autoRenew: (body as any).autoRenew ?? undefined,
+      selectedVenue: hedgeVenue,
+      hedgeInstrument,
+      hedgeSize,
+      hedgeType,
+      optionType,
+      strike: Number.isFinite(strikeValue) ? strikeValue : null,
+      coverageLegs: Array.isArray((body as any).coverageLegs)
+        ? ((body as any).coverageLegs as any[])
+        : undefined,
+      notionalUsdc: Number((body as any).notionalUsdc ?? 0) || null,
+      floorUsd: Number((body as any).floorUsd ?? 0) || null,
+      equityUsd: Number((body as any).equityUsd ?? 0) || null,
+      quotedFeeUsdc,
+      collectedFeeUsdc,
+      hedgeSpendUsdc,
+      grossMarginUsdc,
+      pricingReason,
+      markSource: hedgeVenue === "bybit" || hedgeVenue === "deribit" ? hedgeVenue : null,
+      mtmAttribution: "position"
+    });
+    await saveCoverageLedger();
+    (body as any).selectedVenue = entry.selectedVenue ?? (body as any).selectedVenue ?? null;
   }
   if (feeUsd > 0) {
     const accounting = recordRevenue(tierName, feeUsd);
@@ -5863,15 +7823,113 @@ app.post("/audit/export", async (req) => {
       totals: liquiditySummary()
     });
   }
-  await audit("coverage_activated", body);
+  const coverageLedgerEntryForPayload = coverageIdValue ? coverageLedger.get(coverageIdValue) : null;
+  const quotedFeePayloadRaw = Number((body as any).totalFeeUsd ?? (body as any).feeUsd ?? NaN);
+  const quotedFeePayload = Number.isFinite(quotedFeePayloadRaw) ? quotedFeePayloadRaw : null;
+  const collectedFeePayload = Number.isFinite(feeUsd) ? feeUsd : null;
+  const hedgeSpendPayloadRaw = Number((hedge as any).premiumUsdc ?? NaN);
+  const hedgeSpendPayload = Number.isFinite(hedgeSpendPayloadRaw) ? hedgeSpendPayloadRaw : null;
+  const coveragePayload = {
+    ...body,
+    selectedVenue: (body as any).selectedVenue ?? hedgeVenue ?? null,
+    quotedFeeUsdc:
+      coverageLedgerEntryForPayload?.quotedFeeUsdc ?? quotedFeePayload,
+    collectedFeeUsdc:
+      coverageLedgerEntryForPayload?.collectedFeeUsdc ?? collectedFeePayload,
+    hedgeSpendUsdc:
+      coverageLedgerEntryForPayload?.hedgeSpendUsdc ?? hedgeSpendPayload,
+    grossMarginUsdc:
+      coverageLedgerEntryForPayload?.grossMarginUsdc ?? null,
+    pricingReason:
+      coverageLedgerEntryForPayload?.pricingReason ??
+      (body as any).pricingReason ??
+      (body as any).reason ??
+      null,
+    coverageLegs:
+      (body as any).coverageLegs ??
+      coverageLedgerEntryForPayload?.coverageLegs ??
+      null,
+    hedge: {
+      ...hedge,
+      instrument: hedgeInstrument ?? hedge.instrument ?? null,
+      hedgeSize: hedgeSize ?? hedge.hedgeSize ?? null,
+      hedgeType: hedgeType ?? hedge.hedgeType ?? null,
+      optionType: optionType ?? hedge.optionType ?? null,
+      strike: Number.isFinite(strikeValue) ? strikeValue : hedge.strike ?? null,
+      venue: hedgeVenue ?? hedge.venue ?? null
+    }
+  };
+  const ledgerEntry = coverageIdValue ? coverageLedger.get(coverageIdValue) : null;
+  if (ledgerEntry) {
+    const issues: Array<{ field: string; expected: unknown; received: unknown }> = [];
+    if (
+      ledgerEntry.hedgeInstrument &&
+      hedgeInstrument &&
+      ledgerEntry.hedgeInstrument !== hedgeInstrument
+    ) {
+      issues.push({
+        field: "hedgeInstrument",
+        expected: ledgerEntry.hedgeInstrument,
+        received: hedgeInstrument
+      });
+    }
+    if (
+      ledgerEntry.selectedVenue &&
+      coveragePayload.selectedVenue &&
+      ledgerEntry.selectedVenue !== coveragePayload.selectedVenue
+    ) {
+      issues.push({
+        field: "selectedVenue",
+        expected: ledgerEntry.selectedVenue,
+        received: coveragePayload.selectedVenue
+      });
+    }
+    if (
+      ledgerEntry.hedgeSize !== null &&
+      ledgerEntry.hedgeSize !== undefined &&
+      hedgeSize !== null &&
+      hedgeSize !== undefined
+    ) {
+      const sizeDelta = Math.abs(ledgerEntry.hedgeSize - hedgeSize);
+      if (sizeDelta > 1e-6) {
+        issues.push({
+          field: "hedgeSize",
+          expected: ledgerEntry.hedgeSize,
+          received: hedgeSize
+        });
+      }
+    }
+    if (issues.length > 0) {
+      await audit("audit_validation_failed", {
+        coverageId: coverageIdValue,
+        issues,
+        selectedVenue: coveragePayload.selectedVenue ?? null
+      });
+    }
+  }
+  await audit("coverage_activated", coveragePayload);
   return { status: "ok", file: name };
 });
 
-app.post("/admin/reset", async () => {
+app.post("/admin/reset", async (_req, reply) => {
+  if (APP_MODE !== "demo") {
+    reply.code(403);
+    return { status: "forbidden", message: "Reset is only available in demo mode." };
+  }
   const cleared = await clearAuditLogs();
   activeCoverages.clear();
+  coverageLedger.clear();
   portfolioSnapshots.clear();
+  hedgeLedger.clear();
+  realizedHedgePnlUsdc = new Decimal(0);
   resetRiskState();
+  try {
+    await rm(COVERAGE_FILE_PATH, { force: true });
+    await rm(HEDGE_LEDGER_PATH, { force: true });
+    await rm(COVERAGE_LEDGER_PATH, { force: true });
+  } catch {
+    // ignore
+  }
   return {
     status: "ok",
     clearedFiles: cleared.cleared
@@ -5898,6 +7956,88 @@ app.get("/audit/logs", async (req) => {
     count: entries.length,
     totalEvents: allEntries.length,
     filtered: !showAll
+  };
+});
+
+app.get("/debug/risk-controls", async () => {
+  const current = await loadRiskControls(RISK_CONTROLS_PATH);
+  let mtime: string | null = null;
+  try {
+    const info = await stat(RISK_CONTROLS_PATH);
+    mtime = new Date(info.mtimeMs).toISOString();
+  } catch {
+    mtime = null;
+  }
+  return {
+    status: "ok",
+    path: RISK_CONTROLS_PATH.pathname,
+    mtime,
+    controls: {
+      pass_through_allow_uncapped_bronze: current.pass_through_allow_uncapped_bronze ?? false,
+      pass_through_uncapped_max_ratio: current.pass_through_uncapped_max_ratio ?? null,
+      pass_through_cap_by_tier: current.pass_through_cap_by_tier ?? {},
+      pass_through_cap_by_leverage: current.pass_through_cap_by_leverage ?? {},
+      tier_min_notional_usdc_by_tier: current.tier_min_notional_usdc_by_tier ?? {},
+      tier_min_notional_tolerance_pct: current.tier_min_notional_tolerance_pct ?? 0,
+      vc_demo_override_enabled: current.vc_demo_override_enabled ?? false,
+      vc_demo_override_min_notional_usdc: current.vc_demo_override_min_notional_usdc ?? 0,
+      vc_demo_override_note: current.vc_demo_override_note ?? "",
+      vc_demo_override_premium_markup_pct_by_tier:
+        current.vc_demo_override_premium_markup_pct_by_tier ?? {},
+      vc_demo_override_leverage_markup_pct_by_x:
+        current.vc_demo_override_leverage_markup_pct_by_x ?? {},
+      enable_premium_pass_through: current.enable_premium_pass_through ?? null,
+      require_user_opt_in_for_pass_through: current.require_user_opt_in_for_pass_through ?? null,
+      premium_floor_ratio: current.premium_floor_ratio ?? null,
+      pass_through_min_notification_ratio: current.pass_through_min_notification_ratio ?? null,
+      ctc_shadow_mode: current.ctc_shadow_mode ?? null,
+      ctc_price_override_enabled: current.ctc_price_override_enabled ?? null,
+      ctc_shadow_reject_on_explosion: current.ctc_shadow_reject_on_explosion ?? null,
+      ctc_max_multiple_of_hedge_premium: current.ctc_max_multiple_of_hedge_premium ?? null,
+      ctc_max_pct_notional: current.ctc_max_pct_notional ?? null,
+      ctc_min_intrinsic_pct_of_spot: current.ctc_min_intrinsic_pct_of_spot ?? null,
+      tenor_preference_tolerance_days: current.tenor_preference_tolerance_days ?? null
+    }
+  };
+});
+
+app.get("/debug/build-info", async () => {
+  const current = await loadRiskControls(RISK_CONTROLS_PATH);
+  const gitCommit =
+    process.env.RENDER_GIT_COMMIT ??
+    process.env.SOURCE_VERSION ??
+    process.env.GIT_COMMIT ??
+    null;
+  const gitBranch =
+    process.env.RENDER_GIT_BRANCH ??
+    process.env.BRANCH_NAME ??
+    process.env.GIT_BRANCH ??
+    null;
+  return {
+    status: "ok",
+    serverFlavor: "services-api",
+    policyVersion: PRICING_POLICY_VERSION,
+    bootedAt: SERVER_BOOTED_AT,
+    gitCommit,
+    gitBranch,
+    venueMode: venueConfig.mode,
+    deribit: {
+      env: deribitEnv,
+      paper: deribitPaper,
+      hasCredentials: deribitHasCredentials
+    },
+    controls: {
+      ctc_shadow_mode: current.ctc_shadow_mode ?? null,
+      tier_min_notional_usdc_by_tier: current.tier_min_notional_usdc_by_tier ?? {},
+      tier_min_notional_tolerance_pct: current.tier_min_notional_tolerance_pct ?? 0,
+      vc_demo_override_enabled: current.vc_demo_override_enabled ?? false,
+      vc_demo_override_min_notional_usdc: current.vc_demo_override_min_notional_usdc ?? 0,
+      vc_demo_override_note: current.vc_demo_override_note ?? "",
+      vc_demo_override_premium_markup_pct_by_tier:
+        current.vc_demo_override_premium_markup_pct_by_tier ?? {},
+      vc_demo_override_leverage_markup_pct_by_x:
+        current.vc_demo_override_leverage_markup_pct_by_x ?? {}
+    }
   };
 });
 
@@ -5930,10 +8070,8 @@ app.get("/audit/summary", async (req) => {
   const cashProfitUsdc = liquiditySummary().profitUsdc ?? 0;
   const grossRevenueUsdc = liquiditySummary().revenueUsdc ?? 0;
   const grossHedgeSpendUsdc = liquiditySummary().hedgeSpendUsdc ?? 0;
-  const grossSubsidyUsdc = subsidySummary().totalUsdc ?? 0;
   const grossProfitUsdc = new Decimal(grossRevenueUsdc)
-    .minus(new Decimal(grossHedgeSpendUsdc))
-    .minus(new Decimal(grossSubsidyUsdc));
+    .minus(new Decimal(grossHedgeSpendUsdc));
   const grossMarginPct =
     grossRevenueUsdc > 0 ? grossProfitUsdc.div(new Decimal(grossRevenueUsdc)).mul(100) : null;
   const hedgeNotionalUsdc = hedgeMetrics.hedgeNotionalUsdc;
@@ -5953,11 +8091,9 @@ app.get("/audit/summary", async (req) => {
     ...summary,
     risk: riskSummary(),
     liquidity: liquiditySummary(),
-    subsidy: subsidySummary(),
     profitability: {
       grossRevenueUsdc: Number(grossRevenueUsdc),
       grossHedgeSpendUsdc: Number(grossHedgeSpendUsdc),
-      grossSubsidyUsdc: Number(grossSubsidyUsdc),
       grossProfitUsdc: grossProfitUsdc.toNumber(),
       grossMarginPct: grossMarginPct ? grossMarginPct.toNumber() : null,
       cashProfitUsdc: Number(cashProfitUsdc),
@@ -6015,16 +8151,43 @@ app.post("/hedge/roll", async (req) => {
   };
 });
 
-app.listen({ port: 4100, host: "0.0.0.0" }).catch((err) => {
-  app.log.error(err);
-  process.exit(1);
-});
+const startServer = async () => {
+  try {
+    console.log("[API] Starting server...");
+    await app.listen({ port: API_PORT, host: API_HOST });
+    console.log(`[API] Listening on http://${API_HOST}:${API_PORT}`);
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+};
 
-await seedAuditIfEmpty();
+const bootstrapState = async () => {
+  await ensureLogsDir();
+  try {
+    await seedAuditIfEmpty();
+  } catch (error) {
+    console.error("Failed to seed audit log:", error);
+  }
+  try {
+    await loadCoverages();
+  } catch (error) {
+    console.error("Failed to load coverages:", error);
+  }
+  try {
+    await loadCoverageLedger();
+  } catch (error) {
+    console.error("Failed to load coverage ledger:", error);
+  }
+  try {
+    await loadHedgeLedger();
+  } catch (error) {
+    console.error("Failed to load hedge ledger:", error);
+  }
+};
 
-// Load persisted state
-await loadCoverages();
-await loadHedgeLedger();
+await startServer();
+void bootstrapState();
 
 // Optional lightweight interval runner (enabled when LOOP_INTERVAL_MS > 0)
 if (LOOP_INTERVAL_MS > 0) {
@@ -6060,6 +8223,7 @@ if (MTM_INTERVAL_MS > 0) {
           )}&cashUsdc=${encodeURIComponent(account.initialBalanceUsdc)}`
         });
       }
+      await computeCoverageMtmSnapshots();
     } catch (err) {
       app.log.error(err);
     }

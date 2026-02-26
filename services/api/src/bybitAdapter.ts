@@ -8,11 +8,11 @@
 
 // MAINNET - requires VPN to Singapore for access
 const BYBIT_BASE_URL = "https://api.bybit.com/v5";
-const BYBIT_TIMEOUT_MS = 5000;
+const BYBIT_TIMEOUT_MS = Number(process.env.BYBIT_TIMEOUT_MS || "1200");
 const BYBIT_STRIKES_CACHE_TTL_MS = 60000;
 
 console.log("[Bybit] ⚠️  Using MAINNET endpoint (read-only, public data)");
-console.log("[Bybit] Timeout set to 5s (optimized for performance)");
+console.log(`[Bybit] Timeout set to ${BYBIT_TIMEOUT_MS}ms`);
 
 const bybitStrikesCache = new Map<string, BybitStrikesCacheEntry>();
 
