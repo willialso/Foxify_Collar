@@ -87,6 +87,82 @@ function computeBps(premiumUsdc) {
   return premiumUsdc.div(NOTIONAL_USD).mul(10_000);
 }
 
+async function listDeribitInstruments(asset = "BTC") {
+  const data = await fetchJson(
+    `${DERIBIT_PUBLIC_BASE}/public/get_instruments?currency=${asset}&kind=option&expired=false`
+  );
+  return Array.isArray(data?.result) ? data.result : [];
+}
+
+async function getDeribitOrderBook(instrumentName) {
+  const data = await fetchJson(
+    `${DERIBIT_PUBLIC_BASE}/public/get_order_book?instrument_name=${encodeURIComponent(instrumentName)}`
+  );
+  return data?.result ?? null;
+}
+
+function pickClosestExpiryTag(instruments, targetDays) {
+  const now = Date.now();
+  const targetMs = targetDays * 24 * 60 * 60 * 1000;
+  let bestTag = null;
+  let bestDiff = Number.POSITIVE_INFINITY;
+  for (const inst of instruments) {
+    if (!inst?.expiration_timestamp || inst?.option_type !== "put") continue;
+    const diff = Math.abs(inst.expiration_timestamp - now - targetMs);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestTag = String(inst?.instrument_name || "").split("-")[1] ?? null;
+    }
+  }
+  return bestTag;
+}
+
+async function deribitDirectFallbackQuote(spotPrice) {
+  const instruments = await listDeribitInstruments(ASSET);
+  if (!instruments.length) {
+    return { status: "no_quote", reason: "no_deribit_instruments" };
+  }
+  const expiryTag = pickClosestExpiryTag(instruments, TARGET_DAYS);
+  if (!expiryTag) {
+    return { status: "no_quote", reason: "no_deribit_expiry" };
+  }
+
+  const targetStrike = spotPrice.mul(new Decimal(1).minus(drawdownFloorPct));
+  const candidates = instruments
+    .filter((inst) => inst?.option_type === "put" && String(inst?.instrument_name || "").includes(expiryTag))
+    .map((inst) => ({
+      instrument: inst.instrument_name,
+      strike: new Decimal(inst.strike || 0),
+      distance: new Decimal(inst.strike || 0).minus(targetStrike).abs()
+    }))
+    .sort((a, b) => a.distance.comparedTo(b.distance))
+    .slice(0, 10);
+
+  if (!candidates.length) {
+    return { status: "no_quote", reason: "no_deribit_strike_candidates", expiryTag };
+  }
+
+  const positionSize = NOTIONAL_USD.div(spotPrice).div(LEVERAGE);
+  for (const candidate of candidates) {
+    const book = await getDeribitOrderBook(candidate.instrument);
+    const askRaw = book?.asks?.[0]?.[0] ?? null;
+    if (askRaw === null || askRaw === undefined) continue;
+    const ask = new Decimal(askRaw);
+    if (!ask.isFinite() || ask.lte(0)) continue;
+    const premiumUsdc = ask.mul(spotPrice).mul(positionSize);
+    return {
+      status: "ok",
+      pricingPath: "deribit_direct_fallback",
+      instrument: candidate.instrument,
+      expiryTag,
+      strike: candidate.strike.toNumber(),
+      premiumUsdc
+    };
+  }
+
+  return { status: "no_quote", reason: "no_deribit_orderbook_asks", expiryTag };
+}
+
 async function quoteForSpot(apiBase, spotPrice) {
   const payload = buildQuotePayload(spotPrice);
   const quoteResponse = await fetchJson(`${apiBase}/put/quote`, {
@@ -94,8 +170,44 @@ async function quoteForSpot(apiBase, spotPrice) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   });
-  const premiumUsdc = extractPremiumFromQuote(quoteResponse);
-  return { payload, quoteResponse, premiumUsdc, premiumBps: computeBps(premiumUsdc) };
+
+  const quoteStatus = String(quoteResponse?.status || "").toLowerCase();
+  const quotePremiumRaw = quoteResponse?.rollEstimatedPremiumUsdc ?? quoteResponse?.premiumUsdc ?? null;
+  const quotePremium = quotePremiumRaw === null ? null : new Decimal(quotePremiumRaw);
+  const quoteHasPremium = quotePremium && quotePremium.isFinite() && quotePremium.gt(0);
+
+  if (quoteStatus !== "no_quote" && quoteHasPremium) {
+    const premiumUsdc = extractPremiumFromQuote(quoteResponse);
+    return {
+      payload,
+      quoteResponse,
+      premiumUsdc,
+      premiumBps: computeBps(premiumUsdc),
+      pricingPath: "put_quote"
+    };
+  }
+
+  const fallback = await deribitDirectFallbackQuote(spotPrice);
+  if (fallback.status === "ok") {
+    return {
+      payload,
+      quoteResponse,
+      premiumUsdc: fallback.premiumUsdc,
+      premiumBps: computeBps(fallback.premiumUsdc),
+      pricingPath: fallback.pricingPath,
+      fallback
+    };
+  }
+
+  const premiumUsdc = new Decimal(0);
+  return {
+    payload,
+    quoteResponse,
+    premiumUsdc,
+    premiumBps: computeBps(premiumUsdc),
+    pricingPath: "unavailable",
+    fallback
+  };
 }
 
 async function getHistoricalDailyCloses(days) {
@@ -162,12 +274,15 @@ async function run() {
       {
         spotUsd: Number(latestSpot.toFixed(2)),
         status: latestQuote.quoteResponse?.status ?? "unknown",
+        pricingPath: latestQuote.pricingPath,
         expiryTag: latestQuote.quoteResponse?.expiryTag ?? null,
         targetDaysUsed: latestQuote.quoteResponse?.targetDays ?? null,
-        instrument: latestQuote.quoteResponse?.instrument ?? null,
+        instrument:
+          latestQuote.quoteResponse?.instrument ?? latestQuote.fallback?.instrument ?? null,
         premiumUsd: Number(latestQuote.premiumUsdc.toFixed(2)),
         premiumBpsOfNotional: Number(latestQuote.premiumBps.toFixed(4)),
-        quoteId: latestQuote.quoteResponse?.quoteId ?? null
+        quoteId: latestQuote.quoteResponse?.quoteId ?? null,
+        noQuoteReason: latestQuote.quoteResponse?.reason ?? latestQuote.fallback?.reason ?? null
       },
       null,
       2
