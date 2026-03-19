@@ -8,6 +8,7 @@
 - Set `DERIBIT_ENV=live` for production
 - Set `DERIBIT_PAPER=false` for real trading
 - Ensure `RISK_CONTROLS_PATH` points to production config
+- For pilot mode, keep `PILOT_FORCE_DERIBIT_TEST_MODE=true` to force Deribit testnet + paper execution
 
 ### Security
 - Rotate secrets from testnet values

@@ -236,6 +236,455 @@ body {
   padding: 12px;
 }
 
+.pilot-card {
+  width: min(720px, 100%);
+}
+
+.pilot-gate-card {
+  width: min(780px, 100%);
+  display: grid;
+  gap: 12px;
+}
+
+.pilot-gate-title {
+  margin: 0;
+  text-align: center;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  color: var(--text);
+}
+
+.pilot-gate-copy {
+  display: grid;
+  gap: 10px;
+}
+
+.pilot-gate-cta {
+  min-height: 40px;
+  width: 100%;
+}
+
+.pilot-gate-trader-row {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.pilot-gate-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.pilot-gate-input {
+  width: 100%;
+}
+
+.pilot-gate-checkline {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.pilot-gate-checkline input {
+  margin-top: 0;
+}
+
+.pilot-inline-terms-link {
+  border: 0;
+  background: transparent;
+  color: #8ad0ff;
+  padding: 0;
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.pilot-inline-terms-link:hover {
+  color: #b7e4ff;
+}
+
+.pilot-form {
+  display: grid;
+  gap: 8px;
+}
+
+.pilot-form-row {
+  display: grid;
+  grid-template-columns: 170px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.pilot-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.pilot-input {
+  width: 340px;
+  text-align: right;
+  padding: 7px 10px;
+  border-radius: 10px;
+}
+
+.pilot-input-text {
+  text-align: left;
+}
+
+.pilot-input-entry {
+  width: 100%;
+}
+
+.pilot-input-trader {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+}
+
+.pilot-select {
+  text-align: left;
+  white-space: nowrap;
+  padding-right: 30px;
+}
+
+.pilot-checkbox {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.pilot-inline-btn {
+  justify-self: end;
+}
+
+.pilot-field {
+  width: 340px;
+  justify-self: end;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.pilot-field-entry {
+  width: 100%;
+  max-width: 520px;
+}
+
+.pilot-field-trader {
+  width: min(440px, 100%);
+}
+
+.pilot-value {
+  text-align: right;
+}
+
+.pilot-title {
+  margin-bottom: 0;
+}
+
+.pilot-header-brand {
+  align-items: center;
+  gap: 10px;
+}
+
+.pilot-header-brand-simple {
+  align-items: center;
+  gap: 10px;
+}
+
+.pilot-header-logo {
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+  transform: scale(1.18);
+  transform-origin: center center;
+}
+
+.pilot-logo {
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  object-fit: contain;
+}
+
+.pilot-co-brand {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: 12px;
+}
+
+.pilot-co-brand-compact {
+  width: auto;
+  column-gap: 8px;
+  grid-template-columns: auto auto auto;
+}
+
+.pilot-co-brand-logo-slot {
+  width: 100%;
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 4px;
+}
+
+.pilot-co-brand-logo-slot-compact {
+  min-height: 30px;
+  width: 130px;
+  padding: 0;
+}
+
+.pilot-co-brand-logo {
+  max-width: 100%;
+  max-height: 42px;
+  object-fit: contain;
+  display: block;
+}
+
+.pilot-co-brand-logo-compact {
+  max-height: 24px;
+}
+
+.pilot-co-brand-logo--foxify {
+  transform: scale(1.24);
+  transform-origin: center center;
+}
+
+.pilot-co-brand-logo--atticus {
+  transform: scale(1);
+  transform-origin: center center;
+}
+
+.pilot-co-brand-fallback {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.pilot-co-brand-separator {
+  color: var(--muted);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.quote-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 9px 11px;
+  background: #111116;
+  display: grid;
+  gap: 5px;
+}
+
+.quote-card-ready {
+  border-color: rgba(54, 211, 141, 0.45);
+}
+
+.quote-card-fetching {
+  border-color: rgba(125, 180, 255, 0.45);
+}
+
+.quote-card-expired {
+  border-color: rgba(242, 166, 90, 0.5);
+}
+
+.pilot-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.pilot-action-btn {
+  margin-top: 0;
+  min-height: 40px;
+  font-size: 13px;
+}
+
+.pilot-retry-btn {
+  margin-left: 8px;
+  padding: 5px 10px;
+}
+
+.pilot-reference-strip {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #111116;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  display: grid;
+  gap: 4px;
+}
+
+.pilot-reference-strip-stale {
+  border-color: rgba(242, 166, 90, 0.55);
+}
+
+.pilot-reference-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pilot-reference-title {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.pilot-reference-value {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.pilot-reference-meta {
+  line-height: 1.4;
+}
+
+.pilot-reference-refresh {
+  margin: 0;
+  padding: 5px 10px;
+}
+
+.pilot-monitor {
+  width: min(760px, 100%);
+}
+
+.pilot-monitor-subtitle {
+  margin-bottom: 12px;
+}
+
+.pilot-monitor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.pilot-monitor-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #111116;
+  padding: 12px;
+}
+
+.pilot-admin-modal {
+  width: min(1060px, 100%);
+}
+
+.pilot-admin-detail {
+  width: min(720px, 100%);
+}
+
+.pilot-admin-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.pilot-admin-table {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  margin: 12px 0;
+}
+
+.pilot-admin-head,
+.pilot-admin-row {
+  display: grid;
+  grid-template-columns: 2.5fr 1fr 1fr 1.5fr 1fr 0.8fr;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.pilot-admin-head {
+  background: #1b1b21;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.pilot-admin-row {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.pilot-admin-row-selected {
+  background: rgba(125, 180, 255, 0.08);
+}
+
+.pilot-admin-row:last-child {
+  border-bottom: none;
+}
+
+.pilot-admin-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pilot-admin-ledger {
+  margin-top: 10px;
+  display: grid;
+  gap: 4px;
+}
+
+.pilot-terms-modal {
+  width: min(820px, 100%);
+}
+
+.pilot-terms-body {
+  max-height: min(65vh, 560px);
+  overflow: auto;
+  padding-right: 6px;
+}
+
+.pilot-terms-version {
+  margin-top: 0;
+  margin-bottom: 12px;
+}
+
+.pilot-terms-intro {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.pilot-terms-list {
+  margin: 0;
+  padding-left: 24px;
+  display: grid;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+  list-style-position: outside;
+}
+
+.pilot-terms-list li {
+  padding-left: 4px;
+}
+
+.pilot-terms-actions {
+  justify-content: space-between;
+  margin-top: 14px;
+}
+
 .row {
   display: flex;
   justify-content: space-between;
@@ -309,6 +758,20 @@ body {
   padding: 6px 8px;
   width: 120px;
   text-align: right;
+}
+
+.input.pilot-input-text,
+.input.pilot-input-entry {
+  text-align: left;
+}
+
+.input.pilot-input-entry {
+  text-align: right;
+}
+
+.pilot-input-entry::placeholder {
+  font-size: inherit;
+  line-height: inherit;
 }
 
 select.input {
@@ -831,6 +1294,12 @@ select.input {
     margin-top: 8px;
   }
 
+  .section-actions {
+    width: 100%;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+
   .position-actions .btn {
     width: 100%;
     font-size: 12px;
@@ -873,6 +1342,103 @@ select.input {
     font-size: 14px;
     font-weight: 600;
     color: var(--text);
+  }
+
+  .pilot-form-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+    min-height: 0;
+  }
+
+  .pilot-input {
+    width: 100%;
+  }
+
+  .pilot-field {
+    width: 100%;
+    justify-self: start;
+  }
+
+  .pilot-field-entry {
+    width: 100%;
+  }
+
+  .pilot-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+
+  .pilot-co-brand {
+    grid-template-columns: 1fr;
+    row-gap: 8px;
+    justify-items: center;
+    text-align: center;
+  }
+
+  .pilot-co-brand-compact {
+    grid-template-columns: auto auto auto;
+  }
+
+  .pilot-co-brand-logo-slot {
+    min-height: 52px;
+  }
+
+  .pilot-co-brand-separator {
+    justify-self: center;
+    width: 100%;
+    text-align: center;
+  }
+
+  .pilot-gate-title {
+    font-size: 18px;
+  }
+
+  .pilot-gate-trader-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .pilot-gate-checkline {
+    font-size: 12px;
+  }
+
+  .pilot-terms-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pilot-inline-btn {
+    justify-self: start;
+  }
+
+  .pilot-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .pilot-reference-head {
+    align-items: flex-start;
+  }
+
+  .pilot-reference-value {
+    font-size: 18px;
+  }
+
+  .pilot-monitor-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .pilot-admin-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .pilot-admin-head {
+    display: none;
+  }
+
+  .pilot-admin-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 
   .row-inline-fee {
@@ -1076,6 +1642,83 @@ select.input {
   border: 1px solid var(--border);
   border-radius: 12px;
   background: #121216;
+}
+
+.position-row-active {
+  border-color: rgba(54, 211, 141, 0.45);
+  background: linear-gradient(180deg, rgba(54, 211, 141, 0.1), rgba(18, 18, 22, 1));
+}
+
+.position-main {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.position-main-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.section-subtitle {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  margin-top: 2px;
+}
+
+.pilot-viewing-pill {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.collapse-toggle {
+  display: inline-flex;
+  align-items: center;
+}
+
+.collapse-chevron {
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 180ms ease;
+  transform: rotate(0deg);
+}
+
+.collapse-chevron.open {
+  transform: rotate(90deg);
+}
+
+.section-collapsed-note {
+  margin-top: 6px;
+}
+
+.collapsible-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows 240ms ease, opacity 200ms ease, margin-top 240ms ease;
+  margin-top: 0;
+}
+
+.collapsible-panel.is-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  margin-top: 8px;
+}
+
+.collapsible-inner {
+  min-height: 0;
+  overflow: hidden;
 }
 
 .audit-table-wrap {

@@ -1,6 +1,8 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { PilotApp } from "./PilotApp";
+import { PILOT_WIDGET } from "./config";
 import "./styles.css";
 
 type ErrorBoundaryState = {
@@ -42,7 +44,7 @@ const root = createRoot(document.getElementById("root")!);
 root.render(
   <React.StrictMode>
     <RootErrorBoundary>
-      <App />
+      {PILOT_WIDGET ? <PilotApp /> : <App />}
     </RootErrorBoundary>
   </React.StrictMode>
 );

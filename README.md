@@ -7,6 +7,7 @@ Fixed-price protective put protection for FUNDED traders with MTM crediting, rol
 - MTM crediting baked into equity + drawdown buffer.
 - Rolling hedges to prevent drawdown breaches in real time.
 - Auto-renew with expiry alerts.
+- Pilot mode supports Postgres-backed protection lifecycle + ledger APIs under `/pilot/*`.
 
 ## Quick Start
 1. Copy `.env.example` to `.env` and fill in Deribit keys.
@@ -35,3 +36,8 @@ Fixed-price protective put protection for FUNDED traders with MTM crediting, rol
 
 ## Status
 MVP scaffolding in progress. See `docs/architecture.md` for details.
+
+## Pilot API docs
+
+- `docs/pilot-api.md`
+- `docs/integrations/falconx.md`

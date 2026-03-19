@@ -11,6 +11,13 @@
     "dev:web": "npm --workspace apps/web run dev",
     "build:web": "npm --workspace apps/web run build",
     "dev:api": "npm --workspace services/api run dev",
+    "lint": "npm --workspace services/api test",
+    "type-check": "npm --workspace apps/web run build",
+    "test:unit": "npm --workspace services/api test && npm --workspace services/hedging run test",
+    "test:integration": "npm --workspace services/api test",
+    "test:coverage": "npm --workspace services/api test",
+    "build": "npm run build:web",
+    "test:smoke": "npm --workspace apps/web run build",
     "test": "npm --workspace services/hedging run test"
   }
 }

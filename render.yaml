@@ -1,0 +1,88 @@
+databases:
+  - name: atticus-pilot-db
+    plan: basic-256mb
+
+services:
+  - type: web
+    name: atticus-pilot-api
+    runtime: node
+    plan: starter
+    branch: cursor/foxify-pilot-readiness-d74a
+    autoDeploy: true
+    buildCommand: npm ci
+    startCommand: npm --workspace services/api exec tsx src/server.ts
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PILOT_API_ENABLED
+        value: "true"
+      - key: PILOT_VENUE_MODE
+        value: deribit_test
+      - key: PILOT_FORCE_DERIBIT_TEST_MODE
+        value: "false"
+      - key: PILOT_DERIBIT_QUOTE_POLICY
+        value: ask_only
+      - key: PILOT_STRIKE_SELECTION_MODE
+        value: trigger_aligned
+      - key: DERIBIT_ENV
+        value: live
+      - key: DERIBIT_PAPER
+        value: "true"
+      - key: PILOT_TENANT_SCOPE_ID
+        value: foxify-pilot
+      - key: PILOT_TERMS_VERSION
+        value: v1.0
+      - key: PILOT_ADMIN_TOKEN
+        generateValue: true
+      - key: PILOT_PROOF_TOKEN
+        generateValue: true
+      - key: PILOT_INTERNAL_TOKEN
+        generateValue: true
+      - key: USER_HASH_SECRET
+        generateValue: true
+      - key: LOOP_INTERVAL_MS
+        value: "0"
+      - key: MTM_INTERVAL_MS
+        value: "0"
+      - key: PRICE_SINGLE_SOURCE
+        value: "false"
+      - key: PRICE_REFERENCE_URL
+        value: https://www.deribit.com/api/v2/public/ticker?instrument_name=BTC-PERPETUAL
+      - key: FALLBACK_PRICE_URL
+        value: https://api.exchange.coinbase.com/products/BTC-USD/ticker
+      - key: PRICE_REFERENCE_MARKET_ID
+        value: BTC-USD
+      - key: PRICE_REQUEST_RETRY_ATTEMPTS
+        value: "5"
+      - key: PRICE_REQUEST_RETRY_DELAY_MS
+        value: "250"
+      - key: PRICE_FRESHNESS_MAX_MS
+        value: "30000"
+      - key: PRICE_TIMEOUT_PRIMARY_MS
+        value: "2500"
+      - key: PRICE_TIMEOUT_FALLBACK_MS
+        value: "2500"
+      - key: POSTGRES_URL
+        fromDatabase:
+          name: atticus-pilot-db
+          property: connectionString
+
+  - type: web
+    name: atticus-pilot-web
+    runtime: static
+    branch: cursor/foxify-pilot-readiness-d74a
+    autoDeploy: true
+    buildCommand: npm ci && npm --workspace apps/web run build
+    staticPublishPath: apps/web/dist
+    envVars:
+      - key: VITE_PILOT_WIDGET
+        value: "true"
+      - key: VITE_PILOT_TERMS_VERSION
+        value: v1.0
+      - key: VITE_API_BASE
+        value: https://atticus-pilot-api.onrender.com
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

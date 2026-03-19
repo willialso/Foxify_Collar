@@ -21,3 +21,5 @@ const normalizeApiBase = (value: string) => {
 export const API_BASE = normalizeApiBase(RAW_API_BASE);
 export const FOXIFY_POSITION_ENDPOINT = import.meta.env.VITE_FOXIFY_POSITION_ENDPOINT ?? "";
 export const FOXIFY_PORTFOLIO_ENDPOINT = import.meta.env.VITE_FOXIFY_PORTFOLIO_ENDPOINT ?? "";
+export const PILOT_WIDGET = import.meta.env.VITE_PILOT_WIDGET === "true";
+export const PILOT_TERMS_VERSION = (import.meta.env.VITE_PILOT_TERMS_VERSION ?? "v1.0").trim() || "v1.0";
